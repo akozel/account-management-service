@@ -1,0 +1,42 @@
+meta {
+  name: Submit registration profile
+  type: http
+  seq: 3
+}
+
+post {
+  url: {{baseUrl}}/user-accounts
+  body: json
+  auth: none
+}
+
+headers {
+  content-type: application/json
+}
+
+body:json {
+  {
+    "email": "{{email}}",
+    "account_id": "{{accountId}}",
+    "account_creation_token": "{{accountCreationToken}}",
+    "first_name": "{{firstName}}",
+    "last_name": "{{lastName}}",
+    "date_of_birth": "{{dateOfBirth}}"
+  }
+}
+
+vars:pre-request {
+  accountId: 678a7eef-dcaa-442b-92fb-af889d250cdd
+}
+
+tests {
+  test("accepts the profile for asynchronous account creation", function () {
+    const body = res.getBody();
+    expect(res.getStatus()).to.equal(202);
+    expect(res.getHeader("content-type")).to.include("application/json");
+    expect(body.account_id).to.equal(bru.getVar("accountId"));
+    expect(body.status_url).to.equal(
+      `/email-reservations/${bru.getVar("emailPath")}/registrations/${bru.getVar("accountId")}`
+    );
+  });
+}

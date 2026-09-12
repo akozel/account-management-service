@@ -10,6 +10,7 @@ services:
     volumes:
       - account_management_postgres_data:/var/lib/postgresql
       - ./deploy/postgres/001-event-store.sql:/docker-entrypoint-initdb.d/001-event-store.sql:ro,Z
+      - ./deploy/postgres/002-transactional-outbox.sql:/docker-entrypoint-initdb.d/002-transactional-outbox.sql:ro,Z
     healthcheck:
       test: ["CMD-SHELL", "pg_isready -U account_management -d account_management"]
       interval: 5s

@@ -9,6 +9,12 @@
 /lcov.info
 /cobertura.xml
 
+# k6 load-test reports
+/.k6/results/*.json
+/.k6/results/*.ndjson
+/.k6/results/*.html
+!/.k6/results/.gitkeep
+
 # Local environment and secrets
 .env
 .env.*

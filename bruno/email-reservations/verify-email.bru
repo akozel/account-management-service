@@ -1,0 +1,44 @@
+meta {
+  name: Verify email
+  type: http
+  seq: 2
+}
+
+post {
+  url: {{baseUrl}}/email-reservations/{{emailPath}}/verify
+  body: json
+  auth: none
+}
+
+headers {
+  content-type: application/json
+}
+
+body:json {
+  {
+    "account_id": "{{accountId}}",
+    "code": {{verificationCode}}
+  }
+}
+
+vars:pre-request {
+  accountId: 678a7eef-dcaa-442b-92fb-af889d250cdd
+}
+
+script:post-response {
+  if (res.getStatus() === 200) {
+    bru.setVar("accountCreationToken", res.getBody().account_creation_token);
+  }
+}
+
+tests {
+  test("returns the one-time account creation token", function () {
+    const body = res.getBody();
+    expect(res.getStatus()).to.equal(200);
+    expect(res.getHeader("content-type")).to.include("application/json");
+    expect(res.getHeader("cache-control")).to.equal("no-store");
+    expect(body.email).to.equal(bru.getVar("email"));
+    expect(body.account_id).to.equal(bru.getVar("accountId"));
+    expect(body.account_creation_token).to.be.a("string").and.not.be.empty;
+  });
+}

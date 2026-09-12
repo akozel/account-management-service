@@ -1,0 +1,28 @@
+meta {
+  name: Restart verification (request code)
+  type: http
+  seq: 1
+}
+
+post {
+  url: {{baseUrl}}/email-reservations/{{emailPath}}/verification-codes
+  body: none
+  auth: none
+}
+
+script:post-response {
+  if (res.getStatus() === 202) {
+    bru.deleteVar("accountId");
+    bru.deleteVar("accountCreationToken");
+    bru.deleteVar("verificationCode");
+  }
+}
+
+tests {
+  test("accepts a verification restart", function () {
+    const body = res.getBody();
+    expect(res.getStatus()).to.equal(202);
+    expect(res.getHeader("content-type")).to.include("application/json");
+    expect(body.status).to.equal("verification_code_requested");
+  });
+}

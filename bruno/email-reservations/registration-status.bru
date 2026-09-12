@@ -1,0 +1,21 @@
+meta {
+  name: Read registration status (not implemented)
+  type: http
+  seq: 4
+}
+
+get {
+  url: {{baseUrl}}/email-reservations/{{emailPath}}/registrations/{{accountId}}
+  body: none
+  auth: none
+}
+
+tests {
+  test("documents the current status placeholder", function () {
+    const body = res.getBody();
+    expect(res.getStatus()).to.equal(501);
+    expect(res.getHeader("content-type")).to.include("application/json");
+    expect(body.code).to.equal("not_implemented");
+    expect(body.message).to.equal("registration status is not implemented");
+  });
+}
