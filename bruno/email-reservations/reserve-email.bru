@@ -1,0 +1,45 @@
+meta {
+  name: Reserve email
+  type: http
+  seq: 1
+}
+
+post {
+  url: {{baseUrl}}/email-reservations
+  body: json
+  auth: none
+}
+
+headers {
+  content-type: application/json
+}
+
+body:json {
+  {
+    "email": "{{email}}"
+  }
+}
+
+script:post-response {
+  if (res.getStatus() === 202) {
+    const body = res.getBody();
+    const emailPath = encodeURIComponent(body.email).replace(
+      /[!'()*]/g,
+      (character) => `%${character.charCodeAt(0).toString(16).toUpperCase()}`
+    );
+    bru.setVar("email", body.email);
+    bru.setVar("emailPath", emailPath);
+    bru.setVar("accountId", body.account_id);
+    bru.deleteVar("accountCreationToken");
+  }
+}
+
+tests {
+  test("returns an accepted canonical reservation", function () {
+    const body = res.getBody();
+    expect(res.getStatus()).to.equal(202);
+    expect(res.getHeader("content-type")).to.include("application/json");
+    expect(body.email).to.equal(body.email.trim().toLowerCase());
+    expect(body.account_id).to.match(/^[0-9a-f-]{36}$/);
+  });
+}

@@ -1,0 +1,94 @@
+name: CI
+
+on:
+  push:
+  pull_request:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: ci-${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
+env:
+  CARGO_TERM_COLOR: always
+
+jobs:
+  compile:
+    name: Compile
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+
+    steps:
+      - name: Check out repository
+        uses: actions/checkout@v6
+
+      - name: Install Rust toolchain
+        run: rustup toolchain install --no-self-update
+
+      - name: Compile
+        run: cargo check --locked --all-targets
+
+  formatting:
+    name: Check formatting
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+
+    steps:
+      - name: Check out repository
+        uses: actions/checkout@v6
+
+      - name: Install Rust toolchain
+        run: rustup toolchain install --no-self-update
+
+      - name: Check formatting
+        run: cargo fmt --check
+
+  clippy:
+    name: Run Clippy
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+
+    steps:
+      - name: Check out repository
+        uses: actions/checkout@v6
+
+      - name: Install Rust toolchain
+        run: rustup toolchain install --no-self-update
+
+      - name: Run Clippy
+        run: cargo clippy --locked --all-targets -- -D warnings
+
+  build:
+    name: Build
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+
+    steps:
+      - name: Check out repository
+        uses: actions/checkout@v6
+
+      - name: Install Rust toolchain
+        run: rustup toolchain install --no-self-update
+
+      - name: Build
+        run: cargo build --locked
+
+  coverage:
+    name: Check coverage
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+
+    steps:
+      - name: Check out repository
+        uses: actions/checkout@v6
+
+      - name: Install Rust toolchain
+        run: rustup toolchain install --no-self-update
+
+      - name: Install cargo-llvm-cov
+        uses: taiki-e/install-action@cargo-llvm-cov
+
+      - name: Check coverage
+        run: cargo llvm-cov --color never --ignore-filename-regex '(^|/)main\.rs$' --fail-under-lines 90
