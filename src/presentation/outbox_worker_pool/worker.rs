@@ -1,6 +1,7 @@
 use crate::application::outbox::{ClaimedTask, FailedTask, OutboxTaskCoordinator, SettleResult, TaskHandlerRegistry};
-use std::{io::Write, sync::Arc, time::Duration};
+use std::{sync::Arc, time::Duration};
 use tokio::{sync::mpsc, task::JoinHandle};
+use tracing::error;
 
 pub(super) struct OutboxWorker {
     pub(super) mailbox: Option<mpsc::Sender<ClaimedTask>>,
@@ -28,8 +29,8 @@ pub(super) fn spawn_worker(
             match service.execute_and_settle(&mut handler, task, timeout).await {
                 Ok(SettleResult::Settled { failed: Some(failed) }) => log_failed(&failed),
                 Ok(SettleResult::Settled { failed: None }) => {}
-                Ok(SettleResult::OwnershipLost) => eprintln!("outbox ownership lost; task_id={id}"),
-                Err(error) => eprintln!("outbox acknowledgement failed; task_id={id}; error={error}"),
+                Ok(SettleResult::OwnershipLost) => error!(task_id = %id, "outbox ownership lost"),
+                Err(error) => error!(task_id = %id, error = %error, "outbox acknowledgement failed"),
             }
             if completed.send(index).await.is_err() {
                 break;
@@ -44,28 +45,34 @@ pub(super) fn spawn_worker(
 }
 
 pub(super) fn log_failed(task: &FailedTask) {
-    let _ = write_failed(std::io::stderr().lock(), task);
-}
-
-fn write_failed(mut output: impl Write, task: &FailedTask) -> std::io::Result<()> {
     let task_type = &task.format.task_type;
     let safe_type = if task_type.chars().all(|c| c.is_ascii_alphanumeric() || c == '_') {
         task_type.as_str()
     } else {
         "unknown"
     };
-    writeln!(
-        output,
-        "outbox task failed; task_id={}; task_type={safe_type}; task_version={}; attempt={}; reason={}",
-        task.id, task.format.task_version, task.attempt, task.reason
-    )
+    error!(
+        task_id = %task.id,
+        task_type = %safe_type,
+        task_version = task.format.task_version,
+        attempt = task.attempt,
+        reason = %task.reason,
+        "outbox task failed"
+    );
 }
 
 #[cfg(test)]
 mod tests {
-    use std::sync::atomic::{AtomicUsize, Ordering};
+    use std::{
+        io::{self, Write},
+        sync::{
+            Arc, Mutex,
+            atomic::{AtomicUsize, Ordering},
+        },
+    };
 
     use async_trait::async_trait;
+    use tracing_subscriber::fmt::MakeWriter;
 
     use super::*;
     use crate::application::outbox::{
@@ -112,6 +119,34 @@ mod tests {
         }
     }
 
+    #[derive(Clone, Default)]
+    struct RecordingWriter(Arc<Mutex<Vec<u8>>>);
+
+    impl RecordingWriter {
+        fn text(&self) -> String {
+            String::from_utf8(self.0.lock().unwrap().clone()).unwrap()
+        }
+    }
+
+    impl Write for RecordingWriter {
+        fn write(&mut self, buffer: &[u8]) -> io::Result<usize> {
+            self.0.lock().unwrap().extend_from_slice(buffer);
+            Ok(buffer.len())
+        }
+
+        fn flush(&mut self) -> io::Result<()> {
+            Ok(())
+        }
+    }
+
+    impl<'a> MakeWriter<'a> for RecordingWriter {
+        type Writer = Self;
+
+        fn make_writer(&'a self) -> Self::Writer {
+            self.clone()
+        }
+    }
+
     #[tokio::test]
     async fn receives_work_and_reports_completion() {
         let coordinator = Arc::new(RecordingCoordinator(AtomicUsize::new(0)));
@@ -138,37 +173,49 @@ mod tests {
     }
 
     #[test]
-    fn confirmed_failure_lines_contain_identity_and_safe_reason_only() {
-        for reason in ["permanent failure", "retry limit reached", "worker lease expired"] {
+    fn confirmed_failure_events_contain_identity_and_safe_reason_only() {
+        let writer = RecordingWriter::default();
+        let subscriber = tracing_subscriber::fmt()
+            .with_writer(writer.clone())
+            .with_target(false)
+            .with_ansi(false)
+            .without_time()
+            .finish();
+        tracing::subscriber::with_default(subscriber, || {
+            for reason in ["permanent failure", "retry limit reached", "worker lease expired"] {
+                let task = FailedTask {
+                    id: uuid::Uuid::from_u128(1),
+                    format: TaskFormat {
+                        task_type: "create_account".into(),
+                        task_version: 1,
+                    },
+                    attempt: 2,
+                    reason,
+                };
+                log_failed(&task);
+            }
             let task = FailedTask {
-                id: uuid::Uuid::from_u128(1),
+                id: uuid::Uuid::from_u128(2),
                 format: TaskFormat {
-                    task_type: "create_account".into(),
+                    task_type: "secret\nalice@example.com".into(),
                     task_version: 1,
                 },
-                attempt: 2,
-                reason,
+                attempt: 1,
+                reason: "worker lease expired",
             };
-            let mut output = Vec::new();
-            write_failed(&mut output, &task).unwrap();
-            let line = String::from_utf8(output).unwrap();
-            assert!(line.contains("task_id=00000000-0000-0000-0000-000000000001"));
-            assert!(line.contains("task_type=create_account; task_version=1; attempt=2"));
-            assert!(line.contains(reason));
-            assert!(!line.contains("alice@example.com"));
-            assert!(!line.contains("token"));
+            log_failed(&task);
+        });
+
+        let log = writer.text();
+        assert_eq!(log.lines().count(), 4);
+        assert!(log.contains("task_id=00000000-0000-0000-0000-000000000001"));
+        assert!(log.contains("task_type=create_account task_version=1 attempt=2"));
+        for reason in ["permanent failure", "retry limit reached", "worker lease expired"] {
+            assert!(log.contains(reason));
         }
-        let task = FailedTask {
-            id: uuid::Uuid::from_u128(2),
-            format: TaskFormat {
-                task_type: "secret\nalice@example.com".into(),
-                task_version: 1,
-            },
-            attempt: 1,
-            reason: "worker lease expired",
-        };
-        let mut output = Vec::new();
-        write_failed(&mut output, &task).unwrap();
-        assert!(String::from_utf8(output).unwrap().contains("task_type=unknown"));
+        assert!(log.contains("task_type=unknown"));
+        assert!(!log.contains("secret"));
+        assert!(!log.contains("alice@example.com"));
+        assert!(!log.contains("token"));
     }
 }

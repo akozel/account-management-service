@@ -210,10 +210,10 @@ permanent failure. Map an exact already-applied outcome to `Completed`; reject
 different existing data. Do not treat a generic `AlreadyExists` rejection as
 success unless the aggregate checked all identity-defining fields. Keep this
 business classification out of the generic queue/coordinator. When retries
-are exhausted, persist `Failed` and write the confirmed transition to stderr,
-including failures found during lease recovery. Log task identity, attempt,
-and reason, not secrets or payload. `Failed` does not prove the aggregate
-command never committed.
+are exhausted, persist `Failed` and emit an error-level `tracing` event for the
+confirmed transition, including failures found during lease recovery. Log task
+identity, attempt, and reason, not secrets or payload. `Failed` does not prove
+the aggregate command never committed.
 
 For `CreateAccountTask` specifically, `UserAccount::CreateAccount` rejects an
 exact repeat as `AlreadyCreated` after checking the account ID, email, and
@@ -262,7 +262,8 @@ and retry backoff; a zero-delay retry becomes available immediately. A claim
 increments attempts and grants a lease and lock token. Only `processing` has
 lease ownership; only `completed` and `failed` have `finished_at`. Settlement
 and expired-lease recovery return confirmed `failed` transitions to the worker
-for safe stderr logging. Unknown formats stay `pending` without being claimed.
+for safe structured error logging. Unknown formats stay `pending` without being
+claimed.
 
 Background polling is an inbound adapter under `presentation/outbox_worker_pool.rs`. Its
 Tokio supervisor owns bounded worker mailboxes, cancellation, polling and worker

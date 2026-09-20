@@ -7,6 +7,7 @@ use tokio::{
     sync::{mpsc, watch},
     time::MissedTickBehavior,
 };
+use tracing::error;
 use uuid::Uuid;
 
 use crate::application::outbox::{OutboxTaskCoordinator, TaskFormat, TaskHandlerRegistry};
@@ -116,7 +117,7 @@ pub async fn run(
             _ = interval.tick() => {
                 for (i, worker) in workers.iter_mut().enumerate() {
                     if worker.task.is_finished() {
-                        eprintln!("outbox worker stopped; restarting worker={i}; owner={owner}");
+                        error!(worker = i, owner = %owner, "outbox worker stopped; restarting");
                         *worker = spawn_worker(i, checked_handler(&factory, &formats)?, service.clone(), completed.clone(), config.handler_timeout);
                     }
                 }
@@ -127,7 +128,7 @@ pub async fn run(
                 };
                 match recovery {
                     Ok(result) => for failed in result.failed { log_failed(&failed); },
-                    Err(error) => eprintln!("outbox lease recovery failed; error={error}"),
+                    Err(error) => error!(error = %error, "outbox lease recovery failed"),
                 }
             }
             Some(index) = completions.recv() => workers[index].busy = false,
@@ -158,7 +159,7 @@ pub async fn run(
                     // If the worker died after claim, lease recovery will preserve this work.
                 }
             }
-            Err(error) => eprintln!("outbox claim failed; error={error}"),
+            Err(error) => error!(error = %error, "outbox claim failed"),
         }
     }
     for worker in &mut workers {

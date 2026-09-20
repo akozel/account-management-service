@@ -18,6 +18,7 @@ use account_management_service::{
             AggregateConflictRetryPolicy, email_reservation_gateway::CqrsEmailReservationGateway,
             user_account_gateway::CqrsUserAccountGateway,
         },
+        logging::LogingConfig,
         postgres::event_repository_with_outbox::PostgresEventRepositoryWithOutbox,
         postgres::outbox_queue::PostgresOutboxQueue,
         random::RandomRegistrationMaterialGenerator,
@@ -29,10 +30,13 @@ use cqrs_es::{CqrsFramework, persist::PersistedEventStore};
 use presentation::outbox_worker_pool;
 use runtime::RuntimeError;
 use tokio::net::TcpListener;
+use tracing::{error, info};
 
 #[tokio::main]
 async fn main() -> Result<(), RuntimeError> {
     dotenvy::dotenv().ok();
+    let level_filter = LogingConfig::level_filter_from_env().expect("RUST_LOG must be a valid tracing level");
+    LogingConfig::default_setup(level_filter);
     let database_url = std::env::var("DATABASE_URL").expect("DATABASE_URL must be set");
     let bind_address = std::env::var("BIND_ADDRESS").expect("BIND_ADDRESS must be set");
 
@@ -72,6 +76,7 @@ async fn main() -> Result<(), RuntimeError> {
     let email_reservation = email_reservation_service(gateway, Arc::new(RandomRegistrationMaterialGenerator));
     let app = presentation::http::router(email_reservation, http_registration);
     let listener = TcpListener::bind(&bind_address).await.expect("unable to bind HTTP listener");
+    info!(address = %bind_address, "HTTP server is listening");
 
     let (shutdown_tx, shutdown_rx) = tokio::sync::watch::channel(false);
     let worker = tokio::spawn(outbox_worker_pool::run(outbox, handler_factory, worker_config, shutdown_rx));
@@ -87,7 +92,16 @@ async fn main() -> Result<(), RuntimeError> {
     };
     let runtime_result = runtime::run(serve, worker, shutdown_tx, shutdown_signal()).await;
     pool.close().await;
-    runtime_result
+    match runtime_result {
+        Ok(()) => {
+            info!("service stopped");
+            Ok(())
+        }
+        Err(error) => {
+            error!(error = ?error, "service stopped with an error");
+            Err(error)
+        }
+    }
 }
 
 #[cfg(unix)]
