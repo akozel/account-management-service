@@ -81,12 +81,12 @@ async fn explicit_batches_commit_once_and_rollback_with_events_and_snapshots() {
             .await
             .is_err()
     );
-    // An explicit duplicate ID rolls back its new event, rather than skipping work.
-    assert!(
-        repo.persist::<EmailReservation>(&[event("duplicate-task", 1)], None)
-            .await
-            .is_err()
-    );
+    // A duplicate task ID is not an optimistic aggregate conflict. The whole
+    // statement still rolls its otherwise valid new event back.
+    assert!(matches!(
+        repo.persist::<EmailReservation>(&[event("duplicate-task", 1)], None).await,
+        Err(PersistenceError::UnknownError(_))
+    ));
     assert!(
         repo.get_events::<EmailReservation>("duplicate-task")
             .await
@@ -315,6 +315,23 @@ async fn maps_duplicate_event_sequence_to_optimistic_lock_error() {
     assert_eq!(row_count(&database.pool, "events").await, 1);
     assert_eq!(row_count(&database.pool, "transactional_outbox").await, 0);
 
+    database.close().await;
+}
+
+#[tokio::test]
+async fn maps_duplicate_snapshot_key_to_optimistic_lock_error() {
+    let database = Database::new().await;
+    let repository = PostgresEventRepositoryWithOutbox::new(database.pool.clone());
+
+    repository
+        .persist::<TestAggregate>(&[], Some(("duplicate-snapshot".to_owned(), json!({"state": "first"}), 1)))
+        .await
+        .expect("initial snapshot must persist");
+    let result = repository
+        .persist::<TestAggregate>(&[], Some(("duplicate-snapshot".to_owned(), json!({"state": "second"}), 1)))
+        .await;
+
+    assert!(matches!(result, Err(PersistenceError::OptimisticLockError)));
     database.close().await;
 }
 

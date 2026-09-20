@@ -3,7 +3,7 @@ use std::sync::Arc;
 use axum::{
     Router,
     extract::rejection::JsonRejection,
-    http::StatusCode,
+    http::{HeaderValue, StatusCode, header},
     response::{IntoResponse, Response},
     routing::post,
 };
@@ -89,6 +89,7 @@ impl From<SubmissionError> for UserAccountsError {
 
 impl IntoResponse for UserAccountsError {
     fn into_response(self) -> Response {
+        let retry_after = matches!(self, Self::Conflict);
         let (status, code, message) = match self {
             Self::InvalidRequest => (StatusCode::BAD_REQUEST, "invalid_request", "invalid request"),
             Self::InvalidEmail => (StatusCode::UNPROCESSABLE_ENTITY, "invalid_email", "invalid email address"),
@@ -115,7 +116,7 @@ impl IntoResponse for UserAccountsError {
                 "a registration profile was already submitted",
             ),
             Self::Conflict => (
-                StatusCode::CONFLICT,
+                StatusCode::TOO_MANY_REQUESTS,
                 "registration_conflict",
                 "registration changed concurrently",
             ),
@@ -126,6 +127,12 @@ impl IntoResponse for UserAccountsError {
             ),
             Self::Internal => (StatusCode::INTERNAL_SERVER_ERROR, "internal_error", "registration failed"),
         };
-        error_response(status, code, message.to_owned())
+        let mut response = error_response(status, code, message.to_owned());
+        if retry_after {
+            response
+                .headers_mut()
+                .insert(header::RETRY_AFTER, HeaderValue::from_static("1"));
+        }
+        response
     }
 }

@@ -29,7 +29,10 @@ use account_management_service::{
         UserAccountCommand, UserAccountError, UserAccountEvent, UserAccountId,
     },
     infrastructure::{
-        cqrs::{email_reservation_gateway::CqrsEmailReservationGateway, user_account_gateway::CqrsUserAccountGateway},
+        cqrs::{
+            AggregateConflictRetryPolicy, email_reservation_gateway::CqrsEmailReservationGateway,
+            user_account_gateway::CqrsUserAccountGateway,
+        },
         postgres::{event_repository_with_outbox::PostgresEventRepositoryWithOutbox, outbox_queue::PostgresOutboxQueue},
     },
     presentation,
@@ -159,16 +162,19 @@ impl RegistrationMaterialGenerator for NextGenerator {
 
 fn email_gateway(pool: &PgPool) -> Arc<dyn EmailReservationGateway> {
     let pool = pool.clone();
-    Arc::new(CqrsEmailReservationGateway::new(move |tasks| {
-        cqrs_es::CqrsFramework::new(
-            cqrs_es::persist::PersistedEventStore::new_snapshot_store(
-                PostgresEventRepositoryWithOutbox::new(pool.clone()).with_outbox(tasks),
-                3,
-            ),
-            vec![],
-            (),
-        )
-    }))
+    Arc::new(CqrsEmailReservationGateway::new(
+        move |tasks| {
+            cqrs_es::CqrsFramework::new(
+                cqrs_es::persist::PersistedEventStore::new_snapshot_store(
+                    PostgresEventRepositoryWithOutbox::new(pool.clone()).with_outbox(tasks),
+                    3,
+                ),
+                vec![],
+                (),
+            )
+        },
+        AggregateConflictRetryPolicy::default(),
+    ))
 }
 
 fn registration(pool: &PgPool, clock: Arc<TestClock>) -> Arc<dyn RegistrationService> {
@@ -177,16 +183,19 @@ fn registration(pool: &PgPool, clock: Arc<TestClock>) -> Arc<dyn RegistrationSer
 
 fn account_gateway(pool: &PgPool) -> Arc<dyn UserAccountGateway> {
     let account_pool = pool.clone();
-    Arc::new(CqrsUserAccountGateway::new(move |tasks| {
-        cqrs_es::CqrsFramework::new(
-            cqrs_es::persist::PersistedEventStore::new_snapshot_store(
-                PostgresEventRepositoryWithOutbox::new(account_pool.clone()).with_outbox(tasks),
-                1,
-            ),
-            vec![],
-            (),
-        )
-    }))
+    Arc::new(CqrsUserAccountGateway::new(
+        move |tasks| {
+            cqrs_es::CqrsFramework::new(
+                cqrs_es::persist::PersistedEventStore::new_snapshot_store(
+                    PostgresEventRepositoryWithOutbox::new(account_pool.clone()).with_outbox(tasks),
+                    1,
+                ),
+                vec![],
+                (),
+            )
+        },
+        AggregateConflictRetryPolicy::default(),
+    ))
 }
 
 struct RecordingAccountGateway {
@@ -774,18 +783,18 @@ async fn profile_submission_and_code_reissue_follow_commit_order() {
     let service = registration(&db.pool, Arc::new(TestClock::new()));
     let (submit_result, reissue_result) = tokio::join!(service.submit_profile(submission()), reissue(&db.pool, email()));
     if submit_result.is_ok() {
-        assert!(matches!(
+        assert_eq!(
             reissue_result,
-            Err(CommandGatewayError::Conflict | CommandGatewayError::Domain(EmailReservationError::AccountCreationStarted))
-        ));
+            Err(CommandGatewayError::Domain(EmailReservationError::AccountCreationStarted))
+        );
         assert_eq!(tasks(&db.pool, "create_account").await.len(), 1);
         assert_eq!(tasks(&db.pool, "send_verification_code").await.len(), 1);
     } else {
         assert!(reissue_result.is_ok());
-        assert!(matches!(
+        assert_eq!(
             submit_result,
-            Err(SubmissionError::Conflict | SubmissionError::Domain(EmailReservationError::NotCurrentAccountId))
-        ));
+            Err(SubmissionError::Domain(EmailReservationError::NotCurrentAccountId))
+        );
         assert!(tasks(&db.pool, "create_account").await.is_empty());
         assert_eq!(tasks(&db.pool, "send_verification_code").await.len(), 2);
     }
@@ -810,13 +819,8 @@ async fn concurrent_create_delivery_and_account_id_collision_fail_closed() {
     service.submit_profile(submission()).await.unwrap();
     let task: CreateAccountTaskV1 = serde_json::from_value(tasks(&db.pool, "create_account").await[0].1.clone()).unwrap();
     let (first, second) = tokio::join!(service.create_account(task.clone()), service.create_account(task.clone()));
-    if first == Err(ContinuationError::Retry) {
-        service.create_account(task.clone()).await.unwrap();
-    }
-    if second == Err(ContinuationError::Retry) {
-        service.create_account(task).await.unwrap();
-    }
-    assert!(first.is_ok() || second.is_ok());
+    assert_eq!(first, Ok(()));
+    assert_eq!(second, Ok(()));
     assert_eq!(account_events(&db.pool, id(1)).await.len(), 1);
     assert_eq!(tasks(&db.pool, "record_account_created").await.len(), 1);
     assert_eq!(email_events(&db.pool).await.len(), 3);
@@ -1008,13 +1012,8 @@ async fn competing_completion_workers_record_one_event() {
         service.record_account_created(completion.clone()),
         service.record_account_created(completion.clone()),
     );
-    assert!(first.is_ok() || second.is_ok());
-    if first == Err(ContinuationError::Retry) {
-        service.record_account_created(completion.clone()).await.unwrap();
-    }
-    if second == Err(ContinuationError::Retry) {
-        service.record_account_created(completion).await.unwrap();
-    }
+    assert_eq!(first, Ok(()));
+    assert_eq!(second, Ok(()));
     assert_eq!(email_events(&db.pool).await.len(), 4);
     assert_eq!(tasks(&db.pool, "record_account_created").await.len(), 1);
     db.close().await;

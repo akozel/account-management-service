@@ -201,6 +201,23 @@ Accepted` response means the profile event and account-creation task are
 durable, not that account creation has finished. The registration-status
 projection is not implemented yet.
 
+## Retry budgets
+
+Retries are split by what is being repeated. Each layer owns only its own
+failure class and must not repeat the same error again at an adjacent layer.
+
+| Layer | Repeated unit | Budget |
+|---|---|---|
+| Fast CQRS retry | The same aggregate command with the same prebuilt outbox tasks after an optimistic conflict | Up to 3 total attempts |
+| Durable outbox retry | Delivery of the same persisted task after a retryable handler outcome | Up to 10 deliveries |
+
+Application workflows issue one generated command. Even an
+`AccountIdUnchanged` UUID collision is returned as a conflict rather than
+generating another command. An outbox task may cause up to `10 × 3` command
+executions across its durable deliveries. Connection loss, timeout,
+deserialization, and unavailable errors are not retried by the fast CQRS layer
+because the commit outcome can be unknown.
+
 ## PostgreSQL
 
 The Compose file runs PostgreSQL only:

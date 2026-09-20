@@ -257,7 +257,11 @@ mod tests {
                 StatusCode::UNPROCESSABLE_ENTITY,
                 "invalid_profile",
             ),
-            (SubmissionError::Conflict, StatusCode::CONFLICT, "registration_conflict"),
+            (
+                SubmissionError::Conflict,
+                StatusCode::TOO_MANY_REQUESTS,
+                "registration_conflict",
+            ),
             (
                 SubmissionError::Unavailable,
                 StatusCode::SERVICE_UNAVAILABLE,
@@ -267,6 +271,11 @@ mod tests {
             let (actual, body, headers) = call(Arc::new(StubService::failing(error)), VALID_BODY).await;
             assert_eq!(actual, status);
             assert_eq!(body["code"], code);
+            if code == "registration_conflict" {
+                assert_eq!(headers.get(header::RETRY_AFTER).unwrap(), "1");
+            } else {
+                assert!(headers.get(header::RETRY_AFTER).is_none());
+            }
             assert!(
                 headers
                     .get(header::CONTENT_TYPE)

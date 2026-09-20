@@ -25,7 +25,7 @@ use account_management_service::{
     },
     domain::{EmailReservation, ReservationPhase, UserAccountId},
     infrastructure::{
-        cqrs::email_reservation_gateway::CqrsEmailReservationGateway,
+        cqrs::{AggregateConflictRetryPolicy, email_reservation_gateway::CqrsEmailReservationGateway},
         postgres::{event_repository_with_outbox::PostgresEventRepositoryWithOutbox, outbox_queue::PostgresOutboxQueue},
     },
     presentation,
@@ -109,10 +109,13 @@ fn store(pool: &PgPool) -> Store {
 
 fn gateway(pool: &PgPool) -> Arc<dyn EmailReservationGateway> {
     let command_pool = pool.clone();
-    Arc::new(CqrsEmailReservationGateway::new(move |messages| {
-        let repository = PostgresEventRepositoryWithOutbox::new(command_pool.clone()).with_outbox(messages);
-        cqrs_es::CqrsFramework::new(PersistedEventStore::new_snapshot_store(repository, 3), vec![], ())
-    }))
+    Arc::new(CqrsEmailReservationGateway::new(
+        move |messages| {
+            let repository = PostgresEventRepositoryWithOutbox::new(command_pool.clone()).with_outbox(messages);
+            cqrs_es::CqrsFramework::new(PersistedEventStore::new_snapshot_store(repository, 3), vec![], ())
+        },
+        AggregateConflictRetryPolicy::default(),
+    ))
 }
 
 struct TestGenerator {
@@ -628,17 +631,20 @@ fn gated_app(pool: &PgPool, gate: Arc<RaceGate>, first: bool, first_id: u64, cod
     let command_pool = pool.clone();
     let gate_once = Arc::new(AtomicBool::new(true));
     let wait_once = Arc::new(AtomicBool::new(true));
-    let gateway = Arc::new(CqrsEmailReservationGateway::new(move |messages| {
-        let repository = PostgresEventRepositoryWithOutbox::new(command_pool.clone()).with_outbox(messages);
-        let gated = GatedStore {
-            inner: PersistedEventStore::new_snapshot_store(repository, 3),
-            gate: gate.clone(),
-            first,
-            gate_once: gate_once.clone(),
-            wait_once: wait_once.clone(),
-        };
-        cqrs_es::CqrsFramework::new(gated, vec![], ())
-    }));
+    let gateway = Arc::new(CqrsEmailReservationGateway::new(
+        move |messages| {
+            let repository = PostgresEventRepositoryWithOutbox::new(command_pool.clone()).with_outbox(messages);
+            let gated = GatedStore {
+                inner: PersistedEventStore::new_snapshot_store(repository, 3),
+                gate: gate.clone(),
+                first,
+                gate_once: gate_once.clone(),
+                wait_once: wait_once.clone(),
+            };
+            cqrs_es::CqrsFramework::new(gated, vec![], ())
+        },
+        AggregateConflictRetryPolicy::default(),
+    ));
     presentation::http::router(
         email_reservation_service(gateway, Arc::new(TestGenerator::new(first_id, code))),
         Arc::new(UnusedRegistrationService),
@@ -675,9 +681,13 @@ async fn reissue_and_verify_races_follow_commit_order_without_stale_tasks() {
             if verify_first {
                 StatusCode::ACCEPTED
             } else {
-                StatusCode::CONFLICT
+                StatusCode::NOT_FOUND
             }
         );
+        if !verify_first {
+            assert_eq!(second_result.1["code"], "registration_not_current");
+            assert!(second_result.2.get(header::RETRY_AFTER).is_none());
+        }
         assert!(
             matches!(phase(&db.pool, &email).await, ReservationPhase::AwaitingCode { account_id, .. } if account_id.to_string() != old_id)
         );
@@ -734,6 +744,8 @@ async fn two_verifications_of_one_pair_issue_only_one_token_digest() {
     );
     assert_eq!(first.0, StatusCode::OK);
     assert_eq!(second.0, StatusCode::CONFLICT);
+    assert_eq!(second.1["code"], "already_verified");
+    assert!(second.2.get(header::RETRY_AFTER).is_none());
     assert!(second.1.get("account_creation_token").is_none());
     assert_eq!(events(&db.pool, email).await.len(), 2);
     assert_eq!(outbox_tasks(&db.pool, email).await.len(), 1);

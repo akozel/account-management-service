@@ -214,12 +214,13 @@ fn sequence_as_i64(sequence: usize) -> Result<i64, PersistenceError> {
 }
 
 fn map_sqlx_error(error: sqlx::Error) -> PersistenceError {
-    let is_unique_violation = matches!(
+    let is_optimistic_conflict = matches!(
         &error,
         sqlx::Error::Database(database_error)
             if database_error.code().as_deref() == Some("23505")
+                && matches!(database_error.constraint(), Some("events_pkey" | "snapshots_pkey"))
     );
-    if is_unique_violation {
+    if is_optimistic_conflict {
         return PersistenceError::OptimisticLockError;
     }
     if matches!(&error, sqlx::Error::Io(_) | sqlx::Error::Tls(_)) {

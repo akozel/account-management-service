@@ -12,9 +12,14 @@ use account_management_service::{
     },
     infrastructure::{
         console_verification_code_sender::ConsoleVerificationCodeSender,
-        cqrs::email_reservation_gateway::CqrsEmailReservationGateway, cqrs::user_account_gateway::CqrsUserAccountGateway,
-        postgres::event_repository_with_outbox::PostgresEventRepositoryWithOutbox, postgres::outbox_queue::PostgresOutboxQueue,
-        registration_material_generator::RandomRegistrationMaterialGenerator, system_registration_clock::SystemRegistrationClock,
+        cqrs::{
+            AggregateConflictRetryPolicy, email_reservation_gateway::CqrsEmailReservationGateway,
+            user_account_gateway::CqrsUserAccountGateway,
+        },
+        postgres::event_repository_with_outbox::PostgresEventRepositoryWithOutbox,
+        postgres::outbox_queue::PostgresOutboxQueue,
+        registration_material_generator::RandomRegistrationMaterialGenerator,
+        system_registration_clock::SystemRegistrationClock,
     },
     presentation,
 };
@@ -28,19 +33,26 @@ async fn main() {
     let bind_address = std::env::var("BIND_ADDRESS").expect("BIND_ADDRESS must be set");
 
     let pool = postgres_es::default_postgress_pool(&database_url).await;
+    let aggregate_conflict_retry = AggregateConflictRetryPolicy::default();
     let command_pool = pool.clone();
-    let gateway = Arc::new(CqrsEmailReservationGateway::new(move |tasks| {
-        let repository = PostgresEventRepositoryWithOutbox::new(command_pool.clone()).with_outbox(tasks);
-        let store = PersistedEventStore::new_snapshot_store(repository, 25);
-        CqrsFramework::new(store, Vec::new(), ())
-    }));
+    let gateway = Arc::new(CqrsEmailReservationGateway::new(
+        move |tasks| {
+            let repository = PostgresEventRepositoryWithOutbox::new(command_pool.clone()).with_outbox(tasks);
+            let store = PersistedEventStore::new_snapshot_store(repository, 25);
+            CqrsFramework::new(store, Vec::new(), ())
+        },
+        aggregate_conflict_retry,
+    ));
     let queue = Arc::new(PostgresOutboxQueue::new(pool.clone()));
     let account_pool = pool.clone();
-    let account_gateway = Arc::new(CqrsUserAccountGateway::new(move |tasks| {
-        let repository = PostgresEventRepositoryWithOutbox::new(account_pool.clone()).with_outbox(tasks);
-        let store = PersistedEventStore::new_snapshot_store(repository, 25);
-        CqrsFramework::new(store, Vec::new(), ())
-    }));
+    let account_gateway = Arc::new(CqrsUserAccountGateway::new(
+        move |tasks| {
+            let repository = PostgresEventRepositoryWithOutbox::new(account_pool.clone()).with_outbox(tasks);
+            let store = PersistedEventStore::new_snapshot_store(repository, 25);
+            CqrsFramework::new(store, Vec::new(), ())
+        },
+        aggregate_conflict_retry,
+    ));
     let registration = registration_service(gateway.clone(), account_gateway, Arc::new(SystemRegistrationClock));
     let http_registration = registration.clone();
     let handler_factory: presentation::outbox_worker_pool::TaskHandlerFactory = Arc::new(move || {

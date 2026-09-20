@@ -3,7 +3,7 @@ use std::sync::Arc;
 use axum::{
     Router,
     extract::rejection::{JsonRejection, PathRejection},
-    http::StatusCode,
+    http::{HeaderValue, StatusCode, header},
     response::{IntoResponse, Response},
     routing::{get, post},
 };
@@ -104,6 +104,7 @@ impl From<EmailReservationServiceError> for EmailReservationsError {
 
 impl IntoResponse for EmailReservationsError {
     fn into_response(self) -> Response {
+        let retry_after = matches!(self, Self::Conflict);
         let (status, code, message) = match self {
             Self::InvalidRequest => (StatusCode::BAD_REQUEST, "invalid_request", "invalid request"),
             Self::InvalidEmail => (StatusCode::UNPROCESSABLE_ENTITY, "invalid_email", "invalid email address"),
@@ -126,7 +127,7 @@ impl IntoResponse for EmailReservationsError {
                 "invalid verification code",
             ),
             Self::Conflict => (
-                StatusCode::CONFLICT,
+                StatusCode::TOO_MANY_REQUESTS,
                 "email_reservation_conflict",
                 "email reservation changed concurrently",
             ),
@@ -141,7 +142,13 @@ impl IntoResponse for EmailReservationsError {
                 "email reservation failed",
             ),
         };
-        error_response(status, code, message.to_owned())
+        let mut response = error_response(status, code, message.to_owned());
+        if retry_after {
+            response
+                .headers_mut()
+                .insert(header::RETRY_AFTER, HeaderValue::from_static("1"));
+        }
+        response
     }
 }
 
@@ -360,7 +367,7 @@ mod tests {
                 StatusCode::UNPROCESSABLE_ENTITY,
                 "invalid_verification_code",
             ),
-            (E::Conflict, StatusCode::CONFLICT, "email_reservation_conflict"),
+            (E::Conflict, StatusCode::TOO_MANY_REQUESTS, "email_reservation_conflict"),
             (E::Unavailable, StatusCode::SERVICE_UNAVAILABLE, "service_unavailable"),
             (
                 E::UnexpectedDomainRejection(crate::domain::EmailReservationError::AccountIdUnchanged),
@@ -368,7 +375,7 @@ mod tests {
                 "internal_error",
             ),
         ] {
-            let (actual, body, _) = call(
+            let (actual, body, headers) = call(
                 "/email-reservations/alice%40example.com/verify",
                 Some(json!({"account_id":ID,"code":1234567})),
                 Some(error),
@@ -376,6 +383,11 @@ mod tests {
             .await;
             assert_eq!(actual, status);
             assert_eq!(body["code"], code);
+            if code == "email_reservation_conflict" {
+                assert_eq!(headers.get(header::RETRY_AFTER).unwrap(), "1");
+            } else {
+                assert!(headers.get(header::RETRY_AFTER).is_none());
+            }
             assert!(!body.to_string().contains("opaque-test-token"));
         }
     }

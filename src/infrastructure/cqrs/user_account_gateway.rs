@@ -1,7 +1,7 @@
 use async_trait::async_trait;
 use cqrs_es::{CqrsFramework, EventStore};
 
-use super::map_aggregate_error;
+use super::{AggregateConflictRetryPolicy, map_aggregate_error, retry_on_aggregate_conflict};
 
 use crate::{
     application::{CommandGatewayError, outbox::NewOutboxTask, user_account::gateway::UserAccountGateway},
@@ -10,11 +10,15 @@ use crate::{
 
 pub struct CqrsUserAccountGateway<BuildFramework> {
     build_framework: BuildFramework,
+    retry_policy: AggregateConflictRetryPolicy,
 }
 
 impl<BuildFramework> CqrsUserAccountGateway<BuildFramework> {
-    pub fn new(build_framework: BuildFramework) -> Self {
-        Self { build_framework }
+    pub fn new(build_framework: BuildFramework, retry_policy: AggregateConflictRetryPolicy) -> Self {
+        Self {
+            build_framework,
+            retry_policy,
+        }
     }
 }
 
@@ -31,8 +35,9 @@ where
         tasks: Vec<NewOutboxTask>,
     ) -> Result<(), CommandGatewayError<UserAccountError>> {
         let UserAccountCommand::CreateAccount { account_id, .. } = &command;
-        (self.build_framework)(tasks)
-            .execute(&account_id.to_string(), command)
+        let aggregate_id = account_id.to_string();
+        let framework = (self.build_framework)(tasks);
+        retry_on_aggregate_conflict(self.retry_policy, || framework.execute(&aggregate_id, command.clone()))
             .await
             .map_err(map_aggregate_error)
     }

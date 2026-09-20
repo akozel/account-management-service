@@ -51,8 +51,8 @@ src/
   Gateway results use the shared
   `application::CommandGatewayError<DomainError>`; do not define a
   feature-specific gateway-error enum. `use_cases.rs` declares the private
-  workflows and their shared retry constants. Its `test_support.rs` is
-  compiled only for unit tests and holds the fake gateway.
+  workflows and their shared constants. Keep test-only fakes out of `src/`;
+  application boundary tests under `tests/` own their gateway fakes.
 - `{capability}/use_cases/{use_case}.rs` implements one workflow. It
   creates the domain command, calls the feature gateway, and follows
   [Error boundaries](#error-boundaries). It does not define a public API for
@@ -104,6 +104,25 @@ cross-layer enum.
 - A presentation resource maps expected service errors to its HTTP contract.
   It maps unavailable and unexpected service errors to safe internal responses
   without exposing domain, framework, or persistence details.
+
+## Retry ownership
+
+- Infrastructure CQRS owns a short optimistic-conflict retry. It rebuilds
+  aggregate state for every attempt while repeating the same command and the
+  same prebuilt outbox tasks. `max_attempts` counts the initial execution.
+- Retry only `AggregateError::AggregateConflict`. Never automatically retry
+  connection, timeout, unavailable, deserialization, or unexpected failures:
+  their commit outcome may be unknown without an idempotency mechanism.
+- Application issues one generated command per workflow invocation. It does
+  not regenerate a command for rare random-value collisions such as
+  `AccountIdUnchanged`; map that outcome to the feature conflict contract.
+- Durable outbox delivery remains the long-lived retry boundary for internal
+  handlers. An exhausted fast conflict can become a retryable task outcome,
+  but the application layer must not repeat that same conflict first.
+- Retry budgets may multiply only for different causes (`10 × 3` for durable
+  delivery plus CQRS conflicts). The same error must never be retried by
+  adjacent layers.
+- Fast command retry does not make a later client HTTP request idempotent.
 
 ## Infrastructure layout
 
@@ -280,8 +299,8 @@ src/
 
 ## Test ownership
 
-- Unit-test use-case command, error and code-regeneration matrices beside each
-  workflow, using the fake gateway in `use_cases/test_support.rs`.
+- Test application command and error matrices through the public input service
+  in integration tests under `tests/`; those tests own their gateway fakes.
 - HTTP tests send in-memory Axum requests to a stub input service. They do not
   construct an application service or gateway.
 - Unit-test payload construction in `outbox/task.rs`, retry and timeout in

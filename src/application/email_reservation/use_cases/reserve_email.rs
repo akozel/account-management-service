@@ -35,9 +35,8 @@ pub(crate) async fn execute(
         )
         .await
         .map_err(|error| match error {
-            CommandGatewayError::Domain(EmailReservationError::AlreadyReserved) | CommandGatewayError::Conflict => {
-                EmailReservationServiceError::AlreadyReserved
-            }
+            CommandGatewayError::Domain(EmailReservationError::AlreadyReserved) => EmailReservationServiceError::AlreadyReserved,
+            CommandGatewayError::Conflict => EmailReservationServiceError::Conflict,
             CommandGatewayError::Domain(error) => EmailReservationServiceError::UnexpectedDomainRejection(error),
             CommandGatewayError::Unavailable => EmailReservationServiceError::Unavailable,
         })?;

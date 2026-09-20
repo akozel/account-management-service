@@ -88,8 +88,6 @@ fn digest(token: &str) -> String {
     hex::encode(Sha256::digest(token.as_bytes()))
 }
 
-const SUBMISSION_CONFLICT_ATTEMPTS: usize = 3;
-
 #[async_trait]
 impl RegistrationService for DefaultRegistrationService {
     async fn submit_profile(&self, submission: ProfileSubmission) -> Result<AcceptedSubmission, SubmissionError> {
@@ -111,25 +109,15 @@ impl RegistrationService for DefaultRegistrationService {
             profile,
         })
         .map_err(|_| SubmissionError::Unavailable)?;
-        for attempt in 0..SUBMISSION_CONFLICT_ATTEMPTS {
-            match self
-                .email_gateway
-                .execute_with_outbox(command.clone(), vec![task.clone()])
-                .await
-            {
-                Ok(()) => {
-                    return Ok(AcceptedSubmission {
-                        email: submission.email,
-                        account_id: submission.account_id,
-                    });
-                }
-                Err(CommandGatewayError::Conflict) if attempt + 1 < SUBMISSION_CONFLICT_ATTEMPTS => continue,
-                Err(CommandGatewayError::Conflict) => return Err(SubmissionError::Conflict),
-                Err(CommandGatewayError::Unavailable) => return Err(SubmissionError::Unavailable),
-                Err(CommandGatewayError::Domain(error)) => return Err(SubmissionError::Domain(error)),
-            }
+        match self.email_gateway.execute_with_outbox(command, vec![task]).await {
+            Ok(()) => Ok(AcceptedSubmission {
+                email: submission.email,
+                account_id: submission.account_id,
+            }),
+            Err(CommandGatewayError::Conflict) => Err(SubmissionError::Conflict),
+            Err(CommandGatewayError::Unavailable) => Err(SubmissionError::Unavailable),
+            Err(CommandGatewayError::Domain(error)) => Err(SubmissionError::Domain(error)),
         }
-        unreachable!("submission attempts are positive")
     }
 
     async fn create_account(&self, task: CreateAccountTaskV1) -> Result<(), ContinuationError> {
@@ -170,5 +158,116 @@ impl RegistrationService for DefaultRegistrationService {
             Err(CommandGatewayError::Conflict | CommandGatewayError::Unavailable) => Err(ContinuationError::Retry),
             Err(CommandGatewayError::Domain(_)) => Err(ContinuationError::Permanent),
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use std::sync::atomic::{AtomicUsize, Ordering};
+
+    use super::*;
+
+    struct ConflictEmailGateway {
+        calls: AtomicUsize,
+    }
+
+    #[async_trait]
+    impl EmailReservationGateway for ConflictEmailGateway {
+        async fn execute(&self, _: EmailReservationCommand) -> Result<(), CommandGatewayError<EmailReservationError>> {
+            self.calls.fetch_add(1, Ordering::SeqCst);
+            Err(CommandGatewayError::Conflict)
+        }
+
+        async fn execute_with_outbox(
+            &self,
+            _: EmailReservationCommand,
+            tasks: Vec<NewOutboxTask>,
+        ) -> Result<(), CommandGatewayError<EmailReservationError>> {
+            self.calls.fetch_add(1, Ordering::SeqCst);
+            assert_eq!(tasks.len(), 1);
+            Err(CommandGatewayError::Conflict)
+        }
+    }
+
+    struct ConflictAccountGateway;
+
+    #[async_trait]
+    impl UserAccountGateway for ConflictAccountGateway {
+        async fn execute_with_outbox(
+            &self,
+            _: UserAccountCommand,
+            _: Vec<NewOutboxTask>,
+        ) -> Result<(), CommandGatewayError<UserAccountError>> {
+            Err(CommandGatewayError::Conflict)
+        }
+    }
+
+    struct FixedClock;
+
+    impl RegistrationClock for FixedClock {
+        fn now(&self) -> DateTime<Utc> {
+            "2026-09-20T12:00:00Z".parse().unwrap()
+        }
+    }
+
+    #[tokio::test]
+    async fn profile_submission_delegates_conflict_retry_to_the_gateway() {
+        let email_gateway = Arc::new(ConflictEmailGateway {
+            calls: AtomicUsize::new(0),
+        });
+        let service = registration_service(email_gateway.clone(), Arc::new(ConflictAccountGateway), Arc::new(FixedClock));
+
+        let result = service
+            .submit_profile(ProfileSubmission {
+                email: Email::parse("alice@example.com").unwrap(),
+                account_id: "26e91668-f9fc-4be4-bd9d-321fba42e18b".parse().unwrap(),
+                account_creation_token: "token".into(),
+                first_name: "Alice".into(),
+                last_name: "Smith".into(),
+                date_of_birth: NaiveDate::from_ymd_opt(1990, 5, 12).unwrap(),
+            })
+            .await;
+
+        assert_eq!(result, Err(SubmissionError::Conflict));
+        assert_eq!(email_gateway.calls.load(Ordering::SeqCst), 1);
+    }
+
+    #[tokio::test]
+    async fn internal_continuations_keep_exhausted_conflicts_retryable() {
+        let email_gateway = Arc::new(ConflictEmailGateway {
+            calls: AtomicUsize::new(0),
+        });
+        let service = registration_service(email_gateway.clone(), Arc::new(ConflictAccountGateway), Arc::new(FixedClock));
+        let email = Email::parse("alice@example.com").unwrap();
+        let account_id = "26e91668-f9fc-4be4-bd9d-321fba42e18b".parse().unwrap();
+        let profile = RegistrationProfile::new(
+            "Alice".into(),
+            "Smith".into(),
+            NaiveDate::from_ymd_opt(1990, 5, 12).unwrap(),
+            NaiveDate::from_ymd_opt(2026, 9, 20).unwrap(),
+        );
+
+        assert_eq!(
+            service
+                .create_account(CreateAccountTaskV1 {
+                    email: email.clone(),
+                    account_id,
+                    profile: profile.clone(),
+                })
+                .await,
+            Err(ContinuationError::Retry)
+        );
+        assert_eq!(
+            service
+                .record_account_created(RecordAccountCreatedTaskV1 {
+                    email,
+                    account_id,
+                    profile,
+                    created_at: FixedClock.now(),
+                })
+                .await,
+            Err(ContinuationError::Retry)
+        );
+        assert_eq!(email_gateway.calls.load(Ordering::SeqCst), 1);
     }
 }
