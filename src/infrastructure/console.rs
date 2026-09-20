@@ -1,3 +1,5 @@
+//! Development console output adapters.
+
 use std::io::{self, Write};
 
 use crate::application::{

@@ -1,3 +1,5 @@
+//! System time adapters.
+
 use chrono::{DateTime, Utc};
 
 use crate::application::user_account::service::RegistrationClock;

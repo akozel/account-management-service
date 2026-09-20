@@ -24,6 +24,9 @@ configuration in this repository.
   failures into gateway failures, but must not interpret their business meaning.
   Do not expose those types through domain APIs.
 - `main` only composes dependencies and starts the application.
+- `runtime`, included privately by the binary, supervises process lifecycle:
+  shutdown signals, coordinated adapter draining, and runtime exit errors. It
+  may depend on presentation adapters but is not part of the library API.
 
 ## Application feature layout
 
@@ -132,14 +135,21 @@ Group outbound adapters by infrastructure technology:
 src/
   infrastructure.rs
   infrastructure/
+    console.rs
     cqrs.rs
     cqrs/
       {feature}_gateway.rs
     postgres.rs
     postgres/
       {adapter}.rs
+    random.rs
+    time.rs
 ```
 
+- Keep a technology in one module file while it has a single small adapter.
+  Split it into a same-named module file and directory only when multiple
+  adapters make that clearer. `random` owns entropy-backed generators, `time`
+  owns system clocks, and `console` owns development console output adapters.
 - `infrastructure/cqrs/{feature}_gateway.rs` implements the feature gateway. It accepts
   the domain command created by application, derives any framework aggregate id,
   executes it through `cqrs-es`, and follows [Error boundaries](#error-boundaries).
@@ -291,6 +301,8 @@ src/
 - `src/main.rs` is the composition root. Exclude it from line coverage because
   it only wires dependencies and starts the process; do not add brittle unit
   tests around process startup.
+- Keep `src/runtime.rs` in coverage and test lifecycle coordination there with
+  controlled futures rather than real process signals.
 - Keep `src/presentation/http.rs` in coverage. Test its top-level router through an
   in-memory Axum request so route composition is verified without PostgreSQL.
 - Keep infrastructure adapters in coverage until their integration-test

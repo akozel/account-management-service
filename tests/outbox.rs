@@ -17,7 +17,7 @@ use account_management_service::{
     },
     domain::{Email, EmailReservation},
     infrastructure::{
-        console_verification_code_sender::ConsoleVerificationCodeSender,
+        console::ConsoleVerificationCodeSender,
         postgres::{event_repository_with_outbox::PostgresEventRepositoryWithOutbox, outbox_queue::PostgresOutboxQueue},
     },
     presentation::outbox_worker_pool::{self, OutboxWorkerPoolConfig, TaskHandlerFactory},
