@@ -10,7 +10,11 @@ use super::{error::OutboxError, task::TaskFormat};
 use async_trait::async_trait;
 use serde_json::Value;
 use std::time::Duration;
+use tokio::time::Instant;
 use uuid::Uuid;
+
+/// Fixed reserve for dispatch/scheduling uncertainty beyond the explicit I/O budgets.
+pub const LEASE_SAFETY_MARGIN: Duration = Duration::from_secs(5);
 
 #[derive(Clone, Debug)]
 pub struct ClaimedTask {
@@ -20,6 +24,12 @@ pub struct ClaimedTask {
     pub metadata: Value,
     pub attempt: i32,
     pub lock_token: Uuid,
+    /// Conservative, process-local lease deadline on the runtime's monotonic clock.
+    /// The queue anchors this BEFORE requesting the database lease, so pool waits,
+    /// transport, commit, batch collection, and mailbox delay consume this budget.
+    /// Never derive it by comparing database UTC with the worker's wall clock;
+    /// it is not persisted and does not replace database token/expiry checks.
+    pub lease_deadline: Instant,
 }
 
 #[derive(Clone, Debug, PartialEq)]

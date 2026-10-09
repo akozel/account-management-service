@@ -67,6 +67,7 @@ async fn ready_time_formats_and_skip_locked_distribute_without_overlap() {
         assert_eq!(saved.get::<i32, _>("attempts"), 0);
     }
     assert!(queue.claim(&format(), "test", 1, Duration::ZERO).await.is_err());
+    assert!(queue.claim(&format(), "test", 1, Duration::from_nanos(1)).await.is_err());
     assert!(queue.claim(&format(), "test", 1, Duration::MAX).await.is_err());
     db.close().await;
 }
@@ -226,6 +227,7 @@ async fn queue_indexes_serve_ready_and_expired_queries_with_finished_history() {
     );
     assert_eq!(queue.recover_expired(1).await.unwrap_err(), OutboxError::Unavailable);
     let dummy = ClaimedTask {
+        lease_deadline: tokio::time::Instant::now() + Duration::from_secs(60),
         id: Uuid::new_v4(),
         format: format(),
         payload: json!({}),

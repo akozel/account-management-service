@@ -8,4 +8,6 @@ pub enum OutboxError {
     Unavailable,
     #[error("outbox storage operation timed out; its result is unknown")]
     TimedOut,
+    #[error("outbox lease budget exhausted; task requires durable recovery")]
+    LeaseBudgetExhausted,
 }

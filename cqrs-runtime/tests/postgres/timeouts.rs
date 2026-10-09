@@ -8,6 +8,7 @@ struct LostReplyQueue {
     inner: PostgresOutboxQueue,
     lose_claim_reply: std::sync::atomic::AtomicBool,
     lose_settle_reply: std::sync::atomic::AtomicBool,
+    delayed_format: Option<TaskFormat>,
 }
 
 #[async_trait]
@@ -19,6 +20,9 @@ impl OutboxQueue for LostReplyQueue {
         limit: usize,
         lease: Duration,
     ) -> Result<Vec<ClaimedTask>, OutboxError> {
+        if self.delayed_format.as_ref() == Some(format) {
+            std::future::pending::<()>().await;
+        }
         let result = self.inner.claim(format, owner, limit, lease).await?;
         if self.lose_claim_reply.load(Ordering::SeqCst) {
             std::future::pending::<()>().await;
@@ -48,6 +52,7 @@ async fn deadlines_after_committed_claim_or_settlement_preserve_durable_outcomes
         inner: PostgresOutboxQueue::new(db.pool.clone()),
         lose_claim_reply: std::sync::atomic::AtomicBool::new(true),
         lose_settle_reply: std::sync::atomic::AtomicBool::new(true),
+        delayed_format: None,
     });
     let coordinator = outbox_task_coordinator_with_config(
         queue.clone(),
@@ -88,6 +93,126 @@ async fn deadlines_after_committed_claim_or_settlement_preserve_durable_outcomes
             .unwrap()
             .is_empty()
     );
+    db.close().await;
+}
+
+#[tokio::test]
+async fn delayed_batch_keeps_the_original_task_deadline_and_skips_expired_execution() {
+    let db = Database::new().await;
+    let task = new_task();
+    enqueue(&db.pool, vec![task.clone()]).await;
+    let delayed_format = TaskFormat {
+        task_type: "delayed".into(),
+        task_version: 1,
+    };
+    let queue = Arc::new(LostReplyQueue {
+        inner: PostgresOutboxQueue::new(db.pool.clone()),
+        lose_claim_reply: std::sync::atomic::AtomicBool::new(false),
+        lose_settle_reply: std::sync::atomic::AtomicBool::new(false),
+        delayed_format: Some(delayed_format.clone()),
+    });
+    let coordinator = outbox_task_coordinator_with_config(
+        queue.clone(),
+        vec![format(), delayed_format],
+        OutboxTaskCoordinatorConfig {
+            storage_timeout: Duration::from_millis(300),
+        },
+    )
+    .unwrap();
+    let old = coordinator
+        .claim("test", 2, Duration::from_millis(100))
+        .await
+        .unwrap()
+        .pop()
+        .unwrap();
+    assert!(old.lease_deadline <= tokio::time::Instant::now());
+    let calls = Arc::new(AtomicUsize::new(0));
+    assert_eq!(
+        coordinator
+            .execute_and_settle(&mut CountingHandler(calls.clone()), old.clone(), Duration::from_secs(1))
+            .await,
+        Err(OutboxError::LeaseBudgetExhausted)
+    );
+    assert_eq!(calls.load(Ordering::SeqCst), 0);
+    assert_worker_state(&db.pool, task.id, "processing", 1, None).await;
+    // Force server expiry as well: the conservative local deadline may precede it.
+    expire(&db.pool, task.id).await;
+    assert_eq!(coordinator.recover_expired(1).await.unwrap().recovered, 1);
+    make_ready(&db.pool, task.id).await;
+    let fresh = claim(&queue.inner).await.pop().unwrap();
+    assert_ne!(old.lock_token, fresh.lock_token);
+    assert!(!queue.inner.settle(&old, TaskOutcome::Completed).await.unwrap().is_settled());
+    assert!(
+        coordinator
+            .execute_and_settle(&mut CountingHandler(calls.clone()), fresh, Duration::from_secs(1))
+            .await
+            .unwrap()
+            .is_settled()
+    );
+    assert_eq!(calls.load(Ordering::SeqCst), 1);
+    assert_worker_state(&db.pool, task.id, "completed", 2, None).await;
+    db.close().await;
+}
+
+#[tokio::test]
+async fn insufficient_remaining_lease_returns_task_to_retry_without_performing_its_effect() {
+    let db = Database::new().await;
+    let task = new_task();
+    enqueue(&db.pool, vec![task.clone()]).await;
+    let queue = Arc::new(PostgresOutboxQueue::new(db.pool.clone()));
+    let coordinator = outbox_task_coordinator_with_config(
+        queue.clone(),
+        vec![format()],
+        OutboxTaskCoordinatorConfig {
+            storage_timeout: Duration::from_millis(300),
+        },
+    )
+    .unwrap();
+    let mut old = coordinator
+        .claim("test", 1, Duration::from_secs(60))
+        .await
+        .unwrap()
+        .pop()
+        .unwrap();
+    // Model dispatch delay using a shorter conservative local budget; the DB
+    // ownership remains live, so the original attempt can safely request retry.
+    old.lease_deadline = tokio::time::Instant::now() + Duration::from_secs(10);
+    let calls = Arc::new(AtomicUsize::new(0));
+    assert!(
+        coordinator
+            .execute_and_settle(&mut CountingHandler(calls.clone()), old.clone(), Duration::from_secs(30))
+            .await
+            .unwrap()
+            .is_settled()
+    );
+    assert_eq!(calls.load(Ordering::SeqCst), 0);
+    assert_worker_state(
+        &db.pool,
+        task.id,
+        "pending",
+        1,
+        Some("insufficient lease budget before handler execution"),
+    )
+    .await;
+    make_ready(&db.pool, task.id).await;
+    let fresh = coordinator
+        .claim("test", 1, Duration::from_secs(60))
+        .await
+        .unwrap()
+        .pop()
+        .unwrap();
+    assert_eq!(fresh.id, old.id);
+    assert_eq!(fresh.payload, old.payload);
+    assert_ne!(fresh.lock_token, old.lock_token);
+    assert!(
+        coordinator
+            .execute_and_settle(&mut CountingHandler(calls.clone()), fresh, Duration::from_secs(30))
+            .await
+            .unwrap()
+            .is_settled()
+    );
+    assert_eq!(calls.load(Ordering::SeqCst), 1);
+    assert_worker_state(&db.pool, task.id, "completed", 2, None).await;
     db.close().await;
 }
 

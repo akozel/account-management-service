@@ -3,6 +3,7 @@ use std::time::Duration;
 use async_trait::async_trait;
 use sqlx::{PgPool, Postgres, Row, Transaction};
 use thiserror::Error;
+use tokio::time::Instant;
 
 use crate::outbox::{
     ClaimedTask, FailedTask, OutboxError, OutboxQueue, RecoveryResult, SettleResult, TaskFormat, TaskOutcome, retry_delay,
@@ -107,9 +108,12 @@ impl OutboxQueue for PostgresOutboxQueue {
         limit: usize,
         lease: Duration,
     ) -> Result<Vec<ClaimedTask>, OutboxError> {
-        if lease.is_zero() {
+        if lease.as_millis() == 0 {
             return Err(OutboxError::InvalidTask);
         }
+        // PostgreSQL grants its lease later, during UPDATE. Starting our local
+        // clock before any await gives a conservative bound without UTC skew.
+        let lease_deadline = Instant::now().checked_add(lease).ok_or(OutboxError::InvalidTask)?;
         let limit = i64::try_from(limit).map_err(|_| OutboxError::InvalidTask)?;
         let mut tx = self.transaction().await?;
         let rows = sqlx::query(
@@ -146,6 +150,7 @@ impl OutboxQueue for PostgresOutboxQueue {
                     metadata: row.try_get("metadata")?,
                     attempt: row.try_get("attempts")?,
                     lock_token: row.try_get("lock_token")?,
+                    lease_deadline,
                 })
             })
             .collect::<Result<Vec<_>, sqlx::Error>>()

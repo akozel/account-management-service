@@ -181,18 +181,72 @@ The server setting must fit PostgreSQL's `1..=2147483647` millisecond range.
 Both configurations reject zero, invalid numbers, and unsupported durations
 at startup. Prefer a server budget shorter than the runtime budget, while
 accounting for their different starting points and multi-statement recovery.
-The handler timeout and lease are separate settings; this change does not
-introduce lease renewal or a full remaining-lease check before execution.
+The handler timeout and lease are separate settings; their combined budget
+and per-task execution check are defined below. No lease renewal is enabled.
 
 Regression tests cover stalled queue calls during normal worker operation,
 the shared multi-format claim budget, pool-acquisition deadlines, server
 cancellation of lock waits and slow statements, pooled-setting restoration,
 rollback of cancelled claims, and lost replies after real commits.
 
-## Remaining open question
+## Lease budget and individual task deadlines
 
-[Question 3](known_issues/2026-10-10-task_worker_open_questions.md) is closed by
-the implemented runtime and PostgreSQL limits and regression tests. Question
-4, budgeting the lease from claim through settlement, still requires
-discussion. Question 2 remains closed by handler replay safety and separate
-retry policies; none of these decisions implies exactly-once external effects.
+Status: implemented. The typical case uses a 30-second total handler budget
+and a 60-second lease. Local retries do not each receive a new handler budget:
+
+```text
+handler budget >= sum(attempt durations) + sum(local backoff) + overhead
+lease > claim budget + handler budget + settlement budget + safety margin
+defaults: 60s > 5s + 30s + 5s + 5s = 45s
+```
+
+There are 15 seconds of additional headroom. The five-second safety margin
+is a fixed runtime constant, `LEASE_SAFETY_MARGIN`. At startup, `main` and
+`worker::run` validate the full formula using the coordinator's effective
+storage timeout; incompatible or overflowing budgets are rejected. Shutdown
+draining also allows a remaining handler invocation plus the coordinator's
+actual settlement timeout, rather than assuming a five-second I/O default.
+
+A ten-second initial attempt leaves at most twenty seconds for all subsequent
+attempts, backoff, and overhead. Three total ten-second attempts already need
+thirty seconds before backoff; three retries after an initial attempt can
+need forty seconds plus backoff. Do not assume these retries necessarily fit.
+For example, an initial attempt capped at ten seconds, three retries capped
+at four seconds each, and three two-second backoffs use twenty-eight seconds,
+leaving two seconds for overhead. This is budget guidance, not an implemented
+policy for the current console sender.
+
+`ClaimedTask.lease_deadline` is process-local runtime context. The PostgreSQL
+queue anchors it to a monotonic instant before acquiring a connection or
+requesting the DB lease. Because the server grants ownership later, this is
+a conservative bound that includes transport, commit, batch collection,
+dispatch, and mailbox delays without comparing database and worker UTC clocks.
+Preserve it when passing/cloning a task; never restart its clock at dispatch.
+Other queue adapters must provide an equally conservative deadline. Payload
+versions, stored tasks, and SQL schema do not change.
+
+Before running the handler, the coordinator requires the task's remaining
+budget to fit the full handler timeout, storage timeout for settlement, and
+safety margin. It does not silently shorten the handler's invocation budget.
+If that budget no longer fits, it requests a normal retry without calling
+the handler. If the remaining lease minus margin cannot support any safe
+settlement, it returns `OutboxError::LeaseBudgetExhausted` and leaves durable
+work for recovery. These skipped executions still consume their claim attempt.
+
+Settlement has an absolute deadline at the earlier of its ordinary storage
+deadline and the task's original lease deadline minus margin. After a process
+pause exhausts that budget, no new settlement call starts. Cooperative timer
+branches are polled first when a deadline and an operation are both ready.
+
+This estimate is not proof of current DB ownership: database token/expiry
+checks remain authoritative if clocks change or another owner recovers work.
+A process pause or already-sent remote request can still outlive ownership;
+handlers retain the replay-safety contract. No heartbeat or renewal mechanism
+is introduced.
+
+## Resolved worker questions
+
+[Questions 2–4](known_issues/2026-10-10-task_worker_open_questions.md) are closed:
+handler replay safety and separate retry policies, runtime/PostgreSQL storage
+limits, and validated per-task lease budgets. These decisions do not imply
+exactly-once external effects.

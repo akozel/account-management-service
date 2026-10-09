@@ -87,6 +87,10 @@ mod tests {
             vec![]
         }
 
+        fn storage_timeout(&self) -> Duration {
+            Duration::from_secs(1)
+        }
+
         async fn claim(&self, _: &str, _: usize, _: Duration) -> Result<Vec<ClaimedTask>, OutboxError> {
             Ok(vec![])
         }

@@ -319,7 +319,23 @@ timeouts. `PostgresOutboxQueueConfig` owns the positive
 transaction-locally for queue SQL, including lock waiting. Keep these settings
 out of shared-pool session state and event-store command policy. Runtime
 timeout means an unknown storage outcome; free the waiting capacity without
-inferring task success or failure. Lease budgeting remains open in `doc/known_issues`.
+inferring task success or failure.
+
+The whole handler invocation (all local attempts, SDK retries, backoff, and
+overhead) must fit `OUTBOX_HANDLER_TIMEOUT_SECS`. Three retries after an initial
+ten-second attempt are not three total attempts; four ten-second attempts need
+forty seconds before backoff and cannot be promised inside a thirty-second cap.
+Validate `lease > 2 * storage_timeout + handler_timeout + LEASE_SAFETY_MARGIN`
+against the coordinator's actual budget at startup. The fixed margin is five
+seconds; defaults give `60 > 5 + 30 + 5 + 5 = 45`, with fifteen seconds extra.
+
+Each `ClaimedTask` carries a conservative monotonic `lease_deadline` anchored
+before the DB claim request, never reset at dispatch and never derived by
+comparing database UTC to the worker's wall clock. Run a handler only when its
+full budget and settlement reserve fit. Otherwise request retry without the
+effect, or leave the task for recovery when safe settlement time is exhausted.
+Bound acknowledgement by the earlier storage deadline and lease minus margin.
+Keep database token/expiry fencing and replay-safe handlers; no renewal is enabled.
 
 ## Presentation layout
 

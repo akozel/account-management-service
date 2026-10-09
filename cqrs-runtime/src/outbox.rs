@@ -23,7 +23,7 @@ pub use coordinator::{
     outbox_task_coordinator_with_config, retry_delay,
 };
 pub use error::OutboxError;
-pub use queue::{ClaimedTask, FailedTask, OutboxQueue, RecoveryResult, SettleResult, TaskOutcome};
+pub use queue::{ClaimedTask, FailedTask, LEASE_SAFETY_MARGIN, OutboxQueue, RecoveryResult, SettleResult, TaskOutcome};
 pub use task::{NewOutboxTask, Schedule, TaskFormat, TaskPayload};
 pub use task_handler::{TaskExecutionError, TaskHandler};
 pub use task_handler_registry::{TaskHandlerRegistry, TaskHandlerRegistryError};
@@ -68,6 +68,7 @@ pub(crate) mod test_support {
             metadata: json!({"correlation_id": "test"}),
             attempt: 2,
             lock_token: Uuid::new_v4(),
+            lease_deadline: tokio::time::Instant::now() + Duration::from_secs(60),
         }
     }
 
@@ -90,7 +91,14 @@ pub(crate) mod test_support {
 
     #[async_trait]
     impl OutboxQueue for Queue {
-        async fn claim(&self, format: &TaskFormat, _: &str, limit: usize, _: Duration) -> Result<Vec<ClaimedTask>, OutboxError> {
+        async fn claim(
+            &self,
+            format: &TaskFormat,
+            _: &str,
+            limit: usize,
+            lease: Duration,
+        ) -> Result<Vec<ClaimedTask>, OutboxError> {
+            let lease_deadline = tokio::time::Instant::now() + lease;
             self.requested.lock().unwrap().push(format.clone());
             let delay = *self.claim_delay.lock().unwrap();
             if !delay.is_zero() {
@@ -105,7 +113,9 @@ pub(crate) mod test_support {
             let mut incoming = self.incoming.lock().unwrap();
             let mut result = Vec::new();
             while result.len() < limit && incoming.front().is_some_and(|message| message.format == *format) {
-                result.push(incoming.pop_front().unwrap());
+                let mut task = incoming.pop_front().unwrap();
+                task.lease_deadline = lease_deadline;
+                result.push(task);
             }
             Ok(result)
         }

@@ -287,6 +287,7 @@ async fn tasks(pool: &PgPool, task_type: &str) -> Vec<(Uuid, Value)> {
 
 fn claimed<T: TaskPayload>(row: &(Uuid, Value)) -> ClaimedTask {
     ClaimedTask {
+        lease_deadline: tokio::time::Instant::now() + Duration::from_secs(60),
         id: row.0,
         format: TaskFormat::of::<T>(),
         payload: row.1.clone(),

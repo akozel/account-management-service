@@ -35,10 +35,18 @@ Apply these boundaries when reviewing or changing the implementation:
   results when a later format times out. `PostgresOutboxQueueConfig` applies
   its statement timeout transaction-locally; shared-pool session settings
   must remain intact. Both settings are positive and documented in `.env.example`.
+- Validate the whole lease budget using the coordinator's actual storage
+  timeout: `lease > claim + handler + settlement + 5s margin`. Local retries
+  and backoff share the handler budget; distinguish retry count from total
+  attempts. Defaults are `60s > 5s + 30s + 5s + 5s = 45s`.
+- Preserve the task's conservative monotonic lease deadline from before claim.
+  Do not reset it on dispatch or compare database UTC with local wall time.
+  Skip handler execution when its full budget and settlement reserve no longer
+  fit. Request retry if safe settlement remains, otherwise use durable recovery.
+  Acknowledgement is bounded by storage time and lease minus margin. Database
+  token/expiry checks and idempotency remain necessary; no renewal is enabled.
 
 The separate [worker decisions and open questions](../../../../doc/known_issues/2026-10-10-task_worker_open_questions.md)
-close question 2 through handler replay safety and separate retry policies.
-Question 3 is closed by implemented deadlines and regression tests;
-question 4, lease budgeting, remains open for
-discussion. Closing question 2 does not imply exactly-once external effects
-or introduce lease renewal or deduplication APIs.
+close questions 2–4 through handler replay safety and separate retry policies,
+storage deadlines, and per-task lease budgets. Their closure does not imply
+exactly-once external effects or introduce lease renewal or deduplication APIs.

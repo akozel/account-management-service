@@ -77,6 +77,9 @@ async fn main() -> Result<(), RuntimeError> {
     let outbox = outbox_task_coordinator_with_config(queue, handler_factory().formats(), coordinator_config)
         .expect("valid outbox coordinator configuration");
     let worker_config = worker::OutboxWorkerPoolConfig::from_env().expect("valid worker configuration");
+    worker_config
+        .validate_for_storage_timeout(outbox.storage_timeout())
+        .expect("outbox lease must cover claim, handler, settlement, and safety margin");
     let email_reservation = email_reservation_service(gateway, Arc::new(RandomRegistrationMaterialGenerator));
     let app = presentation::http::router(email_reservation, http_registration);
     let listener = TcpListener::bind(&bind_address).await.expect("unable to bind HTTP listener");

@@ -5,6 +5,11 @@
 //! phases and accepted transitions establish business prerequisites before
 //! application publishes dependent work. Settlement concerns one task's
 //! operation, not advancement of aggregate state or completion of a workflow.
+//!
+//! Startup validates lease > claim + handler + settlement + 5-second margin
+//! against the coordinator's effective storage budget. Each handler budget
+//! includes local retries and backoff. Per-task deadlines preserve remaining
+//! ownership through dispatch; lease renewal is not enabled.
 
 use std::{sync::Arc, time::Duration};
 
@@ -16,7 +21,7 @@ use tokio::{
 use tracing::error;
 use uuid::Uuid;
 
-use crate::outbox::{OutboxTaskCoordinator, TaskFormat, TaskHandlerRegistry};
+use crate::outbox::{LEASE_SAFETY_MARGIN, OutboxTaskCoordinator, TaskFormat, TaskHandlerRegistry};
 mod task_worker;
 use task_worker::{log_failed, spawn_worker};
 
@@ -92,6 +97,24 @@ impl OutboxWorkerPoolConfig {
         }
         Ok(())
     }
+
+    /// Validate against the coordinator's actual I/O budget, not an assumed default.
+    /// One claim batch, the whole handler (local retries/backoff included), and
+    /// settlement must fit in the lease, with a fixed scheduling safety margin.
+    pub fn validate_for_storage_timeout(&self, storage_timeout: Duration) -> Result<(), OutboxWorkerPoolConfigError> {
+        self.validate()?;
+        let required = storage_timeout
+            .checked_mul(2)
+            .and_then(|budget| budget.checked_add(self.handler_timeout))
+            .and_then(|budget| budget.checked_add(LEASE_SAFETY_MARGIN))
+            .ok_or(OutboxWorkerPoolConfigError("lease budget overflows"))?;
+        if storage_timeout.is_zero() || self.lease <= required {
+            return Err(OutboxWorkerPoolConfigError(
+                "lease must exceed claim + handler + settlement + 5-second safety margin",
+            ));
+        }
+        Ok(())
+    }
 }
 
 pub async fn run(
@@ -100,7 +123,7 @@ pub async fn run(
     config: OutboxWorkerPoolConfig,
     mut shutdown: watch::Receiver<bool>,
 ) -> Result<(), OutboxWorkerPoolConfigError> {
-    config.validate()?;
+    config.validate_for_storage_timeout(service.storage_timeout())?;
     let formats = service.formats();
     let owner = Uuid::new_v4().to_string();
     let (completed, mut completions) = mpsc::channel(config.concurrency);
@@ -173,7 +196,9 @@ pub async fn run(
     }
     // Draining acknowledgements must not block workers on the completion channel.
     drop(completions);
-    let _ = tokio::time::timeout(config.handler_timeout + Duration::from_secs(5), async {
+    // Drain one remaining invocation plus the coordinator's actual acknowledgement
+    // budget. The per-task lease deadline still bounds both phases independently.
+    let _ = tokio::time::timeout(config.handler_timeout + service.storage_timeout(), async {
         for worker in &mut workers {
             let _ = (&mut worker.task).await;
         }
@@ -232,6 +257,51 @@ mod tests {
                 "{key}={value}"
             );
         }
+    }
+
+    #[test]
+    fn full_lease_budget_uses_effective_storage_timeout_and_rejects_overflow() {
+        let mut config = OutboxWorkerPoolConfig::default();
+        assert!(config.validate_for_storage_timeout(Duration::from_secs(5)).is_ok());
+        config.lease = Duration::from_secs(45);
+        assert!(config.validate_for_storage_timeout(Duration::from_secs(5)).is_err());
+        config.lease = Duration::from_secs(46);
+        assert!(config.validate_for_storage_timeout(Duration::from_secs(5)).is_ok());
+        assert!(config.validate_for_storage_timeout(Duration::from_secs(10)).is_err());
+        assert!(config.validate_for_storage_timeout(Duration::ZERO).is_err());
+        assert!(config.validate_for_storage_timeout(Duration::MAX).is_err());
+        config.concurrency = 0;
+        assert!(config.validate_for_storage_timeout(Duration::from_secs(5)).is_err());
+    }
+
+    #[tokio::test]
+    async fn invalid_full_lease_budget_is_rejected_before_polling() {
+        let queue = Arc::new(Queue::default());
+        let service = outbox_task_coordinator_with_config(
+            queue.clone(),
+            vec![format()],
+            OutboxTaskCoordinatorConfig {
+                storage_timeout: Duration::from_secs(10),
+            },
+        )
+        .unwrap();
+        let factory: TaskHandlerFactory = Arc::new(|| TaskHandlerRegistry::try_new(vec![Box::new(handler())]).unwrap());
+        let (_stop, shutdown) = watch::channel(false);
+        assert!(
+            super::run(
+                service,
+                factory,
+                OutboxWorkerPoolConfig {
+                    lease: Duration::from_secs(50),
+                    ..Default::default()
+                },
+                shutdown
+            )
+            .await
+            .is_err()
+        );
+        assert!(queue.requested.lock().unwrap().is_empty());
+        assert_eq!(queue.recovered.load(Ordering::SeqCst), 0);
     }
 
     #[tokio::test]
@@ -409,6 +479,34 @@ mod tests {
                 .unwrap();
             assert!(start.elapsed() <= Duration::from_secs(35));
         }
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn shutdown_drain_uses_the_configured_settlement_budget() {
+        let queue = Arc::new(Queue::default());
+        queue.hang_settle.store(true, Ordering::SeqCst);
+        queue.incoming.lock().unwrap().push_back(claimed());
+        let service = outbox_task_coordinator_with_config(
+            queue.clone(),
+            vec![format()],
+            OutboxTaskCoordinatorConfig {
+                storage_timeout: Duration::from_secs(10),
+            },
+        )
+        .unwrap();
+        let factory: TaskHandlerFactory = Arc::new(|| {
+            let mut handler = handler();
+            handler.hang = true;
+            TaskHandlerRegistry::try_new(vec![Box::new(handler)]).unwrap()
+        });
+        let (stop, shutdown) = watch::channel(false);
+        let started = tokio::time::Instant::now();
+        let worker = tokio::spawn(super::run(service, factory, OutboxWorkerPoolConfig::default(), shutdown));
+        wait_until(|| queue.requested.lock().unwrap().len() == 1).await;
+        stop.send(true).unwrap();
+        worker.await.unwrap().unwrap();
+        assert!(started.elapsed() >= Duration::from_secs(40));
+        assert!(matches!(queue.outcomes.lock().unwrap()[0].1, TaskOutcome::Retry { .. }));
     }
 
     #[tokio::test]

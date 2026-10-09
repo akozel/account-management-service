@@ -1,6 +1,15 @@
+//! Task execution within fixed leases and bounded storage operations.
+//!
+//! Local retries/backoff share one handler invocation budget. Before execution,
+//! the task must retain that full budget plus settlement time and the fixed
+//! safety margin. A stale budget triggers retry without running the handler,
+//! or durable recovery if even safe settlement no longer fits. Absolute local
+//! deadlines complement the database's token/expiry fencing; they do not renew
+//! ownership or cancel a side effect already accepted by a remote system.
+
 use super::{
     error::OutboxError,
-    queue::{ClaimedTask, OutboxQueue, RecoveryResult, SettleResult, TaskOutcome},
+    queue::{ClaimedTask, LEASE_SAFETY_MARGIN, OutboxQueue, RecoveryResult, SettleResult, TaskOutcome},
     task::TaskFormat,
     task_handler::{TaskExecutionError, TaskHandler},
 };
@@ -13,11 +22,13 @@ use std::{
     time::Duration,
 };
 use thiserror::Error;
-use tokio::time::{Instant, timeout, timeout_at};
+use tokio::time::{Instant, sleep_until, timeout, timeout_at};
 
 #[async_trait]
 pub trait OutboxTaskCoordinator: Send + Sync {
     fn formats(&self) -> Vec<TaskFormat>;
+    /// Effective storage budget used by worker startup to validate the full lease.
+    fn storage_timeout(&self) -> Duration;
     async fn claim(&self, owner: &str, limit: usize, lease: Duration) -> Result<Vec<ClaimedTask>, OutboxError>;
     async fn recover_expired(&self, limit: usize) -> Result<RecoveryResult, OutboxError>;
     async fn execute_and_settle(
@@ -116,12 +127,35 @@ impl DefaultOutboxTaskCoordinator {
             storage_timeout: config.storage_timeout,
         }
     }
+
+    async fn settle_before(
+        &self,
+        task: &ClaimedTask,
+        outcome: TaskOutcome,
+        lease_deadline: Instant,
+    ) -> Result<SettleResult, OutboxError> {
+        let now = Instant::now();
+        if now >= lease_deadline {
+            return Err(OutboxError::LeaseBudgetExhausted);
+        }
+        let deadline = (now + self.storage_timeout).min(lease_deadline);
+        tokio::select! {
+            // Check the deadline before polling storage, including after a pause.
+            biased;
+            _ = sleep_until(deadline) => Err(OutboxError::TimedOut),
+            result = self.queue.settle(task, outcome) => result,
+        }
+    }
 }
 
 #[async_trait]
 impl OutboxTaskCoordinator for DefaultOutboxTaskCoordinator {
     fn formats(&self) -> Vec<TaskFormat> {
         self.formats.clone()
+    }
+
+    fn storage_timeout(&self) -> Duration {
+        self.storage_timeout
     }
 
     async fn claim(&self, owner: &str, limit: usize, lease: Duration) -> Result<Vec<ClaimedTask>, OutboxError> {
@@ -158,21 +192,45 @@ impl OutboxTaskCoordinator for DefaultOutboxTaskCoordinator {
         task: ClaimedTask,
         timeout: Duration,
     ) -> Result<SettleResult, OutboxError> {
-        let outcome = match tokio::time::timeout(timeout, handler.handle(&task)).await {
-            Ok(Ok(())) => TaskOutcome::Completed,
-            Ok(Err(TaskExecutionError::Permanent { reason })) => TaskOutcome::Failed { reason },
-            Ok(Err(TaskExecutionError::Retry { reason, retry_after })) => TaskOutcome::Retry {
-                reason,
-                delay: retry_after.unwrap_or_else(|| retry_delay(task.attempt)),
-            },
-            Err(_) => TaskOutcome::Retry {
+        // Handler retries and backoff share one invocation budget. Start only
+        // when that full budget AND settlement fit before this task's lease.
+        let now = Instant::now();
+        let settlement_deadline = task
+            .lease_deadline
+            .checked_sub(LEASE_SAFETY_MARGIN)
+            .ok_or(OutboxError::LeaseBudgetExhausted)?;
+        let required = timeout.checked_add(self.storage_timeout).ok_or(OutboxError::InvalidTask)?;
+        if settlement_deadline.saturating_duration_since(now) < required {
+            return self
+                .settle_before(
+                    &task,
+                    TaskOutcome::Retry {
+                        reason: "insufficient lease budget before handler execution".to_owned(),
+                        delay: retry_delay(task.attempt),
+                    },
+                    settlement_deadline,
+                )
+                .await;
+        }
+        let handler_deadline = now.checked_add(timeout).ok_or(OutboxError::InvalidTask)?;
+        let outcome = tokio::select! {
+            biased;
+            _ = sleep_until(handler_deadline) => TaskOutcome::Retry {
                 reason: "handler timed out".to_owned(),
                 delay: retry_delay(task.attempt),
             },
+            result = handler.handle(&task) => match result {
+                Ok(()) => TaskOutcome::Completed,
+                Err(TaskExecutionError::Permanent { reason }) => TaskOutcome::Failed { reason },
+                Err(TaskExecutionError::Retry { reason, retry_after }) => TaskOutcome::Retry {
+                    reason,
+                    delay: retry_after.unwrap_or_else(|| retry_delay(task.attempt)),
+                },
+            },
         };
-        tokio::time::timeout(self.storage_timeout, self.queue.settle(&task, outcome))
-            .await
-            .unwrap_or(Err(OutboxError::TimedOut))
+        // Retain a margin before local expiry; queue-side token and database
+        // clock checks remain authoritative, including after clock changes.
+        self.settle_before(&task, outcome, settlement_deadline).await
     }
 }
 
@@ -184,6 +242,114 @@ mod tests {
         sync::{Arc, atomic::Ordering},
         time::Duration,
     };
+
+    struct ProbeHandler {
+        calls: Arc<std::sync::atomic::AtomicUsize>,
+        simulate_pause: bool,
+    }
+
+    #[async_trait]
+    impl TaskHandler for ProbeHandler {
+        fn formats(&self) -> Vec<TaskFormat> {
+            vec![format()]
+        }
+
+        async fn handle(&mut self, _: &ClaimedTask) -> Result<(), TaskExecutionError> {
+            self.calls.fetch_add(1, Ordering::SeqCst);
+            if self.simulate_pause {
+                tokio::time::advance(Duration::from_secs(120)).await;
+            }
+            Ok(())
+        }
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn delayed_task_retries_without_starting_handler_and_expired_task_waits_for_recovery() {
+        let queue = Arc::new(Queue::default());
+        let service = outbox_task_coordinator(queue.clone(), vec![format()]);
+        let calls = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let mut handler = ProbeHandler {
+            calls: calls.clone(),
+            simulate_pause: false,
+        };
+        let mut delayed = claimed();
+        delayed.lease_deadline = Instant::now() + Duration::from_secs(39);
+        assert!(
+            service
+                .execute_and_settle(&mut handler, delayed, Duration::from_secs(30))
+                .await
+                .unwrap()
+                .is_settled()
+        );
+        assert_eq!(calls.load(Ordering::SeqCst), 0);
+        assert!(
+            matches!(&queue.outcomes.lock().unwrap()[0].1, TaskOutcome::Retry { reason, .. }
+            if reason == "insufficient lease budget before handler execution")
+        );
+        let mut expired = claimed();
+        expired.lease_deadline = Instant::now();
+        assert_eq!(
+            service
+                .execute_and_settle(&mut handler, expired, Duration::from_secs(30))
+                .await,
+            Err(OutboxError::LeaseBudgetExhausted)
+        );
+        assert_eq!(calls.load(Ordering::SeqCst), 0);
+        assert_eq!(queue.outcomes.lock().unwrap().len(), 1);
+        assert_eq!(handler.formats(), vec![format()]);
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn lease_margin_shortens_settlement_deadline_without_starting_handler() {
+        let queue = Arc::new(Queue::default());
+        queue.hang_settle.store(true, Ordering::SeqCst);
+        let service = outbox_task_coordinator(queue.clone(), vec![format()]);
+        let calls = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let mut handler = ProbeHandler {
+            calls: calls.clone(),
+            simulate_pause: false,
+        };
+        let mut task = claimed();
+        task.lease_deadline = Instant::now() + LEASE_SAFETY_MARGIN + Duration::from_secs(1);
+        let started = Instant::now();
+        assert_eq!(
+            service.execute_and_settle(&mut handler, task, Duration::from_secs(30)).await,
+            Err(OutboxError::TimedOut)
+        );
+        assert_eq!(started.elapsed(), Duration::from_secs(1));
+        assert_eq!(calls.load(Ordering::SeqCst), 0);
+        assert!(matches!(queue.outcomes.lock().unwrap()[0].1, TaskOutcome::Retry { .. }));
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn process_pause_exhausting_lease_prevents_a_late_acknowledgement() {
+        let queue = Arc::new(Queue::default());
+        let service = outbox_task_coordinator(queue.clone(), vec![format()]);
+        let calls = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let mut handler = ProbeHandler {
+            calls: calls.clone(),
+            simulate_pause: true,
+        };
+        assert_eq!(
+            service
+                .execute_and_settle(&mut handler, claimed(), Duration::from_secs(30))
+                .await,
+            Err(OutboxError::LeaseBudgetExhausted)
+        );
+        assert_eq!(calls.load(Ordering::SeqCst), 1);
+        assert!(queue.outcomes.lock().unwrap().is_empty());
+    }
+
+    #[tokio::test]
+    async fn unrepresentable_handler_budget_is_rejected_before_execution() {
+        let queue = Arc::new(Queue::default());
+        let service = outbox_task_coordinator(queue.clone(), vec![format()]);
+        assert_eq!(
+            service.execute_and_settle(&mut handler(), claimed(), Duration::MAX).await,
+            Err(OutboxError::InvalidTask)
+        );
+        assert!(queue.outcomes.lock().unwrap().is_empty());
+    }
 
     #[test]
     fn storage_timeout_config_has_defaults_overrides_and_rejects_invalid_budgets() {
@@ -269,6 +435,7 @@ mod tests {
         assert_eq!(started.elapsed(), Duration::from_secs(3));
         assert_eq!(tasks.len(), 1);
         assert_eq!(tasks[0].id, first_id);
+        assert_eq!(tasks[0].lease_deadline, started + Duration::from_secs(60));
         assert_eq!(queue.incoming.lock().unwrap().len(), 1);
         assert_eq!(queue.requested.lock().unwrap().len(), 2);
     }

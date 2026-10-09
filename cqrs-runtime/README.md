@@ -60,3 +60,16 @@ policy. Both settings must be positive; the server setting must fit a signed
 root injects them through `outbox_task_coordinator_with_config` and
 `PostgresOutboxQueue::with_config`. The simpler constructors use these defaults.
 See the [transaction-local timeout example](../doc/examples/postgres_queue_timeouts.md).
+
+The worker validates `lease > 2 * storage_timeout + handler_timeout + 5s`.
+The handler's budget includes all local attempts and backoff; a retry count
+is distinct from a total attempt count. Defaults leave additional headroom:
+`60s > 5s + 30s + 5s + 5s = 45s`.
+
+Each claimed task carries a conservative monotonic lease deadline from before
+its DB claim request, preserved through collection and dispatch. The
+coordinator runs the handler only if its full budget and settlement reserve
+still fit. Otherwise it retries without executing the handler, or leaves the
+task for durable recovery if no safe acknowledgement window remains.
+Settlement cannot await beyond the original deadline minus the fixed margin.
+This adds no persisted fields, schema migration, heartbeat, or lease renewal.

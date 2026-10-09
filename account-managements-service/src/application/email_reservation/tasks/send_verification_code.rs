@@ -106,6 +106,7 @@ pub(crate) mod test_support {
             metadata: json!({"correlation_id": "test"}),
             attempt: 2,
             lock_token: Uuid::new_v4(),
+            lease_deadline: tokio::time::Instant::now() + std::time::Duration::from_secs(60),
         }
     }
 
