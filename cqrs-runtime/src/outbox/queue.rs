@@ -1,3 +1,11 @@
+//! Individual task ownership and settlement, independent of business sequencing.
+//!
+//! Eligible tasks from one aggregate may be claimed concurrently, including
+//! higher source-event sequences while earlier tasks remain nonterminal.
+//! Aggregate state and atomic publication of dependent work establish the
+//! workflow order. A lease token protects acknowledgement of one claim;
+//! execution can repeat after an operation succeeds without acknowledgement.
+
 use super::{error::OutboxError, task::TaskFormat};
 use async_trait::async_trait;
 use serde_json::Value;

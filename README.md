@@ -47,6 +47,13 @@ in this case study, but the account identity is not coupled to the address.
 The aggregates never call or mutate each other. Application services issue
 commands, and durable outbox tasks carry facts between the two event streams.
 
+Business sequence is enforced by aggregate phases and transition invariants.
+Dependent tasks are committed with the events that establish their
+prerequisites. Tasks may run concurrently and in any order, including tasks
+sharing a source aggregate or `aggregate_sequence`; workers do not serialize
+the business process. See the [task processing contract](doc/task_processing_contract.md)
+and [open worker questions](doc/known_issues/2026-10-10-task_worker_open_questions.md).
+
 ## Workspace layout
 
 The repository is a Cargo workspace with two packages:

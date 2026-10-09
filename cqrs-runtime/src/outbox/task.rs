@@ -1,3 +1,11 @@
+//! Versioned durable task data for operations permitted by accepted events.
+//!
+//! Several tasks may originate from the same event and execute concurrently.
+//! Business prerequisites belong to aggregate transitions, not task scheduling.
+//! An external operation's stable idempotency key can be persisted in its
+//! versioned payload or metadata. The task ID identifies repeats of one task;
+//! different tasks for one logical effect need a shared operation identity.
+
 use super::error::OutboxError;
 use chrono::{DateTime, Utc};
 use serde::Serialize;

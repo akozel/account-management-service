@@ -127,9 +127,17 @@ cross-layer enum.
 - Durable outbox delivery remains the long-lived retry boundary for internal
   handlers. An exhausted fast conflict can become a retryable task outcome,
   but the application layer must not repeat that same conflict first.
-- Retry budgets may multiply only for different causes (`10 × 3` for durable
-  delivery plus CQRS conflicts). The same error must never be retried by
-  adjacent layers.
+- A task handler may own bounded local retries of its one operation. The
+  outbox separately owns durable redelivery of the whole task, including
+  recovery after a crash or expired lease; the coordinator also retries a
+  timed-out handler. Local retry exhaustion does not prevent redelivery until
+  a terminal task outcome is durably settled. Every invocation must be safe
+  to repeat from the beginning.
+- Bound and document local and durable retry budgets together, including
+  sender SDK retries. Explicit local retries may multiply with outbox
+  deliveries (`10 × 3` can mean thirty sends). Keep local work within the
+  handler execution budget; do not duplicate the CQRS executor's conflict
+  retries in application code.
 - Fast command retry does not make a later client HTTP request idempotent.
 
 ## Infrastructure layout
@@ -280,6 +288,29 @@ supervisor owns bounded worker mailboxes, cancellation, polling and worker
 restarts. `main` composes the runtime queue, coordinator, business handler
 factory, and supervisor alongside HTTP. Configuration parsing and validation
 stay in the runtime crate so they remain testable and covered.
+
+### Task handlers and workers
+
+When reviewing or extending task delivery, handlers, sender ports, ordering,
+or idempotency, read [Task processing contracts](references/task-processing.md).
+Business sequence belongs to the aggregate state machine. Create dependent
+work only with the accepted event that establishes its prerequisite; the
+aggregate rejects conflicting or premature transitions. Tasks may execute
+concurrently and in any order, including tasks from the same source aggregate
+or event. `aggregate_sequence` identifies the source event, not delivery order.
+Do not add a sequential/parallel flag or an aggregate-wide queue barrier for
+this contract. A successor may execute before its predecessor's settlement
+when the prerequisite event and successor task are already committed.
+
+Handlers perform one operation, delegate transition checks to the target
+aggregate, and classify exact redelivery separately from mismatched data.
+If an external effect needs an idempotency key, persist it in the versioned
+payload or task metadata and pass it unchanged to the sender on every retry;
+`task.id` is available for identifying one task's redeliveries. An attempt
+number or lock token is not an operation identity. The key does not itself
+provide receiver deduplication. Delivery uncertainty follows the handler
+replay-safety contract; storage deadlines and lease budgeting remain open
+questions documented in `doc/known_issues`.
 
 ## Presentation layout
 

@@ -138,6 +138,13 @@ infrastructure; the aggregate does not perform outbox I/O. Each Task performs
 one operation: a domain Task commands one aggregate, while an I/O Task may
 perform one external effect. Follow the critical Task convention in
 `.codex/skills/clean-architecture/SKILL.md`.
+Business sequencing is enforced by aggregate phases and transition invariants.
+Only publish a dependent Task with the accepted event that establishes its
+prerequisite; aggregate state cannot stop an external Task already enqueued.
+Tasks from one aggregate, including Tasks sharing `aggregate_sequence`, may
+execute concurrently and in any order. Do not use queue settlement or a
+delivery-order flag as the aggregate's workflow state. See
+[`doc/task_processing_contract.md`](../../../doc/task_processing_contract.md).
 An already-applied command may return a distinct exact-repeat domain rejection;
 the TaskHandler interprets it for its own Task. The aggregate must distinguish
 that case from an existing record with different identity-defining data.

@@ -1,4 +1,10 @@
 //! Inbound polling adapter: bounded worker mailboxes, supervised by one dispatcher.
+//!
+//! Workers execute eligible tasks concurrently without serializing source
+//! aggregates or interpreting event sequence as delivery order. Aggregate
+//! phases and accepted transitions establish business prerequisites before
+//! application publishes dependent work. Settlement concerns one task's
+//! operation, not advancement of aggregate state or completion of a workflow.
 
 use std::{sync::Arc, time::Duration};
 

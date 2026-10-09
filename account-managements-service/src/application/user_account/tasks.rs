@@ -1,4 +1,10 @@
 //! Versioned registration continuation tasks.
+//!
+//! Aggregate phases establish the registration order: profile acceptance
+//! publishes account creation, and the committed account event publishes the
+//! completion task. Workers may run concurrently; completion does not wait for
+//! the creation task's separate acknowledgement. Target aggregates validate
+//! transitions and exact repeats, while handlers classify delivery outcomes.
 pub mod create_account;
 pub mod record_account_created;
 
