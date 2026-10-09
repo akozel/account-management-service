@@ -18,7 +18,10 @@ pub mod task;
 pub mod task_handler;
 pub mod task_handler_registry;
 
-pub use coordinator::{OutboxTaskCoordinator, outbox_task_coordinator, retry_delay};
+pub use coordinator::{
+    OutboxTaskCoordinator, OutboxTaskCoordinatorConfig, OutboxTaskCoordinatorConfigError, outbox_task_coordinator,
+    outbox_task_coordinator_with_config, retry_delay,
+};
 pub use error::OutboxError;
 pub use queue::{ClaimedTask, FailedTask, OutboxQueue, RecoveryResult, SettleResult, TaskOutcome};
 pub use task::{NewOutboxTask, Schedule, TaskFormat, TaskPayload};
@@ -82,12 +85,17 @@ pub(crate) mod test_support {
         pub(crate) hang_recovery: AtomicBool,
         pub(crate) hang_settle: AtomicBool,
         pub(crate) failing_format: Mutex<Option<TaskFormat>>,
+        pub(crate) claim_delay: Mutex<Duration>,
     }
 
     #[async_trait]
     impl OutboxQueue for Queue {
         async fn claim(&self, format: &TaskFormat, _: &str, limit: usize, _: Duration) -> Result<Vec<ClaimedTask>, OutboxError> {
             self.requested.lock().unwrap().push(format.clone());
+            let delay = *self.claim_delay.lock().unwrap();
+            if !delay.is_zero() {
+                tokio::time::sleep(delay).await;
+            }
             if self.hang_claim.load(Ordering::SeqCst) {
                 std::future::pending::<()>().await;
             }

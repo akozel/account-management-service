@@ -28,9 +28,17 @@ Apply these boundaries when reviewing or changing the implementation:
   metadata. Keep it and the effect-defining data stable across retries/requeue,
   and pass it to the receiving adapter. `task.id` can identify one task's
   repeats; neither attempt nor lock token is an idempotency key.
+- Enforce claim, recovery, and settlement deadlines at the runtime boundary,
+  covering the whole adapter call. Treat timeout as an unknown storage outcome
+  and release the waiting runtime capacity. Use `OutboxTaskCoordinatorConfig`
+  for the shared claim/recovery/settlement budget and preserve earlier claim
+  results when a later format times out. `PostgresOutboxQueueConfig` applies
+  its statement timeout transaction-locally; shared-pool session settings
+  must remain intact. Both settings are positive and documented in `.env.example`.
 
 The separate [worker decisions and open questions](../../../../doc/known_issues/2026-10-10-task_worker_open_questions.md)
 close question 2 through handler replay safety and separate retry policies.
-Questions 3–4, stalled storage operations and lease budget before dispatch,
-remain open. Closing question 2 does not imply exactly-once external effects
-or introduce new runtime deadlines, lease renewal, or deduplication APIs.
+Question 3 is closed by implemented deadlines and regression tests;
+question 4, lease budgeting, remains open for
+discussion. Closing question 2 does not imply exactly-once external effects
+or introduce lease renewal or deduplication APIs.

@@ -23,8 +23,8 @@ use account_managements_service::{
 use cqrs_es::{CqrsFramework, persist::PersistedEventStore};
 use cqrs_runtime::{
     command::AggregateConflictRetryPolicy,
-    outbox::{TaskHandlerRegistry, outbox_task_coordinator},
-    postgres::{PostgresEventRepositoryWithOutbox, PostgresOutboxQueue},
+    outbox::{OutboxTaskCoordinatorConfig, TaskHandlerRegistry, outbox_task_coordinator_with_config},
+    postgres::{PostgresEventRepositoryWithOutbox, PostgresOutboxQueue, PostgresOutboxQueueConfig},
     worker,
 };
 use runtime::RuntimeError;
@@ -38,6 +38,8 @@ async fn main() -> Result<(), RuntimeError> {
     LogingConfig::default_setup(level_filter);
     let database_url = std::env::var("DATABASE_URL").expect("DATABASE_URL must be set");
     let bind_address = std::env::var("BIND_ADDRESS").expect("BIND_ADDRESS must be set");
+    let coordinator_config = OutboxTaskCoordinatorConfig::from_env().expect("valid outbox storage timeout");
+    let postgres_queue_config = PostgresOutboxQueueConfig::from_env().expect("valid PostgreSQL outbox timeout");
 
     let pool = postgres_es::default_postgress_pool(&database_url).await;
     let aggregate_conflict_retry = AggregateConflictRetryPolicy::default();
@@ -50,7 +52,9 @@ async fn main() -> Result<(), RuntimeError> {
         },
         aggregate_conflict_retry,
     ));
-    let queue = Arc::new(PostgresOutboxQueue::new(pool.clone()));
+    let queue = Arc::new(
+        PostgresOutboxQueue::with_config(pool.clone(), postgres_queue_config).expect("valid PostgreSQL outbox configuration"),
+    );
     let account_pool = pool.clone();
     let account_gateway = Arc::new(CqrsUserAccountGateway::new(
         move |tasks| {
@@ -70,7 +74,8 @@ async fn main() -> Result<(), RuntimeError> {
         ])
         .expect("valid outbox handler registry")
     });
-    let outbox = outbox_task_coordinator(queue, handler_factory().formats());
+    let outbox = outbox_task_coordinator_with_config(queue, handler_factory().formats(), coordinator_config)
+        .expect("valid outbox coordinator configuration");
     let worker_config = worker::OutboxWorkerPoolConfig::from_env().expect("valid worker configuration");
     let email_reservation = email_reservation_service(gateway, Arc::new(RandomRegistrationMaterialGenerator));
     let app = presentation::http::router(email_reservation, http_registration);

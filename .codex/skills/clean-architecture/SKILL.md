@@ -309,8 +309,17 @@ payload or task metadata and pass it unchanged to the sender on every retry;
 `task.id` is available for identifying one task's redeliveries. An attempt
 number or lock token is not an operation identity. The key does not itself
 provide receiver deduplication. Delivery uncertainty follows the handler
-replay-safety contract; storage deadlines and lease budgeting remain open
-questions documented in `doc/known_issues`.
+replay-safety contract. Queue-operation deadlines belong at the runtime boundary
+and must cover the full claim, recovery, or settlement call, including adapter
+connection acquisition and commit. `OutboxTaskCoordinatorConfig` owns the
+positive `OUTBOX_STORAGE_TIMEOUT_MS` budget (default 5000 ms); multi-format
+claim shares one deadline and preserves already confirmed tasks on later
+timeouts. `PostgresOutboxQueueConfig` owns the positive
+`OUTBOX_POSTGRES_STATEMENT_TIMEOUT_MS` server budget (default 4000 ms), applied
+transaction-locally for queue SQL, including lock waiting. Keep these settings
+out of shared-pool session state and event-store command policy. Runtime
+timeout means an unknown storage outcome; free the waiting capacity without
+inferring task success or failure. Lease budgeting remains open in `doc/known_issues`.
 
 ## Presentation layout
 

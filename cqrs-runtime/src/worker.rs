@@ -329,6 +329,58 @@ mod tests {
         .unwrap();
     }
 
+    #[tokio::test]
+    async fn storage_timeouts_allow_polling_and_free_worker_capacity_without_shutdown() {
+        for stage in ["claim", "recovery", "settle"] {
+            let queue = Arc::new(Queue::default());
+            queue.hang_claim.store(stage == "claim", Ordering::SeqCst);
+            queue.hang_recovery.store(stage == "recovery", Ordering::SeqCst);
+            queue.hang_settle.store(stage == "settle", Ordering::SeqCst);
+            queue.incoming.lock().unwrap().extend([claimed(), claimed()]);
+            let service = outbox_task_coordinator_with_config(
+                queue.clone(),
+                vec![format()],
+                OutboxTaskCoordinatorConfig {
+                    storage_timeout: Duration::from_millis(5),
+                },
+            )
+            .unwrap();
+            let calls = Arc::new(AtomicUsize::new(0));
+            let factory: TaskHandlerFactory = Arc::new({
+                let calls = calls.clone();
+                move || TaskHandlerRegistry::try_new(vec![Box::new(CountingHandler(calls.clone()))]).unwrap()
+            });
+            let (stop, shutdown) = watch::channel(false);
+            let worker = tokio::spawn(super::run(
+                service,
+                factory,
+                OutboxWorkerPoolConfig {
+                    concurrency: 1,
+                    poll_interval: Duration::from_millis(2),
+                    ..Default::default()
+                },
+                shutdown,
+            ));
+            match stage {
+                "claim" => {
+                    wait_until(|| queue.requested.lock().unwrap().len() >= 2).await;
+                    assert_eq!(calls.load(Ordering::SeqCst), 0);
+                    queue.hang_claim.store(false, Ordering::SeqCst);
+                }
+                "recovery" => {
+                    wait_until(|| queue.recovered.load(Ordering::SeqCst) >= 2).await;
+                    queue.hang_recovery.store(false, Ordering::SeqCst);
+                }
+                _ => {}
+            }
+            // Both tasks are executed even when the first acknowledgement never returns.
+            wait_until(|| calls.load(Ordering::SeqCst) == 2 && queue.outcomes.lock().unwrap().len() == 2).await;
+            assert!(!worker.is_finished());
+            stop.send(true).unwrap();
+            worker.await.unwrap().unwrap();
+        }
+    }
+
     #[tokio::test(start_paused = true)]
     async fn shutdown_cancels_stalled_polling_and_bounds_stalled_acknowledgements() {
         for stage in ["claim", "recovery", "settle"] {

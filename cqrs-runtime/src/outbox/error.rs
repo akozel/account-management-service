@@ -6,4 +6,6 @@ pub enum OutboxError {
     InvalidTask,
     #[error("outbox storage is unavailable")]
     Unavailable,
+    #[error("outbox storage operation timed out; its result is unknown")]
+    TimedOut,
 }

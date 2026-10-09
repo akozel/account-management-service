@@ -43,3 +43,20 @@ the same operation identity at both levels.
 See the [accepted task processing contract](../doc/task_processing_contract.md)
 for responsibilities and the [open worker questions](../doc/known_issues/2026-10-10-task_worker_open_questions.md)
 for delivery uncertainty, storage deadlines, and lease budgeting.
+
+The coordinator enforces `OUTBOX_STORAGE_TIMEOUT_MS` (default `5000`) for
+the whole claim batch, recovery, or settlement call. Claims across formats
+share one deadline and return already confirmed work if a later format times
+out. `OutboxError::TimedOut` means the storage result is unknown; worker
+capacity is released and lease recovery remains responsible for durable work.
+
+The PostgreSQL queue applies `OUTBOX_POSTGRES_STATEMENT_TIMEOUT_MS` (default
+`4000`) to each SQL statement in its transactions, including lock waits.
+Transaction-local settings restore the connection's previous values on
+commit/rollback; event-store operations on the shared pool keep their own
+policy. Both settings must be positive; the server setting must fit a signed
+32-bit millisecond value. Configuration parsing/validation lives in
+`OutboxTaskCoordinatorConfig` and `PostgresOutboxQueueConfig`; the composition
+root injects them through `outbox_task_coordinator_with_config` and
+`PostgresOutboxQueue::with_config`. The simpler constructors use these defaults.
+See the [transaction-local timeout example](../doc/examples/postgres_queue_timeouts.md).

@@ -132,10 +132,67 @@ including attempts hidden in a sender SDK. Bound local work by the handler's
 execution budget; retain CQRS optimistic-conflict retries in the command
 executor instead of duplicating them inside the application handler.
 
-## Separate open questions
+## Runtime queue-operation deadlines
 
-[Worker questions 3–4](known_issues/2026-10-10-task_worker_open_questions.md)
-remain open: deadlines for queue I/O and the lease budget from claim through
-settlement. Question 2, success without acknowledgement, is closed by the
-handler replay-safety and separate retry-policy contracts above. Its closure
-does not imply exactly-once external effects or resolve questions 3–4.
+Status: implemented. `DefaultOutboxTaskCoordinator` bounds storage calls
+independently of handler execution, and `PostgresOutboxQueue` additionally
+limits SQL execution on the server.
+
+The runtime boundary must enforce a positive, configurable deadline when
+calling queue claim, expired-lease recovery, and settlement. It bounds the
+whole adapter operation, including connection acquisition, SQL execution,
+transaction completion, and waiting for a response. Handler execution has its
+own budget. This contract applies to any queue implementation, independently
+of PostgreSQL settings.
+
+After a deadline expires, the runtime stops awaiting that operation, reports
+the storage failure, and can continue polling or release the worker slot.
+Queue implementations must cooperate with async cancellation and avoid
+blocking execution or detached work that retains runtime capacity. Repeated
+storage unavailability may prevent delivery, but one stalled await must not
+occupy the dispatcher or a worker indefinitely.
+
+Timeout does not prove rollback or cancellation at the receiver. A timed-out
+claim may have committed without returning its tasks; expired-lease recovery
+handles that durable work. A timed-out settlement may also have committed;
+the runtime must not infer success or permanent task failure from the missing
+response. Keep token-checked settlement and handler replay safety. Preserve
+already confirmed tasks when a later claim sub-operation fails or times out.
+
+Optional PostgreSQL limits can additionally abort SQL that exceeds a server
+budget. They do not replace the runtime deadline, bound connection acquisition
+or network waiting, or guarantee immediate transaction cleanup. See the
+[PostgreSQL example](examples/postgres_queue_timeouts.md).
+
+The service reads two positive millisecond settings from
+[`account-managements-service/.env.example`](../account-managements-service/.env.example):
+
+- `OUTBOX_STORAGE_TIMEOUT_MS`, default `5000`: one deadline for the full
+  multi-format claim batch, or one recovery or settlement call. Later claim
+  timeouts preserve the tasks confirmed by earlier formats. A timeout without
+  a confirmed batch returns `OutboxError::TimedOut`, an unknown storage result.
+- `OUTBOX_POSTGRES_STATEMENT_TIMEOUT_MS`, default `4000`: one SQL statement's
+  server budget, including lock waiting. The PostgreSQL queue applies
+  `set_config('statement_timeout', value, true)` inside each claim, recovery,
+  or settlement transaction. Commit/rollback restores the previous connection
+  setting, leaving event-store operations on the shared pool unaffected.
+
+The server setting must fit PostgreSQL's `1..=2147483647` millisecond range.
+Both configurations reject zero, invalid numbers, and unsupported durations
+at startup. Prefer a server budget shorter than the runtime budget, while
+accounting for their different starting points and multi-statement recovery.
+The handler timeout and lease are separate settings; this change does not
+introduce lease renewal or a full remaining-lease check before execution.
+
+Regression tests cover stalled queue calls during normal worker operation,
+the shared multi-format claim budget, pool-acquisition deadlines, server
+cancellation of lock waits and slow statements, pooled-setting restoration,
+rollback of cancelled claims, and lost replies after real commits.
+
+## Remaining open question
+
+[Question 3](known_issues/2026-10-10-task_worker_open_questions.md) is closed by
+the implemented runtime and PostgreSQL limits and regression tests. Question
+4, budgeting the lease from claim through settlement, still requires
+discussion. Question 2 remains closed by handler replay safety and separate
+retry policies; none of these decisions implies exactly-once external effects.

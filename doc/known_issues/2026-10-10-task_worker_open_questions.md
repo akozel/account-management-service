@@ -2,8 +2,8 @@
 
 Дата: 2026-10-10.
 
-Статус: пункт 2 закрыт принятым контрактом; пункты 3 и 4 открыты.
-Изменения поведения workers/handlers не внесены.
+Статус: пункт 2 закрыт принятым контрактом; пункт 3 закрыт реализацией и
+регрессионными тестами; пункт 4 открыт.
 
 Принятый [контракт обработки задач](../task_processing_contract.md) закрепляет
 последовательность бизнес-процесса через состояния и переходы агрегата.
@@ -69,29 +69,57 @@ handler без возвращённого им решения о retry. Оста
 
 ## 3. Зависшие claim, recovery и settlement
 
-Статус: открыто.
+Статус: закрыто 2026-10-10; обе гарантии реализованы и проверены.
 
 Область: [worker supervisor](../../cqrs-runtime/src/worker.rs),
 [coordinator](../../cqrs-runtime/src/outbox/coordinator.rs),
 [PostgreSQL queue](../../cqrs-runtime/src/postgres/outbox_queue.rs).
 
-`handler_timeout` ограничивает только `TaskHandler::handle`. Операции claim,
-`recover_expired` и `settle` не имеют отдельного дедлайна на уровне runtime.
-Зависший claim или recovery удерживает dispatcher; зависшие settlements могут
-занять все worker slots. Восстановление lease в базе само по себе не освобождает
-worker, ожидающий ответа от storage. При shutdown есть отмена polling и
-ограничение времени drain, но это не решает зависание при обычной работе.
+До исправления `handler_timeout` ограничивал только `TaskHandler::handle`, а
+claim, `recover_expired` и `settle` не имели отдельного дедлайна runtime.
+Зависший claim/recovery удерживал dispatcher; зависшие settlements могли занять
+все worker slots. Recovery записей в базе само по себе не освобождало ожидающий
+worker. Ограничение shutdown drain не решало зависание при обычной работе.
 
-Нужно обсудить:
+Принятое решение:
 
-- Где задавать дедлайны: PostgreSQL, adapter, coordinator или supervisor?
-- Как освобождать runtime capacity после зависшего I/O?
-- Как обрабатывать неизвестный commit при timeout settlement или claim?
-- Какие проверки должны подтверждать восстановление прогресса без shutdown?
+- Deadline обеспечивается на границе runtime для полного вызова claim,
+  recovery или settlement, включая получение соединения, выполнение SQL,
+  завершение транзакции и ожидание ответа. Время handler ограничивается отдельно.
+- При timeout runtime прекращает ожидание и может продолжить polling либо
+  освободить worker slot. Async adapter должен поддерживать отмену ожидания.
+- Timeout не доказывает rollback. Результат записи неизвестен: claim мог
+  сохранить владение, а settlement — terminal status. Неподтверждённые tasks
+  остаются в долговечной очереди; их обработка следует recovery и контракту
+  безопасного повтора. Уже подтверждённые tasks из предыдущих claim нельзя
+  терять из-за timeout следующего вызова.
+- `OUTBOX_POSTGRES_STATEMENT_TIMEOUT_MS` ограничивает каждый SQL statement
+  очереди на сервере, включая ожидание блокировок. Установка локальна транзакции
+  и не меняет настройки других операций shared pool. См.
+  [пример](../examples/postgres_queue_timeouts.md).
 
-Существующий тест `shutdown_cancels_stalled_polling_and_bounds_stalled_acknowledgements`
-в [worker.rs](../../cqrs-runtime/src/worker.rs) проверяет shutdown, а не
-восстановление обычного исполнения после зависшего storage.
+Реализация и проверки:
+
+- `OutboxTaskCoordinatorConfig` задаёт положительный `OUTBOX_STORAGE_TIMEOUT_MS`
+  (по умолчанию 5000 ms). Все форматы одного claim используют общий deadline;
+  recovery и settlement имеют отдельный бюджет того же размера. При timeout
+  без подтверждённого batch возвращается `OutboxError::TimedOut`.
+- `PostgresOutboxQueueConfig` задаёт положительный server timeout (по умолчанию
+  4000 ms). `set_config(..., true)` применяется в транзакциях claim/recovery/
+  settlement; после commit или rollback прежние настройки соединения восстановлены.
+- Unit-тесты coordinator проверяют общий бюджет claim и сохранение ранее
+  подтверждённых tasks. Тест `storage_timeouts_allow_polling_and_free_worker_capacity_without_shutdown`
+  в [worker.rs](../../cqrs-runtime/src/worker.rs) проверяет продолжение polling
+  и освобождение исполнителя при зависшем storage без shutdown.
+- [PostgreSQL-тесты](../../cqrs-runtime/tests/postgres/timeouts.rs) проверяют
+  deadline ожидания соединения, отмену SQL при блокировке и медленном trigger,
+  rollback изменений claim, восстановление настроек pooled connection и
+  неизвестный ответ после фактически состоявшегося claim/settlement commit.
+
+Оба параметра документированы в
+[`.env.example`](../../account-managements-service/.env.example). Решение
+не отменяет требования безопасного повторного выполнения из пункта 2 и не
+закрывает вопрос полного lease budget из пункта 4.
 
 ## 4. Lease расходуется до начала handler
 

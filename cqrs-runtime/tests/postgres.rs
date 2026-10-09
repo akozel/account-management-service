@@ -51,6 +51,8 @@ mod processing;
 mod queue;
 #[path = "postgres/support.rs"]
 mod support;
+#[path = "postgres/timeouts.rs"]
+mod timeouts;
 #[cfg(feature = "worker")]
 #[path = "postgres/worker.rs"]
 mod worker;

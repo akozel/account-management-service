@@ -1,7 +1,8 @@
 use std::time::Duration;
 
 use async_trait::async_trait;
-use sqlx::{PgPool, Row};
+use sqlx::{PgPool, Postgres, Row, Transaction};
+use thiserror::Error;
 
 use crate::outbox::{
     ClaimedTask, FailedTask, OutboxError, OutboxQueue, RecoveryResult, SettleResult, TaskFormat, TaskOutcome, retry_delay,
@@ -9,11 +10,81 @@ use crate::outbox::{
 
 pub struct PostgresOutboxQueue {
     pool: PgPool,
+    statement_timeout: Duration,
+}
+
+#[derive(Clone, Debug)]
+pub struct PostgresOutboxQueueConfig {
+    /// Per-statement server budget, including lock waiting; scoped to queue transactions.
+    pub statement_timeout: Duration,
+}
+
+#[derive(Debug, Error, PartialEq, Eq)]
+#[error("invalid PostgreSQL outbox configuration: {0}")]
+pub struct PostgresOutboxQueueConfigError(pub &'static str);
+
+impl Default for PostgresOutboxQueueConfig {
+    fn default() -> Self {
+        Self {
+            statement_timeout: Duration::from_secs(4),
+        }
+    }
+}
+
+impl PostgresOutboxQueueConfig {
+    pub fn from_env() -> Result<Self, PostgresOutboxQueueConfigError> {
+        Self::from_lookup(|name| std::env::var(name).ok())
+    }
+
+    pub fn from_lookup(mut lookup: impl FnMut(&str) -> Option<String>) -> Result<Self, PostgresOutboxQueueConfigError> {
+        let millis = match lookup("OUTBOX_POSTGRES_STATEMENT_TIMEOUT_MS") {
+            Some(value) => value
+                .parse::<u64>()
+                .map_err(|_| PostgresOutboxQueueConfigError("OUTBOX_POSTGRES_STATEMENT_TIMEOUT_MS"))?,
+            None => 4_000,
+        };
+        let config = Self {
+            statement_timeout: Duration::from_millis(millis),
+        };
+        config.validate()?;
+        Ok(config)
+    }
+
+    pub fn validate(&self) -> Result<(), PostgresOutboxQueueConfigError> {
+        if self.statement_timeout.as_millis() == 0 || self.statement_timeout.as_millis() > i32::MAX as u128 {
+            return Err(PostgresOutboxQueueConfigError(
+                "statement timeout must be 1..=2147483647 milliseconds",
+            ));
+        }
+        Ok(())
+    }
 }
 
 impl PostgresOutboxQueue {
     pub fn new(pool: PgPool) -> Self {
-        Self { pool }
+        Self {
+            pool,
+            statement_timeout: PostgresOutboxQueueConfig::default().statement_timeout,
+        }
+    }
+
+    pub fn with_config(pool: PgPool, config: PostgresOutboxQueueConfig) -> Result<Self, PostgresOutboxQueueConfigError> {
+        config.validate()?;
+        Ok(Self {
+            pool,
+            statement_timeout: config.statement_timeout,
+        })
+    }
+
+    async fn transaction(&self) -> Result<Transaction<'_, Postgres>, OutboxError> {
+        let mut tx = self.pool.begin().await.map_err(storage_error)?;
+        // Transaction-local settings never change the shared pool's session defaults.
+        sqlx::query("SELECT set_config('statement_timeout', $1, true)")
+            .bind(self.statement_timeout.as_millis().to_string())
+            .execute(&mut *tx)
+            .await
+            .map_err(storage_error)?;
+        Ok(tx)
     }
 }
 
@@ -40,7 +111,7 @@ impl OutboxQueue for PostgresOutboxQueue {
             return Err(OutboxError::InvalidTask);
         }
         let limit = i64::try_from(limit).map_err(|_| OutboxError::InvalidTask)?;
-        let mut tx = self.pool.begin().await.map_err(storage_error)?;
+        let mut tx = self.transaction().await?;
         let rows = sqlx::query(
             r#"
             WITH ready AS (
@@ -84,6 +155,7 @@ impl OutboxQueue for PostgresOutboxQueue {
     }
 
     async fn settle(&self, task: &ClaimedTask, outcome: TaskOutcome) -> Result<SettleResult, OutboxError> {
+        let mut tx = self.transaction().await?;
         let retry = matches!(outcome, TaskOutcome::Retry { .. });
         let (status, delay, error) = match outcome {
             TaskOutcome::Completed => ("completed", Duration::ZERO, None),
@@ -100,7 +172,8 @@ impl OutboxQueue for PostgresOutboxQueue {
             RETURNING status
         "#).bind(task.id).bind(task.lock_token).bind(status).bind(milliseconds(delay)?)
             .bind(error.map(|e| e.chars().take(2048).collect::<String>()))
-            .fetch_optional(&self.pool).await.map_err(storage_error)?;
+            .fetch_optional(&mut *tx).await.map_err(storage_error)?;
+        tx.commit().await.map_err(storage_error)?;
         let Some(row) = row else {
             return Ok(SettleResult::OwnershipLost);
         };
@@ -115,7 +188,7 @@ impl OutboxQueue for PostgresOutboxQueue {
     }
 
     async fn recover_expired(&self, limit: usize) -> Result<RecoveryResult, OutboxError> {
-        let mut tx = self.pool.begin().await.map_err(storage_error)?;
+        let mut tx = self.transaction().await?;
         let rows = sqlx::query(
             r#"
             SELECT id, task_type, task_version, attempts, max_attempts FROM transactional_outbox
@@ -164,5 +237,43 @@ impl OutboxQueue for PostgresOutboxQueue {
             recovered: rows.len() as u64,
             failed,
         })
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[tokio::test]
+    async fn statement_timeout_config_validates_defaults_overrides_and_server_range() {
+        assert_eq!(
+            PostgresOutboxQueueConfig::from_lookup(|_| None).unwrap().statement_timeout,
+            Duration::from_secs(4)
+        );
+        assert_eq!(
+            PostgresOutboxQueueConfig::from_lookup(|_| Some("125".into()))
+                .unwrap()
+                .statement_timeout,
+            Duration::from_millis(125)
+        );
+        assert!(PostgresOutboxQueueConfig::from_lookup(|_| Some(i32::MAX.to_string())).is_ok());
+        for value in ["0", "invalid", "-1", "2147483648", "18446744073709551616"] {
+            assert!(PostgresOutboxQueueConfig::from_lookup(|_| Some(value.into())).is_err());
+        }
+        for statement_timeout in [Duration::ZERO, Duration::from_nanos(1), Duration::MAX] {
+            assert!(PostgresOutboxQueueConfig { statement_timeout }.validate().is_err());
+        }
+        let pool = sqlx::postgres::PgPoolOptions::new()
+            .connect_lazy("postgresql://localhost/test")
+            .unwrap();
+        assert!(
+            PostgresOutboxQueue::with_config(
+                pool,
+                PostgresOutboxQueueConfig {
+                    statement_timeout: Duration::ZERO
+                }
+            )
+            .is_err()
+        );
     }
 }
