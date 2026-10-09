@@ -19,12 +19,15 @@ configuration in this repository.
 - `presentation` maps inbound protocols into domain and application types. It
   owns HTTP DTOs and must not bypass application code or encode domain rules.
   Application must not expose or depend on HTTP DTOs.
-- `infrastructure` implements ports and contains PostgreSQL, `postgres-es`,
-  external email, and other I/O integrations. It translates framework and I/O
-  failures into gateway failures, but must not interpret their business meaning.
-  Do not expose those types through domain APIs.
+- `infrastructure` implements service-specific ports such as aggregate ID
+  selection, entropy, clocks, and external delivery. Aggregate gateways
+  delegate generic execution to `cqrs-runtime`; do not duplicate its retry or
+  persistence behavior.
+- `cqrs-runtime` owns domain-agnostic CQRS command execution, outbox
+  contracts and coordination, PostgreSQL persistence, canonical SQL, and the
+  worker supervisor. It must never depend on `account-managements-service`.
 - `main` only composes dependencies and starts the application.
-- `runtime`, included privately by the binary, supervises process lifecycle:
+- `account-managements-service/src/runtime.rs`, included privately by the binary, supervises process lifecycle:
   shutdown signals, coordinated adapter draining, and runtime exit errors. It
   may depend on presentation adapters but is not part of the library API.
 
@@ -33,7 +36,7 @@ configuration in this repository.
 Group application code first by domain capability, then by use case:
 
 ```text
-src/
+account-managements-service/src/
   application.rs
   application/
     {capability}.rs
@@ -45,17 +48,16 @@ src/
       tasks.rs
       tasks/{task}.rs
       tasks/{task}/v1.rs
-    outbox.rs
-    outbox/{task,queue,task_handler,coordinator,task_handler_registry,error}.rs
 ```
 
 - `{capability}.rs` declares the feature modules. `service.rs` owns the public
   input service, service errors and factory; `gateway.rs` owns the output port.
   Gateway results use the shared
-  `application::CommandGatewayError<DomainError>`; do not define a
+  `cqrs_runtime::command::CommandGatewayError<DomainError>`; do not define a
   feature-specific gateway-error enum. `use_cases.rs` declares the private
-  workflows and their shared constants. Keep test-only fakes out of `src/`;
-  application boundary tests under `tests/` own their gateway fakes.
+  workflows and their shared constants. Keep test-only fakes out of the
+  service's `src/`; application boundary tests under
+  `account-managements-service/tests/` own their gateway fakes.
 - `{capability}/use_cases/{use_case}.rs` implements one workflow. It
   creates the domain command, calls the feature gateway, and follows
   [Error boundaries](#error-boundaries). It does not define a public API for
@@ -64,9 +66,10 @@ src/
   application port implemented by infrastructure. Generate them before
   issuing the command; events carry the accepted values so replay never
   samples randomness again.
-- Versioned durable task DTOs live under `{capability}/tasks/{task}/v1.rs`;
-  `{task}.rs` owns the current `TaskHandler` and any sender port. Keep persisted DTOs
-  readable while queued work can still be retried.
+- Versioned durable task DTOs live under `{capability}/tasks/{task}/v1.rs` and
+  implement `cqrs_runtime::outbox::TaskPayload`; `{task}.rs` owns the current
+  `TaskHandler` implementation and any business sender port. Keep persisted
+  DTOs readable while queued work can still be retried.
 - Presentation imports only `application::{capability}::service::{FeatureService,
   FeatureServiceError}`. Infrastructure implements the feature's
   `gateway::FeatureGateway`. `main` composes a gateway through the service factory and
@@ -77,11 +80,11 @@ src/
 ### Feature layout example
 
 ```text
-src/application/invoice.rs                 Declares gateway, service, use_cases
-src/application/invoice/gateway.rs         InvoiceGateway output port
-src/application/invoice/service.rs         InvoiceService input port, errors, factory
-src/application/invoice/use_cases.rs       Private workflow declarations
-src/application/invoice/use_cases/approve.rs  Command and error mapping
+account-managements-service/src/application/invoice.rs                 Declares gateway, service, use cases
+account-managements-service/src/application/invoice/gateway.rs         InvoiceGateway output port
+account-managements-service/src/application/invoice/service.rs         InvoiceService input port, errors and factory
+account-managements-service/src/application/invoice/use_cases.rs       Private workflow declarations
+account-managements-service/src/application/invoice/use_cases/approve.rs  Command and error mapping
 ```
 
 `InvoiceService` is the input boundary used by presentation; `InvoiceGateway`
@@ -96,7 +99,7 @@ cross-layer enum.
 
 - `DomainError` is deterministic aggregate business logic. It never represents
   I/O, persistence, retries, or framework behavior.
-- `application::CommandGatewayError<DomainError>` is the shared output-port
+- `cqrs_runtime::command::CommandGatewayError<DomainError>` is the shared output-port
   result for command gateways. Infrastructure converts framework failures into
   these categories without deciding what a command means to its caller. Do not
   create a feature-specific duplicate of this enum.
@@ -110,9 +113,11 @@ cross-layer enum.
 
 ## Retry ownership
 
-- Infrastructure CQRS owns a short optimistic-conflict retry. It rebuilds
-  aggregate state for every attempt while repeating the same command and the
-  same prebuilt outbox tasks. `max_attempts` counts the initial execution.
+- `cqrs-runtime::CqrsCommandExecutor` owns the short optimistic-conflict retry.
+  An aggregate-specific gateway computes the aggregate ID and delegates the
+  unchanged command and prebuilt tasks. The executor builds one framework per
+  command and reloads aggregate state for each attempt. `max_attempts` counts
+  the initial execution.
 - Retry only `AggregateError::AggregateConflict`. Never automatically retry
   connection, timeout, unavailable, deserialization, or unexpected failures:
   their commit outcome may be unknown without an idempotency mechanism.
@@ -132,16 +137,13 @@ cross-layer enum.
 Group outbound adapters by infrastructure technology:
 
 ```text
-src/
+account-managements-service/src/
   infrastructure.rs
   infrastructure/
     console.rs
     cqrs.rs
     cqrs/
       {feature}_gateway.rs
-    postgres.rs
-    postgres/
-      {adapter}.rs
     random.rs
     time.rs
 ```
@@ -152,15 +154,16 @@ src/
   owns system clocks, and `console` owns development console output adapters.
 - `infrastructure/cqrs/{feature}_gateway.rs` implements the feature gateway. It accepts
   the domain command created by application, derives any framework aggregate id,
-  executes it through `cqrs-es`, and follows [Error boundaries](#error-boundaries).
+  delegates it to `cqrs_runtime::command::CqrsCommandExecutor`, and follows
+  [Error boundaries](#error-boundaries).
   It must not map a domain rejection or conflict to a service error.
   Command gateways do not expose reconstructed aggregate state to the
   application. The CQRS engine loads state internally to decide a command and
-  uses optimistic version checks on commit. Retry a conflict by executing the
-  command again; build query endpoints from event streams and projections.
-- `infrastructure/postgres/{adapter}.rs` owns `sqlx`, `postgres-es`, SQL, and
-  PostgreSQL transaction behavior. It may implement a CQRS persistence trait;
-  that is still a PostgreSQL adapter.
+  uses optimistic version checks on commit. Build query endpoints from event
+  streams and projections.
+- `cqrs-runtime`'s `postgres` feature owns `sqlx`, `postgres-es`, the event
+  repository, queue, and SQL assets. Service infrastructure must not wrap or
+  re-export these generic adapters.
 - Do not add `pub use` aliases that flatten technology modules. Import a
   concrete adapter through its technology path.
 - Runtime diagnostics use structured `tracing` events at the adapter boundary
@@ -170,7 +173,7 @@ src/
   it. The default level is `info`, configurable through `RUST_LOG`. Keep domain
   code free of logging and never include outbox payloads or secrets in failure
   events.
-- `main` is the only composition root. It constructs the PostgreSQL adapter,
+- `main` is the only composition root. It constructs the runtime PostgreSQL adapter,
   event store, CQRS framework, feature gateway, feature service, and router in
   that order. Infrastructure modules must not provide factories that compose
   several technologies.
@@ -232,6 +235,12 @@ A client profile submission consumes its account-creation token with the first
 accepted command; every later submission with that consumed token is a semantic
 rejection, even when the request is identical.
 
+`PostgresEventRepositoryWithOutbox` supports at most one event per command.
+It rejects a multi-event batch, a snapshot without an event, and tasks without
+an event before issuing SQL. The one event, optional snapshot, and tasks are
+then committed by one atomic statement. Supporting multi-event commands
+requires a separate snapshot-contract change.
+
 `main` injects a `build_framework` closure into each CQRS gateway. For each
 command, it creates a PostgreSQL repository carrying that call's immutable
 task list, then the standard event store and CQRS framework. This keeps
@@ -245,15 +254,16 @@ let gateway = CqrsInvoiceGateway::new(move |tasks| {
         .with_outbox(tasks);
     let store = PersistedEventStore::new_snapshot_store(repository, 25);
     CqrsFramework::new(store, vec![], ())
-});
+}, AggregateConflictRetryPolicy::default());
 ```
 
-Application owns task contracts, queue and handler ports, and the
-`OutboxTaskCoordinator` for claim, timeout, retry and settlement. A `TaskHandlerRegistry`
+Application owns versioned business task DTOs, handler implementations, and
+sender ports. `cqrs-runtime` owns the generic task, queue and handler traits,
+the `OutboxTaskCoordinator`, and `TaskHandlerRegistry`. The registry
 rejects empty and duplicate registrations and routes each type/version to one
 handler. The composition root builds a separate registry for every worker and
 derives the coordinator's claim formats from it. Unknown formats stay pending.
-PostgreSQL owns atomic claims, leases, token-checked settlements
+The runtime PostgreSQL adapter owns atomic claims, leases, token-checked settlements
 and expired-lease recovery. Concrete senders live under their infrastructure
 technology. Versioned wire DTOs are converted into current handler inputs.
 The outbox uses `pending`, `processing`, `completed`, and `failed` statuses.
@@ -265,27 +275,24 @@ and expired-lease recovery return confirmed `failed` transitions to the worker
 for safe structured error logging. Unknown formats stay `pending` without being
 claimed.
 
-Background polling is an inbound adapter under `presentation/outbox_worker_pool.rs`. Its
-Tokio supervisor owns bounded worker mailboxes, cancellation, polling and worker
-restarts; `outbox_worker_pool/worker.rs` invokes the application coordinator with its
-registry. `main` composes the queue, coordinator, handler factory and supervisor
-alongside HTTP. Configuration
-parsing/validation stays outside `main` so it remains testable and covered.
+Background polling comes from `cqrs-runtime`'s `worker` feature. Its Tokio
+supervisor owns bounded worker mailboxes, cancellation, polling and worker
+restarts. `main` composes the runtime queue, coordinator, business handler
+factory, and supervisor alongside HTTP. Configuration parsing and validation
+stay in the runtime crate so they remain testable and covered.
 
 ## Presentation layout
 
 Organize HTTP adapters by resource, then use case:
 
 ```text
-src/
+account-managements-service/src/
   presentation.rs
   presentation/
     http.rs
     http/{resource}.rs
     http/{resource}/
       {use_case}.rs
-    outbox_worker_pool.rs
-    outbox_worker_pool/worker.rs
 ```
 
 - `presentation/http.rs` composes resource routers and contains reusable HTTP
@@ -299,31 +306,34 @@ src/
 
 ### Coverage boundary
 
-- `src/main.rs` is the composition root. Exclude it from line coverage because
+- `account-managements-service/src/main.rs` is the composition root. Exclude it from line coverage because
   it only wires dependencies and starts the process; do not add brittle unit
   tests around process startup.
-- Keep `src/runtime.rs` in coverage and test lifecycle coordination there with
+- Keep `account-managements-service/src/runtime.rs` in coverage and test lifecycle coordination there with
   controlled futures rather than real process signals.
-- Keep `src/presentation/http.rs` in coverage. Test its top-level router through an
+- Keep `account-managements-service/src/presentation/http.rs` in coverage. Test its top-level router through an
   in-memory Axum request so route composition is verified without PostgreSQL.
 - Keep infrastructure adapters in coverage until their integration-test
   strategy is explicitly decided; do not exclude them merely to satisfy the
   global threshold.
+- Cover `cqrs-runtime` as part of workspace coverage; feature-specific code
+  must be exercised with `--all-features`.
 
 ## Test ownership
 
 - Test application command and error matrices through the public input service
-  in integration tests under `tests/`; those tests own their gateway fakes.
+  in integration tests under `account-managements-service/tests/`; those tests own their gateway fakes.
 - HTTP tests send in-memory Axum requests to a stub input service. They do not
   construct an application service or gateway.
-- Unit-test payload construction in `outbox/task.rs`, retry and timeout in
-  `outbox/coordinator.rs`, format routing in `outbox/task_handler_registry.rs`, v1
-  task decoding in the handler, output failures in the sender, and worker
-  configuration, supervision and shutdown beside the worker pool and worker.
-- `tests/outbox.rs` roots the PostgreSQL suite. Its `support.rs` owns the shared
-  database fixture; `persistence.rs`, `queue.rs`, `processing.rs` and `worker.rs`
-  own persisted behavior. `tests/cqrs_gateway.rs` uses real `CqrsFramework`
-  and `MemStore`.
+- Runtime unit tests use local dummy aggregate, task, error, and handler types;
+  they must not import the service. Test executor retry/error behavior, payload
+  construction, coordinator timeout/retry, registry routing, and worker
+  supervision beside their runtime modules.
+- `cqrs-runtime/tests/postgres.rs` roots the PostgreSQL suite. Its
+  `postgres/support.rs` owns the shared database fixture; persistence, queue,
+  processing and worker modules own persisted behavior. Service gateway tests
+  under `account-managements-service/tests/cqrs_gateway.rs` use real
+  `CqrsFramework` and `MemStore`.
 
 ## HTTP errors and mappings
 

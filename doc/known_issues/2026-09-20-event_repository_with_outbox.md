@@ -4,7 +4,7 @@
 
 Область review:
 
-- [`src/infrastructure/postgres/event_repository_with_outbox.rs`](../../src/infrastructure/postgres/event_repository_with_outbox.rs)
+- [`cqrs-runtime/src/postgres/event_repository_with_outbox.rs`](../../cqrs-runtime/src/postgres/event_repository_with_outbox.rs)
 - схема `transactional_outbox`;
 - постановка, claim, retry и подтверждение outbox-задач;
 - взаимодействие с snapshot-механизмом `cqrs-es`.
@@ -23,7 +23,10 @@ outbox, а не dual-write: domain events, snapshot и outbox tasks записы
 
 ## Найденные проблемы
 
-### P1 при появлении multi-event команд: snapshot получает неверный `last_sequence`
+### Resolved: multi-event и snapshot-only writes отклоняются
+
+Статус: исправлено при выделении `cqrs-runtime`. Регрессионный тест находится в
+[`cqrs-runtime/tests/postgres/persistence.rs`](../../cqrs-runtime/tests/postgres/persistence.rs).
 
 В `persist_batch` snapshot всегда получает sequence последнего события batch:
 
@@ -37,21 +40,18 @@ let last_sequence = event_sequences.last().copied().unwrap_or_default();
 `last_sequence = 3`. При следующей загрузке событие с sequence `3` будет
 пропущено, и состояние aggregate окажется неполным.
 
-Сейчас aggregate-команды сервиса генерируют по одному событию, поэтому дефект
-фактически не проявляется. Тем не менее generic repository небезопасен для
-multi-event команд.
+Все aggregate-команды сервиса генерируют не более одного события. Runtime
+теперь проверяет этот safety contract до выполнения SQL:
 
-Возможные решения:
+- batch из нескольких событий отклоняется;
+- snapshot без события отклоняется;
+- outbox tasks без события отклоняются;
+- пустой batch без snapshot и tasks остаётся допустимым no-op.
 
-- исправить или форкнуть интеграцию с `cqrs-es`, чтобы вместе со snapshot
-  передавался его фактический event sequence;
-- отказаться от snapshot store до исправления контракта;
-- как временное ограничение явно закрепить и проверить invariant «одна команда
-  создаёт не более одного события».
-
-Смежный случай: прямой вызов `persist([], Some(snapshot))` разрешён и сохранит
-`last_sequence = 0`. Такой вызов следует отклонять, если repository не может
-получить фактическую sequence snapshot.
+Для поддерживаемого one-event batch snapshot получает sequence именно этого
+события, а event, snapshot и tasks фиксируются одним statement. Поддержка
+multi-event команд по-прежнему требует отдельного изменения контракта, чтобы
+repository получал фактическую sequence snapshot.
 
 ### P1/P2: задачи одного aggregate могут выполняться не по порядку
 
@@ -74,7 +74,7 @@ per-aggregate сериализация. Для verification codes может л�
 ### Resolved: классификация PostgreSQL `23505`
 
 Статус: исправлено. Регрессионный тест находится в
-[`tests/outbox/persistence.rs`](../../tests/outbox/persistence.rs).
+[`cqrs-runtime/tests/postgres/persistence.rs`](../../cqrs-runtime/tests/postgres/persistence.rs).
 
 `map_sqlx_error` превращает любое нарушение unique constraint в
 `PersistenceError::OptimisticLockError`:
@@ -106,13 +106,13 @@ if database_error.code().as_deref() == Some("23505") {
 
 ## Что реализовано корректно
 
-- Snapshot lock, events и outbox связаны через `RETURNING` CTE.
+- Snapshot lock, единственное event и outbox связаны через `RETURNING` CTE.
 - При stale snapshot ни events, ни outbox tasks не вставляются.
 - Ошибка вставки event, snapshot или outbox task откатывает весь statement.
 - Outbox task нельзя поставить без зафиксированного domain event.
 - Повторный task ID не проглатывается через `ON CONFLICT DO NOTHING`.
-- Перед записью проверяются переполнение event sequence, duration и лимит bind
-  parameters PostgreSQL.
+- До SQL проверяются one-event invariant, наличие event для snapshot/tasks,
+  переполнение event sequence, duration и лимит bind parameters PostgreSQL.
 - Claim использует `FOR UPDATE SKIP LOCKED`, позволяя нескольким worker-ам
   безопасно разбирать очередь.
 - Lease и `lock_token` fencing не позволяют старому владельцу подтвердить
@@ -159,7 +159,6 @@ duplicate event sequence и валидацию outbox task.
 
 Не хватает регрессионных тестов для:
 
-- snapshot на границе interval при batch из нескольких событий;
 - out-of-order выполнения двух задач одного aggregate;
 - ~~отдельной классификации дубликата `transactional_outbox.id`~~ — исправлено,
   покрыто регрессионным тестом;

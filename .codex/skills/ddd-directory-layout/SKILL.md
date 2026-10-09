@@ -5,7 +5,8 @@ description: Organize Rust domain aggregates, entities, value objects, commands,
 
 # DDD directory layout for Account Management Service
 
-Use this skill before adding or reorganizing code under `src/domain/`.
+Use this skill before adding or reorganizing code under
+`account-managements-service/src/domain/`.
 
 ## Layout
 
@@ -13,7 +14,7 @@ Group code by aggregate or bounded-context concept, not in global `entities/`
 or `value_objects/` directories. A root module is the stable public facade:
 
 ```text
-src/domain/
+account-managements-service/src/domain/
   user_account.rs
   user_account/
     aggregate.rs

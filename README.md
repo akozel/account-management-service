@@ -47,6 +47,21 @@ in this case study, but the account identity is not coupled to the address.
 The aggregates never call or mutate each other. Application services issue
 commands, and durable outbox tasks carry facts between the two event streams.
 
+## Workspace layout
+
+The repository is a Cargo workspace with two packages:
+
+- [`account-managements-service`](account-managements-service) owns the domain, use cases, versioned business
+  tasks and handlers, HTTP adapter, service-specific adapters, and binary;
+- [`cqrs-runtime`](cqrs-runtime/README.md) owns reusable command
+  execution, outbox coordination, PostgreSQL persistence, and worker
+  supervision without depending on the account-management domain.
+
+`cqrs-runtime` enables its `postgres` and `worker` features by default. Minimal
+consumers can opt into only the portable contracts with
+`default-features = false`. The domain continues to implement the upstream
+`cqrs-es::Aggregate` and `DomainEvent` traits directly.
+
 ## Domain model
 
 ### `EmailReservation`
@@ -220,6 +235,11 @@ because the commit outcome can be unknown.
 
 ## PostgreSQL
 
+The canonical event-store and transactional-outbox schemas are maintained in
+[`cqrs-runtime/sql`](cqrs-runtime/sql). Compose mounts those exact
+assets, so there is no second service-owned schema copy. This workspace split
+does not change the schema or persisted formats and requires no data migration.
+
 The Compose file runs PostgreSQL only:
 
 ```sh
@@ -238,9 +258,9 @@ Copy the local configuration template, adjust it if necessary, build the
 release binary, and run it:
 
 ```sh
-cp .env.example .env
+cp account-managements-service/.env.example .env
 cargo build --release
-./target/release/account-management-service
+./target/release/account-managements-service
 ```
 
 ## HTML coverage report
@@ -248,7 +268,7 @@ cargo build --release
 Generate and open the coverage report with:
 
 ```sh
-cargo llvm-cov --html --open --ignore-filename-regex '(^|/)main\.rs$' --fail-under-lines 90
+cargo llvm-cov --workspace --all-features --html --open --ignore-filename-regex '(^|/)main\.rs$' --fail-under-lines 90
 ```
 
 The generated entry point is `target/llvm-cov/html/index.html`.
