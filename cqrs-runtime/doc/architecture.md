@@ -16,6 +16,9 @@ generic executor; the runtime contains no application-domain dependencies.
 flowchart TB
     subgraph Host["Host application and domain"]
         Root["Composition root<br/>dependency wiring and process lifecycle"]
+        Lifecycle["Process runtime<br/>signal, cancellation and adapter drain"]
+        Http["HTTP server<br/>graceful shutdown"]
+        Stop["CancellationToken<br/>shared process stop request"]
         Gateway["Application / command gateway<br/>command and explicit NewOutboxTask list"]
         Aggregate["Aggregate<br/>business invariants and workflow phases"]
         Factory["HandlerRegistryFactory<br/>fresh handlers and sender state"]
@@ -47,7 +50,15 @@ flowchart TB
     Receiver["External receiver<br/>effect and idempotency enforcement"]
 
     Root -.->|"supplies framework factory"| Executor
-    Root -.->|"starts and signals shutdown"| Supervisor
+    Root -.->|"starts"| Supervisor
+    Root -.->|"creates shared token"| Stop
+    Root -.->|"starts"| Lifecycle
+    Root -.->|"constructs"| Http
+    Lifecycle -.->|"signal or critical component exit: cancel"| Stop
+    Supervisor -.->|"fatal error: cancel before drain"| Stop
+    Stop -.->|"stop HTTP admission"| Http
+    Stop -.->|"stop claims and recovery"| Supervisor
+    Stop -.->|"stop dequeue; preserve active invocation"| Slot
     Root -.->|"supplies dependencies"| Factory
     Gateway -->|"execute(command, tasks)"| Executor
     Executor -->|"build once; execute each attempt"| Cqrs
@@ -254,10 +265,20 @@ the entire await, including pool acquisition and commit. The local lease estimat
 never replaces PostgreSQL token/expiry fencing. A retry request may become
 `Failed` at the attempt limit. Unknown formats remain pending.
 
-Shutdown and restart-factory failure set internal stop before closing the channel,
-stop claims and dequeue, then drain started
-invocations plus settlement for H+S. Waiting claims remain for recovery; remaining
-workers are aborted and joined after the deadline.
+Shutdown cancels the shared CancellationToken before closing the channel and
+stops claims and dequeue, then drains started invocations plus settlement for H+S.
+Startup/restart errors cancel that token before returning/draining: HTTP begins
+graceful shutdown while healthy workers still finish. A worker panic is restarted
+without cancelling the process. Waiting claims remain for recovery; remaining
+workers are aborted and joined after the deadline. The supervisor's DropGuard also
+requests host cancellation on panic/abort, when asynchronous drain is impossible.
+
+The host awaits HTTP and outbox before closing PostgreSQL, preserving the primary
+failure and logging secondary errors with safe task diagnostics. HTTP can publish
+new durable tasks while its in-flight requests finish; these tasks wait for a
+subsequent healthy pool. HTTP/DB cleanup has no overall deadline yet, and the
+synchronous development stdout adapter can exceed cooperative async budgets;
+both limitations remain separate backlog tasks.
 Interrupted work remains durable for expiry recovery. There is no lease renewal.
 
 A target command may atomically publish a successor task through the command

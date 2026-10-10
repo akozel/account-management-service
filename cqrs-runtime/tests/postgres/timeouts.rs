@@ -381,3 +381,90 @@ async fn runtime_deadline_includes_connection_acquisition() {
     pool.close().await;
     db.close().await;
 }
+
+#[tokio::test]
+async fn shutdown_after_committed_claim_or_settlement_preserves_durable_outcomes() {
+    for stage in ["claim", "settle"] {
+        let db = Database::new().await;
+        let task = new_task();
+        enqueue(&db.pool, vec![task.clone()]).await;
+        let queue = Arc::new(LostReplyQueue {
+            inner: PostgresOutboxQueue::new(db.pool.clone()),
+            lose_claim_reply: std::sync::atomic::AtomicBool::new(stage == "claim"),
+            lose_settle_reply: std::sync::atomic::AtomicBool::new(stage == "settle"),
+            delayed_format: None,
+        });
+        let coordinator = outbox_task_coordinator_with_config(
+            queue.clone(),
+            vec![format()],
+            OutboxTaskCoordinatorConfig::new(Duration::from_millis(300)).unwrap(),
+        )
+        .unwrap();
+        let calls = Arc::new(AtomicUsize::new(0));
+        let factory: HandlerRegistryFactory = Arc::new({
+            let calls = calls.clone();
+            move || TaskHandlerRegistry::try_new(vec![Box::new(CountingHandler(calls.clone()))])
+        });
+        let shutdown = CancellationToken::new();
+        let worker = tokio::spawn(outbox_worker_pool::run(
+            coordinator.clone(),
+            factory,
+            OutboxWorkerPoolConfig::new(
+                1,
+                1,
+                Duration::from_secs(3600),
+                Duration::from_secs(1),
+                Duration::from_secs(120),
+            )
+            .unwrap(),
+            shutdown.clone(),
+        ));
+        let expected = if stage == "claim" { "processing" } else { "completed" };
+        tokio::time::timeout(Duration::from_secs(10), async {
+            while row(&db.pool, task.id()).await.get::<String, _>("status") != expected {
+                tokio::time::sleep(Duration::from_millis(2)).await;
+            }
+        })
+        .await
+        .unwrap();
+        shutdown.cancel();
+        tokio::time::timeout(Duration::from_secs(2), worker)
+            .await
+            .unwrap()
+            .unwrap()
+            .unwrap();
+        assert_worker_state(&db.pool, task.id(), expected, 1, None).await;
+        assert_eq!(calls.load(Ordering::SeqCst), usize::from(stage == "settle"));
+        if stage == "claim" {
+            expire(&db.pool, task.id()).await;
+            assert_eq!(coordinator.recover_expired(1).await.unwrap().processed_count(), 1);
+            make_ready(&db.pool, task.id()).await;
+            queue.lose_claim_reply.store(false, Ordering::SeqCst);
+            let owned = coordinator
+                .claim("after_shutdown", 1, Duration::from_secs(120))
+                .await
+                .unwrap()
+                .pop()
+                .unwrap();
+            assert_eq!(owned.delivery().id(), task.id());
+            assert!(
+                coordinator
+                    .execute_and_settle(&mut handler(Ok(())), owned, Duration::from_secs(1))
+                    .await
+                    .unwrap()
+                    .is_applied()
+            );
+            assert_worker_state(&db.pool, task.id(), "completed", 2, None).await;
+        } else {
+            assert_eq!(coordinator.recover_expired(1).await.unwrap().processed_count(), 0);
+            assert!(
+                coordinator
+                    .claim("after_shutdown", 1, Duration::from_secs(120))
+                    .await
+                    .unwrap()
+                    .is_empty()
+            );
+        }
+        db.close().await;
+    }
+}

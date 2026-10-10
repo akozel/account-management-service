@@ -223,16 +223,53 @@ exit removes one Tokio task ID and recreates one checked registry/task for that
 worker index. An in-progress bounded storage await may delay this observation.
 Panic payloads are not logged by supervision; panic=abort ends the process.
 
-True shutdown or closure of the shutdown sender stops claims and dequeue; false
-updates do not stop the pool. The same path applies to restart-factory failures.
-The internal stop is set before explicitly closing the channel, because closure
-alone still allows buffered deliveries to be received. Workers prioritize stop
-over recv and check stop again before execution. Only already-started
-handler/settlement work drains, for a common H+S deadline.
-Waiting claimed tasks remain durable for expiry recovery. At the drain deadline,
-remaining workers are aborted and their join results are observed before return.
-Dropping/cancelling the supervisor aborts workers through JoinSet's drop behavior;
-it cannot perform asynchronous graceful draining.
+`worker::run` takes a `tokio_util::sync::CancellationToken`. Its clones share
+one cancellation request between the host, supervisor, and permanent workers.
+Cancellation stops claims and dequeue, including while the supervisor awaits
+storage. Workers prioritize cancellation over recv and check it again before
+execution. A ready claim batch is discarded if cancellation has been observed;
+its already-committed ownership remains for lease recovery.
+
+Startup configuration/registry errors cancel the supplied token before returning.
+Restart-factory errors and format mismatches cancel it **before** draining healthy
+workers, notifying the host immediately, and return the original `WorkerPoolError`
+after drain. A worker panic alone does not cancel it: the supervisor restarts that
+worker. A host that needs to isolate a pool passes `parent.child_token()`; cancelling
+that child does not cancel the parent. Factories are synchronous and must return
+promptly; cancellation cannot preempt a blocking factory call.
+
+The token is cancelled before explicitly closing the channel, because closure
+alone still permits receiving buffered deliveries. Only already-started
+handler/settlement work drains, for one common H+S deadline (35 seconds with
+default budgets). Cancellation is not raced against `execute_and_settle`: current
+work retains its original handler, storage, and lease deadlines. Waiting claims
+remain durable for expiry recovery. At the drain deadline, remaining workers are
+aborted and their join results are observed before return.
+
+The supervisor holds a token drop guard from startup. Dropping/aborting a polled
+supervisor or unwinding its panic requests host cancellation and aborts workers
+through JoinSet's drop behavior; it cannot perform asynchronous graceful draining.
+Dropping an ordinary token handle does not cancel it. Lifecycle owners should
+hold a drop guard and explicitly cancel/await components for normal shutdown.
+This replaces the former watch receiver API, including its sender-closure and
+false-update semantics; no compatibility adapter is provided.
+
+The service host gives HTTP and outbox the same token. It observes process signals,
+token cancellation, and critical component exits in that priority order (HTTP
+before outbox when neither stop request is ready), then awaits both components.
+An unexpected component exit remains the primary failure. With a signal/token
+request, failure priority is signal-observation error, outbox failure, then HTTP
+failure; other observed failures are logged separately. Supervisor task diagnostics
+use task ID and panic/cancellation flags, not JoinError's payload-bearing formatting.
+The ordinary panic hook is independent of these structured diagnostics.
+
+HTTP and outbox drain concurrently. An in-flight HTTP request or handler may commit
+new durable tasks after outbox admission stops; they are processed by a subsequent
+healthy pool. Shutdown does not promise completion of the whole business workflow.
+The database pool closes after both components finish. HTTP shutdown and pool
+cleanup currently have no process-wide deadline. The development console sender
+performs synchronous stdout writes, which cannot be preempted by async timers or
+abort; these two limitations are separate backlog tasks.
 
 The queue anchors `ClaimedTask::lease().deadline()` to a monotonic instant before
 requesting ownership. It is a conservative, process-local budget that includes
@@ -274,7 +311,9 @@ accepted by a receiver. There is no heartbeat/renewal or exactly-once guarantee.
    handler_timeout, lease_duration)` requires both independent limits. Load and validate `PostgresOutboxQueueConfig`,
    `OutboxTaskCoordinatorConfig`, and `OutboxWorkerPoolConfig`. Compose the
    queue/coordinator and validate the full lease budget before accepting traffic.
-   Start `worker::run` with a shutdown receiver; the host owns process lifecycle.
+   Start `worker::run` with a cancellation token; the host owns process lifecycle
+   and may share that token with its other critical adapters. Fatal supervisor
+   errors cancel the token before draining; await its result to obtain the error.
    Handle `WorkerPoolError` separately from configuration validation errors.
 6. For another queue adapter, enforce atomic claims, attempt limits, durable
    schedules, conditional token/expiry settlement, and expired ownership

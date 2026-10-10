@@ -82,13 +82,16 @@ Startup проверяет с checked arithmetic:
 Defaults lease=120s. Увеличение очереди требует большего lease или конкурентности.
 Оригинальный deadline проверяется coordinator и остается неизменным после dispatch.
 
-True host shutdown, закрытие host watch или ошибка restart factory запускают
-одинаковый drain. Сначала выставляется internal stop, затем закрывается канал:
-close сам по себе разрешает чтение buffered сообщений. Worker проверяет stop
-с приоритетом перед recv и повторно перед handler; false updates игнорируются.
+Отмена общего CancellationToken или ошибка restart factory запускают одинаковый
+drain. Ошибка factory отменяет токен до drain, сразу уведомляя HTTP. Сначала
+отменяется токен, затем закрывается канал:
+close сам по себе разрешает чтение buffered сообщений. Worker проверяет отмену
+с приоритетом перед recv и повторно перед handler. Обычный Drop token handle
+не отменяет его; владельцы lifecycle используют DropGuard.
 Только начатые handler/settlement завершаются в общем бюджете H+S, затем оставшиеся
 workers abort-ятся и join-ятся. Ожидающие claims остаются для lease recovery.
-Отмена supervisor abort-ит принадлежащие JoinSet задачи без detached workers.
+Отмена supervisor через abort отменяет общий токен с помощью DropGuard и abort-ит
+принадлежащие JoinSet задачи без detached workers; асинхронный drain невозможен.
 
 ## Проверки
 

@@ -1,7 +1,7 @@
 # Упрощение cqrs-runtime
 
-Статус: backlog. Анализ выполнен по текущему рабочему дереву 2026-10-10.
-Первая задача выполнена и прошла обязательные проверки.
+Статус: backlog. Последняя проверка рабочего дерева: 2026-10-11.
+Задачи №1 и №2 выполнены и прошли обязательные проверки.
 Согласованы независимые process-wide defaults C=128/Q=128 и lease=120 секунд.
 
 ## Задачи
@@ -9,7 +9,7 @@
 | № | Задача | Статус | Ожидаемый результат |
 | --- | --- | --- | --- |
 | 1 | [JoinSet, постоянные workers и независимые ограничения очереди/конкурентности](cqrs_runtime_join_set_workers.md) | Выполнено | Handler registry принадлежит одной Tokio task; bounded queue управляет ожиданием; JoinSet управляет завершением, panic и abort. |
-| 2 | Общая процедура shutdown и drain при ошибках supervisor | Drain реализован; CancellationToken отложен | Ошибка factory при restart проходит через согласованную процедуру завершения остальных workers. При необходимости рассмотреть CancellationToken вместо watch<bool>. |
+| 2 | Общая процедура shutdown и drain при ошибках supervisor; CancellationToken | Выполнено | Общий токен HTTP/outbox отменяется до аварийного drain; начатые операции получают H+S, исходная ошибка сохраняется, сопутствующие ошибки логируются безопасно. |
 | 3 | Оценить обычную SQLx-транзакцию вместо динамического CTE публикации | Backlog | Более простой SQL для event + snapshot + tasks при сохранении атомарности и optimistic lock; измерить цену дополнительных round trips. |
 | 4 | Batch recovery просроченных leases | Backlog | Заменить SELECT + N UPDATE пакетным обновлением, сохранив блокировки, индивидуальный jitter, attempts и подтвержденные failures после commit. |
 | 5 | Проверить целесообразность готового PostgreSQL runner | Backlog: исследование | Прототип sqlxmq или Apalis: атомарное enqueue с event-store, версии DTO, attempts, failure, lease/recovery и миграция существующих записей. |
@@ -17,6 +17,8 @@
 | 7 | Удалить локальный perf-harness после выбора очереди | Выполнено | Модуль performance, smoke-тест его измерений, инструкции, отчеты и CSV удалены. Оставлены поведенческие unit-тесты runtime. |
 | 8 | Миграция на async-channel 2.5.0 | Выполнено | Клонируемые receivers, один producer, независимые C/Q; старые реализации, адаптеры, тесты и сравнительные бенчмарки удалены. |
 | 9 | Проверка успешного выполнения 1000 задач | Выполнено | Реальные supervisor, async-channel, registry и coordinator с тестовым storage; каждый ID обработан один раз и получил Completed. |
+| 10 | Ограничить время HTTP shutdown и закрытия пула БД | Backlog; отдельно от №2 | HTTP grace period с управлением принудительным завершением соединений и ограниченный DB cleanup; timeout не трактуется как rollback. |
+| 11 | Заменить или изолировать блокирующий console sender | Backlog; отдельно от №2 | Зависший stdout не блокирует кооперативный runtime и завершение процесса; подтверждать успешную отправку только после выполнения обязательного эффекта. |
 
 ## Границы изменений
 
@@ -48,7 +50,7 @@ workspace tests и llvm-cov с порогом 90%. При новой настр�
 Задачу считать выполненной только после реализации и проверок; завершенный
 дизайн отдельно не означает завершенный рефакторинг.
 
-Миграция сохраняет публичные интерфейсы, defaults C=128/Q=128/lease=120s,
+Миграция очереди (№8) сохраняет публичные интерфейсы, defaults C=128/Q=128/lease=120s,
 исходные deadlines и bounded drain. Единственный poller берет claim limit из
 Q - sender.len(); consumers могут только освобождать место во время claim.
 Тесты проверяют отмену notified receive без потери доставки и освобождение
@@ -64,3 +66,35 @@ Q - sender.len(); consumers могут только освобождать ме�
 После удаления perf-модуля обязательные проверки прошли: fmt, workspace Clippy
 с `-D warnings`, workspace tests (142 passed, включая PostgreSQL и doctests;
 без ignored тестов) и llvm-cov с порогом 90%. Line coverage workspace: 97.89%.
+
+## Проверка graceful shutdown и границы задачи №2
+
+Согласована прямая миграция worker::run на CancellationToken без watch-адаптера.
+Host передает общий токен HTTP, supervisor и process runtime. Ошибка startup/restart
+отменяет его до возврата/drain; отдельный panic worker приводит к restart.
+Для изолированного пула можно передать child_token. DropGuard владельца lifecycle
+заменяет сигнал закрытия watch sender; обычный Drop token handle не отменяет токен.
+Начатые handler/settlement завершаются в общем H+S; ожидающие claims остаются для
+lease recovery. Supervisor abort отменяет токен и JoinSet workers без async drain.
+
+HTTP и outbox останавливаются одновременно. Завершающийся HTTP-запрос может
+опубликовать durable tasks после остановки workers; они ждут следующего запуска.
+Ошибка первого неожиданно завершившегося компонента сохраняется. При сигнале/токене
+приоритет ошибок: signal observation, supervisor, HTTP. Сопутствующие ошибки
+логируются отдельно; JoinError не форматируется вместе с panic payload.
+
+№10 и №11 отложены по согласованию. Для №10 одного timeout вокруг axum::serve
+недостаточно: connection tasks запускаются отдельно, требуется управляемое
+принудительное завершение соединений. DB cleanup выполняется после drain компонентов,
+но тоже нуждается в собственном ограничении; незавершенный commit остается неизвестным.
+Для №11 перенос в spawn_blocking сам по себе не отменяет начатый синхронный write/flush.
+Нельзя подтверждать Completed только за постановку сообщения в память вместо
+подтверждения обязательного эффекта. Worker drain ограничен кооперативным исполнением;
+временной предел для всего процесса пока не гарантирован.
+
+После реализации №2 обязательные проверки прошли: fmt, workspace Clippy с
+`-D warnings`, workspace tests (152 passed, включая PostgreSQL и doctests;
+без ignored тестов) и llvm-cov с порогом 90%. Line coverage workspace: 97.95%.
+Проверены ранняя отмена HTTP до завершения аварийного drain, общий токен во время
+pending claim, restart-factory ошибки и несовпадение форматов, supervisor panic/abort,
+приоритет одновременных событий и сохранение committed claim/settlement в PostgreSQL.

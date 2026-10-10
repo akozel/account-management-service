@@ -297,11 +297,22 @@ Defaults use a 120-second lease; validate queued waves with checked arithmetic:
 lease > 2*S + H + 5s + ceil(Q/C)*(H+S). Original deadlines remain authoritative.
 Observe exits through JoinSet and rebuild one checked registry per replacement;
 never log panic payloads. Normal shutdown and restart-factory errors share bounded
-H+S draining of started work only; set internal stop before closing the channel,
-as closure alone permits buffered receives. Queued claims remain for recovery. Abort and
-observe remaining tasks after the deadline. Keep watch<bool> for host shutdown;
-false updates do not stop the pool. Recovery batches are capped at min(C, 32). `main` composes the runtime queue, coordinator, business handler
-factory, and supervisor alongside HTTP. Configuration parsing and validation
+H+S draining of started work only; cancel the shared CancellationToken before
+closing the channel, as closure alone permits buffered receives. Queued claims
+remain for recovery. Abort and observe remaining tasks after the deadline.
+The host shares token clones with HTTP, process runtime, and the supervisor.
+Fatal startup/restart errors cancel the supplied token before returning/draining,
+so HTTP stops admission immediately; a worker panic alone is restarted. Callers
+can pass a child token to isolate a pool. Ordinary token-handle Drop does not
+cancel; lifecycle owners hold DropGuard. Supervisor panic/abort requests host
+cancellation through its guard and aborts JoinSet workers without async drain.
+Never race token cancellation against an active handler/settlement invocation.
+The process runtime awaits HTTP and outbox before DB cleanup; preserve the first
+unexpected component failure, or signal/outbox/HTTP error priority for requested
+shutdown, and log secondary failures. Format JoinError only as task ID and
+panic/cancellation flags, including RuntimeError Debug used by termination.
+Recovery batches are capped at min(C, 32). `main` composes the runtime queue,
+coordinator, business handler factory, and supervisor alongside HTTP. Configuration parsing and validation
 stay in the runtime crate so they remain testable and covered.
 
 ### Task handlers and workers

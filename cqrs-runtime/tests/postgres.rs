@@ -40,7 +40,7 @@ use testcontainers::{
     runners::AsyncRunner,
 };
 #[cfg(feature = "worker")]
-use tokio::sync::watch;
+use tokio_util::sync::CancellationToken;
 use uuid::Uuid;
 
 #[path = "postgres/persistence.rs"]

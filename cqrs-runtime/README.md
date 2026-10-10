@@ -35,7 +35,7 @@ The host applies [event-store SQL](sql/001-event-store.sql) and
 [outbox SQL](sql/002-transactional-outbox.sql), supplies handler factories and
 a database pool, and owns process signals and inbound-adapter draining.
 The following composition function requires the `postgres` and `worker`
-features and direct host dependencies on SQLx 0.8 and Tokio:
+features and direct host dependencies on SQLx 0.8, Tokio, and tokio-util 0.7:
 
 ```rust
 use std::{error::Error, sync::Arc};
@@ -46,12 +46,12 @@ use cqrs_runtime::{
     worker::{self, OutboxWorkerPoolConfig, HandlerRegistryFactory},
 };
 use sqlx::PgPool;
-use tokio::sync::watch;
+use tokio_util::sync::CancellationToken;
 
 pub async fn run_tasks(
     pool: PgPool,
     factory: HandlerRegistryFactory,
-    shutdown: watch::Receiver<bool>,
+    shutdown: CancellationToken,
 ) -> Result<(), Box<dyn Error + Send + Sync>> {
     let queue = Arc::new(PostgresOutboxQueue::with_config(
         pool,
@@ -69,6 +69,12 @@ pub async fn run_tasks(
     Ok(())
 }
 ```
+
+The host shares a `CancellationToken` with HTTP and the outbox supervisor. Call
+`cancel()` and await the supervisor for graceful drain. Fatal supervisor errors
+cancel the supplied token before drain, so HTTP can stop admission immediately.
+Pass a `child_token()` for an isolated pool. Dropping a token handle does not
+cancel it; a lifecycle owner can hold `shutdown.clone().drop_guard()`.
 
 Every fallible factory invocation must return a fresh registry with the same ordered
 format list. Defaults do not read environment variables automatically: call

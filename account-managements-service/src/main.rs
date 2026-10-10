@@ -29,7 +29,8 @@ use cqrs_runtime::{
 };
 use runtime::RuntimeError;
 use tokio::net::TcpListener;
-use tracing::{error, info};
+use tokio_util::sync::CancellationToken;
+use tracing::info;
 
 #[tokio::main]
 async fn main() -> Result<(), RuntimeError> {
@@ -88,19 +89,15 @@ async fn main() -> Result<(), RuntimeError> {
     let listener = TcpListener::bind(&bind_address).await.expect("unable to bind HTTP listener");
     info!(address = %bind_address, "HTTP server is listening");
 
-    let (shutdown_tx, shutdown_rx) = tokio::sync::watch::channel(false);
-    let worker = tokio::spawn(worker::run(outbox, handler_factory, worker_config, shutdown_rx));
-    let mut http_shutdown = shutdown_tx.subscribe();
+    let shutdown = CancellationToken::new();
+    let worker = tokio::spawn(worker::run(outbox, handler_factory, worker_config, shutdown.clone()));
+    let http_shutdown = shutdown.clone();
     let serve = async move {
         axum::serve(listener, app)
-            .with_graceful_shutdown(async move {
-                if !*http_shutdown.borrow() {
-                    let _ = http_shutdown.changed().await;
-                }
-            })
+            .with_graceful_shutdown(http_shutdown.cancelled_owned())
             .await
     };
-    let runtime_result = runtime::run(serve, worker, shutdown_tx, shutdown_signal()).await;
+    let runtime_result = runtime::run(serve, worker, shutdown, shutdown_signal()).await;
     pool.close().await;
     match runtime_result {
         Ok(()) => {
@@ -108,7 +105,7 @@ async fn main() -> Result<(), RuntimeError> {
             Ok(())
         }
         Err(error) => {
-            error!(error = ?error, "service stopped with an error");
+            error.log("service stopped with an error");
             Err(error)
         }
     }

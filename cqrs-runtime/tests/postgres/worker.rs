@@ -33,7 +33,8 @@ async fn two_live_workers_complete_every_supported_task_and_quarantine_bad_paylo
         move || TaskHandlerRegistry::try_new(vec![Box::new(DummyHandler(handled.clone()))])
     });
     let service = outbox_task_coordinator(Arc::new(PostgresOutboxQueue::new(db.pool.clone())), vec![format()]);
-    let (stop, shutdown) = watch::channel(false);
+    let shutdown = CancellationToken::new();
+    let stop = shutdown.clone();
     let config = OutboxWorkerPoolConfig::new(
         2,
         2,
@@ -63,7 +64,7 @@ async fn two_live_workers_complete_every_supported_task_and_quarantine_bad_paylo
     })
     .await
     .unwrap();
-    stop.send(true).unwrap();
+    stop.cancel();
     left.await.unwrap().unwrap();
     right.await.unwrap().unwrap();
 
@@ -115,7 +116,8 @@ async fn one_worker_pool_routes_two_registered_task_types() {
         Arc::new(PostgresOutboxQueue::new(db.pool.clone())),
         factory().unwrap().formats(),
     );
-    let (stop, shutdown) = watch::channel(false);
+    let shutdown = CancellationToken::new();
+    let stop = shutdown.clone();
     let worker = tokio::spawn(outbox_worker_pool::run(
         service,
         factory,
@@ -138,7 +140,7 @@ async fn one_worker_pool_routes_two_registered_task_types() {
     })
     .await
     .unwrap();
-    stop.send(true).unwrap();
+    stop.cancel();
     worker.await.unwrap().unwrap();
     assert_eq!(handled.lock().unwrap().len(), 1);
     assert_eq!(audited.load(Ordering::SeqCst), 1);

@@ -1,16 +1,17 @@
 //! Bounded delivery admission and JoinSet supervision of permanent registry-owning workers.
 use super::{
     OutboxWorkerPoolConfig, OutboxWorkerPoolConfigError,
-    worker_task::{log_failed, run_worker, stop_requested},
+    worker_task::{log_failed, run_worker},
 };
 use crate::outbox::{ClaimedTask, OutboxTaskCoordinator, TaskFormat, TaskHandlerRegistry, TaskHandlerRegistryError};
 use std::{collections::HashMap, sync::Arc, time::Duration};
 use thiserror::Error;
 use tokio::{
-    sync::{Notify, watch},
+    sync::Notify,
     task::{Id, JoinSet},
     time::MissedTickBehavior,
 };
+use tokio_util::sync::CancellationToken;
 use tracing::{error, info};
 use uuid::Uuid;
 
@@ -55,7 +56,7 @@ struct WorkerPool {
     receiver: async_channel::Receiver<ClaimedTask>,
     available: Arc<Notify>,
     handler_timeout: Duration,
-    stop: watch::Sender<bool>,
+    stop: CancellationToken,
 }
 impl WorkerPool {
     fn spawn(&mut self, index: usize, handler: TaskHandlerRegistry) {
@@ -66,13 +67,13 @@ impl WorkerPool {
             self.receiver.clone(),
             self.available.clone(),
             self.handler_timeout,
-            self.stop.subscribe(),
+            self.stop.clone(),
         ));
         self.indices.insert(handle.id(), index);
     }
 
     async fn drain(&mut self) {
-        self.stop.send_replace(true);
+        self.stop.cancel();
         // Closing a channel still permits receiving buffered tasks. Stop must win
         // the worker's biased select before closure wakes pending receives.
         self.receiver.close();
@@ -86,17 +87,25 @@ impl WorkerPool {
 }
 
 /// One producer claims under free bounded-channel capacity; at most C deliveries run and Q wait.
-/// Each worker owns its registry for its entire Tokio task lifetime. True host shutdown
-/// or closure of its watch sender stops admission/dequeue and drains only started invocations.
-/// Startup/restart validates formats; restart failures use the same bounded drain.
+/// Each worker owns its registry for its entire Tokio task lifetime. Token cancellation
+/// stops admission/dequeue and drains only started invocations for a common H+S budget.
+/// Startup/restart errors cancel the supplied token before returning/draining. Pass a
+/// child token to isolate a pool; clones share cancellation with the host. Dropping a
+/// token handle does not request shutdown: lifecycle owners should use a drop guard.
+/// Dropping/aborting this supervisor cancels the token and aborts its owned workers;
+/// asynchronous graceful draining requires cancelling the token and awaiting `run`.
 /// Original lease deadlines and database fencing remain authoritative.
 pub async fn run(
     coordinator: Arc<dyn OutboxTaskCoordinator>,
     factory: HandlerRegistryFactory,
     config: OutboxWorkerPoolConfig,
-    mut shutdown: watch::Receiver<bool>,
+    shutdown: CancellationToken,
 ) -> Result<(), WorkerPoolError> {
+    let _cancel_on_exit = shutdown.clone().drop_guard();
     config.validate_for_storage_timeout(coordinator.storage_timeout())?;
+    if shutdown.is_cancelled() {
+        return Ok(());
+    }
     let formats = coordinator.formats();
     let handlers = (0..config.concurrency())
         .map(|index| checked_handler(&factory, &formats, index))
@@ -104,7 +113,6 @@ pub async fn run(
     let owner = Uuid::new_v4().to_string();
     let (sender, receiver) = async_channel::bounded(config.queue_capacity());
     let available = Arc::new(Notify::new());
-    let (stop, _) = watch::channel(false);
     let mut pool = WorkerPool {
         workers: JoinSet::new(),
         indices: HashMap::new(),
@@ -112,7 +120,7 @@ pub async fn run(
         receiver,
         available: available.clone(),
         handler_timeout: config.handler_timeout(),
-        stop,
+        stop: shutdown.clone(),
     };
     for (index, handler) in handlers.into_iter().enumerate() {
         pool.spawn(index, handler);
@@ -126,7 +134,7 @@ pub async fn run(
         loop {
             tokio::select! {
                 biased;
-                _ = stop_requested(&mut shutdown) => break,
+                _ = shutdown.cancelled() => break,
                 Some(exit) = pool.workers.join_next_with_id() => {
                     let (id, panicked, cancelled) = match &exit {
                         Ok((id, _)) => (*id, false, false),
@@ -135,12 +143,16 @@ pub async fn run(
                     let index = pool.indices.remove(&id).expect("every worker has a registered index");
                     error!(worker = index, tokio_task_id = %id, panicked, cancelled,
                         owner = %owner, "outbox worker stopped; restarting");
-                    pool.spawn(index, checked_handler(&factory, &formats, index)?);
+                    let handler = checked_handler(&factory, &formats, index)?;
+                    if shutdown.is_cancelled() {
+                        break;
+                    }
+                    pool.spawn(index, handler);
                 }
                 _ = interval.tick() => {
                     let recovery = tokio::select! {
                         biased;
-                        _ = stop_requested(&mut shutdown) => break,
+                        _ = shutdown.cancelled() => break,
                         result = coordinator.recover_expired(config.concurrency().min(RECOVERY_BATCH_LIMIT)) => result,
                     };
                     match recovery {
@@ -158,11 +170,14 @@ pub async fn run(
             // reduce occupancy, so the returned batch fits without reservations.
             let claimed = tokio::select! {
                 biased;
-                _ = stop_requested(&mut shutdown) => break,
+                _ = shutdown.cancelled() => break,
                 result = coordinator.claim(&owner, limit, config.lease_duration()) => result,
             };
             match claimed {
                 Ok(tasks) => {
+                    if shutdown.is_cancelled() {
+                        break;
+                    }
                     assert!(tasks.len() <= limit, "queue must honor the claim limit");
                     for task in tasks {
                         // TrySendError contains ClaimedTask; never format it into
@@ -179,6 +194,8 @@ pub async fn run(
         Ok(())
     }
     .await;
+    // Notify the host before waiting for healthy workers, retaining the original error.
+    shutdown.cancel();
     pool.drain().await;
     drop(sender);
     result
@@ -196,7 +213,6 @@ mod tests {
         },
         time::Duration,
     };
-    use tokio::sync::watch;
 
     #[tokio::test]
     async fn invalid_full_lease_budget_is_rejected_before_polling() {
@@ -208,7 +224,7 @@ mod tests {
         )
         .unwrap();
         let factory: HandlerRegistryFactory = Arc::new(|| TaskHandlerRegistry::try_new(vec![Box::new(handler())]));
-        let (_stop, shutdown) = watch::channel(false);
+        let shutdown = CancellationToken::new();
         assert!(
             super::run(
                 service,
@@ -261,7 +277,8 @@ mod tests {
             OutboxWorkerPoolConfig::default().lease_duration(),
         )
         .unwrap();
-        let (stop, shutdown) = watch::channel(false);
+        let shutdown = CancellationToken::new();
+        let stop = shutdown.clone();
         let worker = tokio::spawn(super::run(service, factory, config, shutdown));
         wait_until(|| queue.recovery_calls.load(Ordering::SeqCst) >= 2).await;
         queue.claim_error.store(false, Ordering::SeqCst);
@@ -276,7 +293,7 @@ mod tests {
         queue.lost_owner.store(true, Ordering::SeqCst);
         queue.incoming.lock().unwrap().push_back(claimed());
         wait_until(|| queue.outcomes.lock().unwrap().len() >= 3).await;
-        stop.send(true).unwrap();
+        stop.cancel();
         worker.await.unwrap().unwrap();
         assert_eq!(calls.load(Ordering::SeqCst), 4);
     }
@@ -290,11 +307,12 @@ mod tests {
             let seen = seen.clone();
             move || TaskHandlerRegistry::try_new(vec![Box::new(CountingHandler(seen.clone()))])
         });
-        let (stop, shutdown) = watch::channel(false);
+        let shutdown = CancellationToken::new();
+        let stop = shutdown.clone();
         let invalid =
             OutboxWorkerPoolConfig::new(1, 1, Duration::from_secs(1), Duration::from_secs(30), Duration::from_secs(45)).unwrap();
         assert!(
-            super::run(service.clone(), factory.clone(), invalid, shutdown.clone())
+            super::run(service.clone(), factory.clone(), invalid, shutdown.child_token())
                 .await
                 .is_err()
         );
@@ -303,7 +321,7 @@ mod tests {
                 outbox_task_coordinator(queue.clone(), vec![]),
                 factory.clone(),
                 OutboxWorkerPoolConfig::default(),
-                shutdown.clone()
+                shutdown.child_token()
             )
             .await
             .is_err()
@@ -311,7 +329,7 @@ mod tests {
         queue.incoming.lock().unwrap().push_back(claimed());
         let worker = tokio::spawn(super::run(service, factory, OutboxWorkerPoolConfig::default(), shutdown));
         wait_until(|| seen.load(Ordering::SeqCst) > 0).await;
-        stop.send(true).unwrap();
+        stop.cancel();
         worker.await.unwrap().unwrap();
         assert_eq!(queue.outcomes.lock().unwrap().len(), 1);
     }
@@ -345,7 +363,8 @@ mod tests {
                 let calls = calls.clone();
                 move || TaskHandlerRegistry::try_new(vec![Box::new(CountingHandler(calls.clone()))])
             });
-            let (stop, shutdown) = watch::channel(false);
+            let shutdown = CancellationToken::new();
+            let stop = shutdown.clone();
             let worker = tokio::spawn(super::run(
                 service,
                 factory,
@@ -374,7 +393,7 @@ mod tests {
             // Both tasks are executed even when the first acknowledgement never returns.
             wait_until(|| calls.load(Ordering::SeqCst) == 2 && queue.outcomes.lock().unwrap().len() == 2).await;
             assert!(!worker.is_finished());
-            stop.send(true).unwrap();
+            stop.cancel();
             worker.await.unwrap().unwrap();
         }
     }
@@ -389,7 +408,8 @@ mod tests {
             queue.incoming.lock().unwrap().push_back(claimed());
             let service = outbox_task_coordinator(queue.clone(), vec![format()]);
             let factory: HandlerRegistryFactory = Arc::new(|| TaskHandlerRegistry::try_new(vec![Box::new(handler())]));
-            let (stop, shutdown) = watch::channel(false);
+            let shutdown = CancellationToken::new();
+            let stop = shutdown.clone();
             let worker = tokio::spawn(super::run(service, factory, OutboxWorkerPoolConfig::default(), shutdown));
             wait_until(|| match stage {
                 "claim" => !queue.requested.lock().unwrap().is_empty(),
@@ -399,7 +419,7 @@ mod tests {
             })
             .await;
             let start = tokio::time::Instant::now();
-            stop.send(true).unwrap();
+            stop.cancel();
             tokio::time::timeout(Duration::from_secs(36), worker)
                 .await
                 .unwrap()
@@ -425,11 +445,12 @@ mod tests {
             handler.hang = true;
             TaskHandlerRegistry::try_new(vec![Box::new(handler)])
         });
-        let (stop, shutdown) = watch::channel(false);
+        let shutdown = CancellationToken::new();
+        let stop = shutdown.clone();
         let started = tokio::time::Instant::now();
         let worker = tokio::spawn(super::run(service, factory, OutboxWorkerPoolConfig::default(), shutdown));
         wait_until(|| queue.incoming.lock().unwrap().is_empty()).await;
-        stop.send(true).unwrap();
+        stop.cancel();
         worker.await.unwrap().unwrap();
         assert!(started.elapsed() >= Duration::from_secs(40));
         assert!(matches!(queue.outcomes.lock().unwrap()[0].1, SettlementRequest::Retry { .. }));
@@ -462,7 +483,7 @@ mod tests {
             }
         });
         let service = outbox_task_coordinator(Arc::new(Queue::default()), vec![format()]);
-        let (_, shutdown) = watch::channel(false);
+        let shutdown = CancellationToken::new();
         let result = super::run(
             service,
             factory,
@@ -505,7 +526,7 @@ mod tests {
                 }
             });
             let coordinator = outbox_task_coordinator(queue.clone(), vec![format()]);
-            let (_stop, shutdown) = watch::channel(false);
+            let shutdown = CancellationToken::new();
             let config = OutboxWorkerPoolConfig::new(
                 1,
                 1,
@@ -599,7 +620,8 @@ mod tests {
             queue.incoming.lock().unwrap().extend((0..20).map(|_| claimed()));
             let probe = Arc::new(IoProbe::default());
             let coordinator = outbox_task_coordinator(queue.clone(), vec![format()]);
-            let (stop, shutdown) = watch::channel(false);
+            let shutdown = CancellationToken::new();
+            let stop = shutdown.clone();
             let pool = tokio::spawn(super::run(
                 coordinator,
                 io_factory(probe.clone()),
@@ -617,10 +639,7 @@ mod tests {
                 calls,
                 "full queue cannot claim more work"
             );
-            stop.send(false).unwrap();
-            tokio::time::sleep(Duration::from_millis(2)).await;
-            assert!(!pool.is_finished());
-            stop.send(true).unwrap();
+            stop.cancel();
             tokio::time::sleep(Duration::from_millis(2)).await;
             assert!(!pool.is_finished(), "started operations must drain");
             probe.gate.add_permits(c);
@@ -677,7 +696,8 @@ mod tests {
             gate: tokio::sync::Semaphore::new(0),
         });
         let probe = Arc::new(IoProbe::default());
-        let (stop, shutdown) = watch::channel(false);
+        let shutdown = CancellationToken::new();
+        let stop = shutdown.clone();
         let pool = tokio::spawn(super::run(
             coordinator.clone(),
             io_factory(probe.clone()),
@@ -704,7 +724,7 @@ mod tests {
         assert_eq!(*queue.claim_limits.lock().unwrap(), vec![2, 1, 1, 1]);
         assert_eq!(probe.peak.load(Ordering::SeqCst), 1);
         assert_eq!(probe.calls.lock().unwrap().len(), 3);
-        stop.send(true).unwrap();
+        stop.cancel();
         // Observe internal stop before releasing the active invocation.
         tokio::task::yield_now().await;
         probe.gate.add_permits(1);
@@ -741,7 +761,8 @@ mod tests {
             let executed = executed.clone();
             move || TaskHandlerRegistry::try_new(vec![Box::new(RecordingHandler(executed.clone()))])
         });
-        let (stop, shutdown) = watch::channel(false);
+        let shutdown = CancellationToken::new();
+        let stop = shutdown.clone();
         let pool = tokio::spawn(super::run(
             outbox_task_coordinator(queue.clone(), vec![format()]),
             factory,
@@ -750,7 +771,7 @@ mod tests {
             shutdown,
         ));
         wait_until(|| queue.outcomes.lock().unwrap().len() >= expected.len()).await;
-        stop.send(true).unwrap();
+        stop.cancel();
         tokio::time::timeout(Duration::from_secs(5), pool)
             .await
             .unwrap()
@@ -777,7 +798,8 @@ mod tests {
         let queue = Arc::new(Queue::default());
         queue.incoming.lock().unwrap().extend((0..2100).map(|_| claimed()));
         let probe = Arc::new(IoProbe::default());
-        let (stop, shutdown) = watch::channel(false);
+        let shutdown = CancellationToken::new();
+        let stop = shutdown.clone();
         let pool = tokio::spawn(super::run(
             outbox_task_coordinator(queue.clone(), vec![format()]),
             io_factory(probe.clone()),
@@ -789,7 +811,7 @@ mod tests {
         let task_ids: std::collections::HashSet<_> = probe.calls.lock().unwrap().iter().map(|call| call.1).collect();
         assert_eq!(task_ids.len(), 1000);
         assert!(queue.recovery_limits.lock().unwrap().iter().all(|&limit| limit == 32));
-        stop.send(true).unwrap();
+        stop.cancel();
         tokio::time::sleep(Duration::from_millis(2)).await;
         probe.gate.add_permits(1000);
         pool.await.unwrap().unwrap();
@@ -801,7 +823,8 @@ mod tests {
         let queue = Arc::new(Queue::default());
         queue.incoming.lock().unwrap().extend([claimed(), claimed()]);
         let probe = Arc::new(IoProbe::default());
-        let (stop, shutdown) = watch::channel(false);
+        let shutdown = CancellationToken::new();
+        let stop = shutdown.clone();
         let pool = tokio::spawn(super::run(
             outbox_task_coordinator(queue.clone(), vec![format()]),
             io_factory(probe.clone()),
@@ -816,7 +839,7 @@ mod tests {
         assert_eq!(calls[0].1, calls[1].1);
         assert_eq!((calls[0].2, calls[1].2), (1, 2));
         assert_eq!(probe.built.load(Ordering::SeqCst), 1);
-        stop.send(true).unwrap();
+        stop.cancel();
         tokio::time::sleep(Duration::from_millis(2)).await;
         probe.gate.add_permits(1);
         pool.await.unwrap().unwrap();
@@ -853,7 +876,8 @@ mod tests {
                 })])
             }
         });
-        let (stop, shutdown) = watch::channel(false);
+        let shutdown = CancellationToken::new();
+        let stop = shutdown.clone();
         let pool = tokio::spawn(super::run(
             outbox_task_coordinator(queue.clone(), vec![format()]),
             factory,
@@ -866,12 +890,29 @@ mod tests {
         assert_eq!((records[0].0, records[1].0), (0, 1));
         assert_ne!(records[0].1, records[1].1);
         assert_eq!(queue.recovery_calls.load(Ordering::SeqCst), 1);
-        stop.send(true).unwrap();
+        assert!(!stop.is_cancelled(), "a worker panic must not cancel the host");
+        stop.cancel();
         pool.await.unwrap().unwrap();
     }
 
     #[tokio::test]
     async fn restart_factory_error_drains_healthy_operations_instead_of_aborting_them() {
+        for mismatch in [false, true] {
+            assert_restart_failure_drains(mismatch).await;
+        }
+    }
+
+    async fn assert_restart_failure_drains(mismatch: bool) {
+        struct OtherHandler;
+        #[async_trait]
+        impl TaskHandler for OtherHandler {
+            fn formats(&self) -> Vec<TaskFormat> {
+                vec![TaskFormat::new("other", 1).unwrap()]
+            }
+            async fn handle(&mut self, _: &TaskDelivery) -> Result<(), TaskHandlerError> {
+                panic!("mismatched registry must never execute");
+            }
+        }
         struct PanicOnDemand(Arc<tokio::sync::Semaphore>);
         #[async_trait]
         impl TaskHandler for PanicOnDemand {
@@ -899,48 +940,57 @@ mod tests {
                     registry: 1,
                     calls: 0,
                 })]),
+                _ if mismatch => TaskHandlerRegistry::try_new(vec![Box::new(OtherHandler)]),
                 _ => Err(TaskHandlerRegistryError::Empty),
             }
         });
-        let (_stop, shutdown) = watch::channel(false);
+        let parent = CancellationToken::new();
+        let shutdown = parent.child_token();
         let pool = tokio::spawn(super::run(
             outbox_task_coordinator(queue.clone(), vec![format()]),
             factory,
             worker_config(2, 2, Duration::from_secs(3600)),
-            shutdown,
+            shutdown.clone(),
         ));
         wait_until(|| probe.active.load(Ordering::SeqCst) == 1 && queue.incoming.lock().unwrap().len() == 1).await;
         crash.add_permits(1);
         wait_until(|| built.load(Ordering::SeqCst) == 3).await;
-        assert!(!pool.is_finished());
+        tokio::time::timeout(Duration::from_secs(1), shutdown.cancelled())
+            .await
+            .unwrap();
+        assert!(!parent.is_cancelled(), "the caller can isolate a pool with a child token");
+        assert!(!pool.is_finished(), "host notification must precede healthy worker drain");
+        assert_eq!(probe.active.load(Ordering::SeqCst), 1);
+        assert!(queue.outcomes.lock().unwrap().is_empty());
         probe.gate.add_permits(1);
-        assert_eq!(
-            pool.await.unwrap(),
-            Err(WorkerPoolError::RegistryBuild {
+        let expected = if mismatch {
+            WorkerPoolError::HandlerFormatsMismatch { worker_index: 0 }
+        } else {
+            WorkerPoolError::RegistryBuild {
                 worker_index: 0,
-                source: TaskHandlerRegistryError::Empty
-            })
-        );
+                source: TaskHandlerRegistryError::Empty,
+            }
+        };
+        assert_eq!(pool.await.unwrap(), Err(expected));
         assert_eq!(queue.outcomes.lock().unwrap().len(), 1);
         assert_eq!(probe.calls.lock().unwrap().len(), 1);
     }
 
     #[tokio::test]
-    async fn initially_requested_and_closed_shutdown_do_not_claim() {
-        for requested in [false, true] {
-            let queue = Arc::new(Queue::default());
-            let (stop, shutdown) = watch::channel(requested);
-            drop(stop);
-            super::run(
-                outbox_task_coordinator(queue.clone(), vec![format()]),
-                Arc::new(|| TaskHandlerRegistry::try_new(vec![Box::new(handler())])),
-                worker_config(2, 1, Duration::from_secs(1)),
-                shutdown,
-            )
-            .await
-            .unwrap();
-            assert!(queue.requested.lock().unwrap().is_empty());
-        }
+    async fn initially_cancelled_shutdown_does_not_build_workers_or_claim() {
+        let queue = Arc::new(Queue::default());
+        let shutdown = CancellationToken::new();
+        shutdown.cancel();
+        super::run(
+            outbox_task_coordinator(queue.clone(), vec![format()]),
+            Arc::new(|| panic!("cancelled startup must not build a registry")),
+            worker_config(2, 1, Duration::from_secs(1)),
+            shutdown,
+        )
+        .await
+        .unwrap();
+        assert!(queue.requested.lock().unwrap().is_empty());
+        assert_eq!(queue.recovery_calls.load(Ordering::SeqCst), 0);
     }
 
     #[tokio::test(start_paused = true)]
@@ -975,7 +1025,7 @@ mod tests {
         }
         let probe = Arc::new(IoProbe::default());
         let (sender, receiver) = async_channel::bounded(1);
-        let (stop, _) = watch::channel(false);
+        let stop = CancellationToken::new();
         let mut pool = WorkerPool {
             workers: JoinSet::new(),
             indices: HashMap::new(),
@@ -1004,17 +1054,110 @@ mod tests {
         let queue = Arc::new(Queue::default());
         queue.incoming.lock().unwrap().extend([claimed(), claimed()]);
         let probe = Arc::new(IoProbe::default());
-        let (_stop, shutdown) = watch::channel(false);
+        let shutdown = CancellationToken::new();
         let pool = tokio::spawn(super::run(
             outbox_task_coordinator(queue.clone(), vec![format()]),
             io_factory(probe.clone()),
             worker_config(1, 1, Duration::from_secs(3600)),
-            shutdown,
+            shutdown.clone(),
         ));
         wait_until(|| probe.active.load(Ordering::SeqCst) == 1 && queue.incoming.lock().unwrap().is_empty()).await;
         pool.abort();
         assert!(pool.await.unwrap_err().is_cancelled());
+        assert!(shutdown.is_cancelled(), "supervisor abort must notify the host");
         wait_until(|| probe.active.load(Ordering::SeqCst) == 0).await;
         assert!(queue.outcomes.lock().unwrap().is_empty());
+    }
+    #[tokio::test]
+    async fn shared_cancellation_stops_dequeue_while_supervisor_is_claiming() {
+        let queue = Arc::new(Queue::default());
+        queue.incoming.lock().unwrap().extend((0..5).map(|_| claimed()));
+        let probe = Arc::new(IoProbe::default());
+        let shutdown = CancellationToken::new();
+        let pool = tokio::spawn(super::run(
+            outbox_task_coordinator(queue.clone(), vec![format()]),
+            io_factory(probe.clone()),
+            worker_config(1, 2, Duration::from_secs(3600)),
+            shutdown.clone(),
+        ));
+        wait_until(|| probe.active.load(Ordering::SeqCst) == 1 && queue.incoming.lock().unwrap().len() == 2).await;
+        queue.hang_claim.store(true, Ordering::SeqCst);
+        probe.gate.add_permits(1);
+        wait_until(|| probe.calls.lock().unwrap().len() == 2 && queue.requested.lock().unwrap().len() == 3).await;
+        shutdown.cancel();
+        // Finish the active operation immediately, even before supervisor resumes.
+        probe.gate.add_permits(1);
+        pool.await.unwrap().unwrap();
+        assert_eq!(probe.calls.lock().unwrap().len(), 2);
+        assert_eq!(queue.outcomes.lock().unwrap().len(), 2);
+        assert_eq!(queue.incoming.lock().unwrap().len(), 2);
+    }
+
+    #[tokio::test]
+    async fn cancellation_in_a_ready_claim_discards_the_batch_without_execution() {
+        struct CancelAfterClaim {
+            inner: Arc<Queue>,
+            shutdown: CancellationToken,
+        }
+        #[async_trait]
+        impl OutboxQueue for CancelAfterClaim {
+            async fn claim(
+                &self,
+                format: &TaskFormat,
+                owner: &str,
+                limit: usize,
+                lease: Duration,
+            ) -> Result<Vec<ClaimedTask>, OutboxError> {
+                let tasks = self.inner.claim(format, owner, limit, lease).await?;
+                self.shutdown.cancel();
+                Ok(tasks)
+            }
+            async fn settle(&self, task: &ClaimedTask, request: SettlementRequest) -> Result<SettlementResult, OutboxError> {
+                self.inner.settle(task, request).await
+            }
+            async fn recover_expired(&self, limit: usize) -> Result<LeaseRecoveryReport, OutboxError> {
+                self.inner.recover_expired(limit).await
+            }
+        }
+        let queue = Arc::new(Queue::default());
+        queue.incoming.lock().unwrap().push_back(claimed());
+        let calls = Arc::new(AtomicUsize::new(0));
+        let shutdown = CancellationToken::new();
+        let factory: HandlerRegistryFactory = Arc::new({
+            let calls = calls.clone();
+            move || TaskHandlerRegistry::try_new(vec![Box::new(CountingHandler(calls.clone()))])
+        });
+        super::run(
+            outbox_task_coordinator(
+                Arc::new(CancelAfterClaim {
+                    inner: queue.clone(),
+                    shutdown: shutdown.clone(),
+                }),
+                vec![format()],
+            ),
+            factory,
+            worker_config(1, 1, Duration::from_secs(3600)),
+            shutdown,
+        )
+        .await
+        .unwrap();
+        assert!(queue.incoming.lock().unwrap().is_empty(), "claim did complete");
+        assert_eq!(calls.load(Ordering::SeqCst), 0);
+        assert!(queue.outcomes.lock().unwrap().is_empty());
+    }
+
+    #[tokio::test]
+    async fn startup_factory_panic_cancels_the_host_without_polling_storage() {
+        let queue = Arc::new(Queue::default());
+        let shutdown = CancellationToken::new();
+        let supervisor = tokio::spawn(super::run(
+            outbox_task_coordinator(queue.clone(), vec![format()]),
+            Arc::new(|| panic!("injected startup factory panic")),
+            worker_config(1, 1, Duration::from_secs(1)),
+            shutdown.clone(),
+        ));
+        assert!(supervisor.await.unwrap_err().is_panic());
+        assert!(shutdown.is_cancelled());
+        assert!(queue.requested.lock().unwrap().is_empty());
     }
 }

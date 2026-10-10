@@ -14,9 +14,13 @@
 //! ownership through queue waiting; lease renewal is not enabled.
 //! One poller owns the sender; each worker has a cloned receiver. Claim limit is
 //! Q minus current queue length; consumers can only free space during claim.
-//! Shutdown sets internal stop before closing the channel.
+//! The host shares a CancellationToken with the supervisor and its workers.
+//! Fatal supervisor errors cancel that token before drain, notifying other host
+//! adapters immediately. Shutdown cancels the token before closing the channel.
 //! Shutdown and restart-factory errors drain only started handler/settlement
 //! operations, then abort and join workers at the common H+S deadline.
+//! Dropping/aborting a polled supervisor cancels its token through DropGuard and
+//! aborts owned workers; graceful drain requires cancellation followed by await.
 
 mod config;
 mod supervisor;

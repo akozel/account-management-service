@@ -2,17 +2,9 @@
 use crate::outbox::{ClaimedTask, OutboxTaskCoordinator, SettlementResult, TaskFailure, TaskHandlerRegistry};
 use async_channel::Receiver;
 use std::{sync::Arc, time::Duration};
-use tokio::sync::{Notify, watch};
+use tokio::sync::Notify;
+use tokio_util::sync::CancellationToken;
 use tracing::error;
-
-/// True or sender closure requests shutdown; false updates do not.
-pub(super) async fn stop_requested(stop: &mut watch::Receiver<bool>) {
-    while !*stop.borrow_and_update() {
-        if stop.changed().await.is_err() {
-            break;
-        }
-    }
-}
 
 pub(super) async fn run_worker(
     index: usize,
@@ -21,19 +13,19 @@ pub(super) async fn run_worker(
     receiver: Receiver<ClaimedTask>,
     available: Arc<Notify>,
     handler_timeout: Duration,
-    mut stop: watch::Receiver<bool>,
+    stop: CancellationToken,
 ) -> usize {
     loop {
         let task = tokio::select! {
             biased;
-            _ = stop_requested(&mut stop) => break,
+            _ = stop.cancelled() => break,
             task = receiver.recv() => task,
         };
         let Ok(task) = task else {
             break;
         };
         available.notify_one();
-        if *stop.borrow() {
+        if stop.is_cancelled() {
             break;
         }
         let id = task.delivery().id();
@@ -183,7 +175,8 @@ mod tests {
 
         let queue = Arc::new(Queue::default());
         let (sender, receiver) = async_channel::bounded(1);
-        let (stop, shutdown) = watch::channel(false);
+        let shutdown = CancellationToken::new();
+        let stop = shutdown.clone();
         let mut worker = Box::pin(run_worker(
             0,
             TaskHandlerRegistry::try_new(vec![Box::new(handler())]).unwrap(),
@@ -197,7 +190,7 @@ mod tests {
         let mut context = Context::from_waker(Waker::noop());
         assert!(matches!(worker.as_mut().poll(&mut context), Poll::Pending));
         assert!(!sender.is_closed());
-        stop.send(true).unwrap();
+        stop.cancel();
         assert_eq!(tokio::time::timeout(Duration::from_secs(1), worker).await.unwrap(), 0);
         assert!(!sender.is_closed(), "shutdown must not depend on channel closure");
         assert!(receiver.is_empty());
