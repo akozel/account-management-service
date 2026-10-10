@@ -140,7 +140,14 @@ provides fixed safe log reasons, independent of persisted handler error text.
 `worker::run` reports `WorkerPoolError`, distinguishing configuration, registry
 construction, and format mismatch on startup or restart. It still supervises
 one mutable registry per permanent Tokio task and leaves interrupted work for recovery.
-Defaults are 128 concurrent deliveries, 128 queued deliveries, and a 120-second
+Defaults are 128 concurrent deliveries, 128 queued deliveries, and a 60-second
 lease. `OUTBOX_QUEUE_CAPACITY` and `OUTBOX_WORKER_CONCURRENCY` are independent.
 The explicit worker config constructor now takes `queue_capacity` after
 `concurrency`; the combined lease validation includes queued waves.
+
+The service host uses handler/storage/statement budgets of 15s/6s/4s. With
+C=Q=128, lease=60s exceeds the validated 53s minimum. HTTP/DB shutdown limits
+remain [known issue #10](../doc/known_issues/http_shutdown.md).
+
+For the host's current lifecycle and the planned 28s envelope, see the
+[graceful shutdown timeline](../README.md#graceful-shutdown-timeline).

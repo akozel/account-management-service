@@ -107,11 +107,9 @@ handler budget >= sum(attempt durations) + sum(local backoff) + overhead
 ```
 
 A retry count excludes the initial attempt: three retries can mean four sends.
-With a thirty-second handler cap, four ten-second attempts do not fit even
-before backoff. For example, a ten-second initial attempt, three retries capped
-at four seconds, and three two-second backoffs use twenty-eight seconds,
-leaving two seconds for overhead. This is an example policy, not built-in
-sender retry behavior.
+With the default fifteen-second cap, three attempts capped at four seconds and
+two one-second backoffs use fourteen seconds, leaving one second for overhead.
+This is an illustrative policy, not built-in sender retry behavior.
 
 `pending.available_at` is the earliest claim time, for initial scheduling or
 retry backoff. Claim increments `attempts` and grants ownership.
@@ -147,9 +145,9 @@ includes both rescheduled work and confirmed terminal failures; use
 | `OUTBOX_WORKER_CONCURRENCY` | `128` | Permanent Tokio workers / concurrent deliveries per process, including settlement. |
 | `OUTBOX_QUEUE_CAPACITY` | `128` | Claimed deliveries waiting locally; independent of worker count. |
 | `OUTBOX_POLL_INTERVAL_MS` | `1000` | Worker polling interval. |
-| `OUTBOX_HANDLER_TIMEOUT_SECS` | `30` | Total time for one handler invocation, including local retry/backoff. |
-| `OUTBOX_LEASE_SECS` | `120` | Queue ownership duration per claim. |
-| `OUTBOX_STORAGE_TIMEOUT_MS` | `5000` | Coordinator deadline for the whole multi-format claim batch, or one recovery/settlement call. |
+| `OUTBOX_HANDLER_TIMEOUT_SECS` | `15` | Total time for one handler invocation, including local retry/backoff. |
+| `OUTBOX_LEASE_SECS` | `60` | Queue ownership duration per claim. |
+| `OUTBOX_STORAGE_TIMEOUT_MS` | `6000` | Coordinator deadline for the whole multi-format claim batch, or one recovery/settlement call. |
 | `OUTBOX_POSTGRES_STATEMENT_TIMEOUT_MS` | `4000` | PostgreSQL deadline for each statement in queue transactions, including lock waiting. |
 
 Use the configuration types' `from_env` methods to load these settings.
@@ -180,11 +178,11 @@ effective storage timeout:
 C = concurrency; Q = queue_capacity; S = storage_timeout; H = handler_timeout
 waves = ceil(Q / C)
 lease > 2*S + H + LEASE_SAFETY_MARGIN + waves*(H+S)
-defaults: C=128, Q=128, lease=120s > 10s + 30s + 5s + 35s = 80s
-example: C=2, Q=3, lease=120s > 10s + 30s + 5s + 2*35s = 115s
+defaults: C=128, Q=128, lease=60s > 12s + 15s + 5s + 21s = 53s
+example: C=2, Q=3 requires lease > 12s + 15s + 5s + 2*21s = 74s
 ```
 
-`LEASE_SAFETY_MARGIN` is a fixed five-second reserve; defaults leave forty
+`LEASE_SAFETY_MARGIN` is a fixed five-second reserve; defaults leave seven
 seconds extra. The queued-wave allowance is conservative for a healthy pool;
 it does not guarantee timely execution after panic, scheduler pauses, or storage
 failures. Original per-delivery deadline checks still apply. Larger queues require
@@ -240,7 +238,7 @@ promptly; cancellation cannot preempt a blocking factory call.
 
 The token is cancelled before explicitly closing the channel, because closure
 alone still permits receiving buffered deliveries. Only already-started
-handler/settlement work drains, for one common H+S deadline (35 seconds with
+handler/settlement work drains, for one common H+S deadline (21 seconds with
 default budgets). Cancellation is not raced against `execute_and_settle`: current
 work retains its original handler, storage, and lease deadlines. Waiting claims
 remain durable for expiry recovery. At the drain deadline, remaining workers are
@@ -266,10 +264,12 @@ The ordinary panic hook is independent of these structured diagnostics.
 HTTP and outbox drain concurrently. An in-flight HTTP request or handler may commit
 new durable tasks after outbox admission stops; they are processed by a subsequent
 healthy pool. Shutdown does not promise completion of the whole business workflow.
-The database pool closes after both components finish. HTTP shutdown and pool
-cleanup currently have no process-wide deadline. The development console sender
-performs synchronous stdout writes, which cannot be preempted by async timers or
-abort; these two limitations are separate backlog tasks.
+The database pool closes after both components finish. Standard Axum graceful
+shutdown stops accepting new TCP connections and waits for current requests.
+HTTP shutdown and pool cleanup have no process-wide deadline
+([known issue #10](../../doc/known_issues/http_shutdown.md)). The development
+console sender performs synchronous stdout writes, which cannot be preempted by
+async timers or abort; this remains backlog task #11.
 
 The queue anchors `ClaimedTask::lease().deadline()` to a monotonic instant before
 requesting ownership. It is a conservative, process-local budget that includes

@@ -30,5 +30,5 @@ uuid = { version = "1.26.1", features = ["serde", "v4"] }
 [dev-dependencies]
 sqlx = { version = "0.8.6", default-features = false, features = ["json", "chrono", "uuid", "postgres", "runtime-tokio-rustls"] }
 testcontainers = "0.28.0"
-tokio = { version = "1.53.1", features = ["sync", "time", "test-util"] }
+tokio = { version = "1.53.1", features = ["sync", "time", "test-util", "io-util"] }
 tower = { version = "0.5.3", features = ["util"] }

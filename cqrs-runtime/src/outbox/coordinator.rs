@@ -220,7 +220,12 @@ mod tests {
     #[tokio::test(start_paused = true)]
     async fn delayed_task_retries_without_starting_handler_and_expired_task_waits_for_recovery() {
         let queue = Arc::new(Queue::default());
-        let service = outbox_task_coordinator(queue.clone(), vec![format()]);
+        let service = outbox_task_coordinator_with_config(
+            queue.clone(),
+            vec![format()],
+            OutboxTaskCoordinatorConfig::new(Duration::from_secs(5)).unwrap(),
+        )
+        .unwrap();
         let calls = Arc::new(std::sync::atomic::AtomicUsize::new(0));
         let mut handler = ProbeHandler {
             calls: calls.clone(),

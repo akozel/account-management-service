@@ -6,7 +6,7 @@ use thiserror::Error;
 const MAX_QUEUE_CAPACITY: usize = usize::MAX >> 3;
 
 /// Independent process-wide execution and waiting limits, with validated local values.
-/// Defaults: C=128, Q=128, poll=1s, handler=30s, lease=120s.
+/// Defaults: C=128, Q=128, poll=1s, handler=15s, lease=60s.
 /// Validate the combined queued-wave lease against the actual coordinator.
 #[derive(Clone, Debug)]
 pub struct OutboxWorkerPoolConfig {
@@ -43,8 +43,8 @@ impl Default for OutboxWorkerPoolConfig {
             concurrency: 128,
             queue_capacity: 128,
             poll_interval: Duration::from_secs(1),
-            handler_timeout: Duration::from_secs(30),
-            lease_duration: Duration::from_secs(120),
+            handler_timeout: Duration::from_secs(15),
+            lease_duration: Duration::from_secs(60),
         }
     }
 }
@@ -115,8 +115,8 @@ impl OutboxWorkerPoolConfig {
             usize::try_from(read_u64("OUTBOX_QUEUE_CAPACITY", 128)?)
                 .map_err(|_| OutboxWorkerPoolConfigError::InvalidQueueCapacity)?,
             Duration::from_millis(read_u64("OUTBOX_POLL_INTERVAL_MS", 1000)?),
-            Duration::from_secs(read_u64("OUTBOX_HANDLER_TIMEOUT_SECS", 30)?),
-            Duration::from_secs(read_u64("OUTBOX_LEASE_SECS", 120)?),
+            Duration::from_secs(read_u64("OUTBOX_HANDLER_TIMEOUT_SECS", 15)?),
+            Duration::from_secs(read_u64("OUTBOX_LEASE_SECS", 60)?),
         )
     }
     /// Conservative healthy-pool budget: lease > 2*S + H + margin + ceil(Q/C)*(H+S).
@@ -159,8 +159,9 @@ mod tests {
         let default = OutboxWorkerPoolConfig::from_lookup(|_| None).unwrap();
         assert_eq!(default.concurrency(), 128);
         assert_eq!(default.queue_capacity(), 128);
-        assert_eq!(default.lease_duration(), Duration::from_secs(120));
-        default.validate_for_storage_timeout(Duration::from_secs(5)).unwrap();
+        assert_eq!(default.lease_duration(), Duration::from_secs(60));
+        assert_eq!(default.handler_timeout(), Duration::from_secs(15));
+        default.validate_for_storage_timeout(Duration::from_secs(6)).unwrap();
         let custom = OutboxWorkerPoolConfig::from_lookup(|name| {
             Some(
                 match name {
@@ -267,5 +268,29 @@ mod tests {
             build(1, MAX_QUEUE_CAPACITY, 120).validate_for_storage_timeout(Duration::from_secs(5)),
             Err(OutboxWorkerPoolConfigError::LeaseBudgetOverflow)
         );
+    }
+    #[test]
+    fn default_lease_budget_has_the_expected_boundary_and_rejects_an_extra_queue_wave() {
+        let build = |queue, lease| {
+            OutboxWorkerPoolConfig::new(
+                128,
+                queue,
+                Duration::from_secs(1),
+                Duration::from_secs(15),
+                Duration::from_secs(lease),
+            )
+            .unwrap()
+        };
+        assert_eq!(
+            build(128, 53).validate_for_storage_timeout(Duration::from_secs(6)),
+            Err(OutboxWorkerPoolConfigError::LeaseTooShort)
+        );
+        build(128, 54).validate_for_storage_timeout(Duration::from_secs(6)).unwrap();
+        build(128, 60).validate_for_storage_timeout(Duration::from_secs(6)).unwrap();
+        assert_eq!(
+            build(256, 60).validate_for_storage_timeout(Duration::from_secs(6)),
+            Err(OutboxWorkerPoolConfigError::LeaseTooShort)
+        );
+        build(256, 75).validate_for_storage_timeout(Duration::from_secs(6)).unwrap();
     }
 }

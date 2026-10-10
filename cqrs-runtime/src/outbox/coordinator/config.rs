@@ -15,7 +15,7 @@ pub enum OutboxTaskCoordinatorConfigError {
 impl Default for OutboxTaskCoordinatorConfig {
     fn default() -> Self {
         Self {
-            storage_timeout: Duration::from_secs(5),
+            storage_timeout: Duration::from_secs(6),
         }
     }
 }
@@ -36,7 +36,7 @@ impl OutboxTaskCoordinatorConfig {
             .map(|value| value.parse::<u64>())
             .transpose()
             .map_err(|_| OutboxTaskCoordinatorConfigError::InvalidEnvironmentValue)?
-            .unwrap_or(5_000);
+            .unwrap_or(6_000);
         Self::new(Duration::from_millis(millis))
     }
     pub fn validate(&self) -> Result<(), OutboxTaskCoordinatorConfigError> {
@@ -56,7 +56,7 @@ mod tests {
     fn storage_timeout_config_has_defaults_overrides_and_rejects_invalid_budgets() {
         assert_eq!(
             OutboxTaskCoordinatorConfig::from_lookup(|_| None).unwrap().storage_timeout(),
-            Duration::from_secs(5)
+            Duration::from_secs(6)
         );
         assert_eq!(
             OutboxTaskCoordinatorConfig::from_lookup(|_| Some("750".into()))

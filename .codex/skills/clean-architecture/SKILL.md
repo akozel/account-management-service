@@ -293,7 +293,8 @@ Only the poller owns a sender. Before claim, snapshot Q - sender.len(); consumer
 only free space during that await, so the batch fits through try_send. No hidden
 buffer or per-send Tokio tasks. Multiple producers would require a new admission
 protocol. Never format TrySendError<ClaimedTask> into logs or panic messages.
-Defaults use a 120-second lease; validate queued waves with checked arithmetic:
+Defaults use H=15s/S=6s/SQL=4s and a 60-second lease (C=Q=128 requires lease >53s).
+Validate queued waves with checked arithmetic:
 lease > 2*S + H + 5s + ceil(Q/C)*(H+S). Original deadlines remain authoritative.
 Observe exits through JoinSet and rebuild one checked registry per replacement;
 never log panic payloads. Normal shutdown and restart-factory errors share bounded

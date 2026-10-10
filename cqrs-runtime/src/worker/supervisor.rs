@@ -420,12 +420,12 @@ mod tests {
             .await;
             let start = tokio::time::Instant::now();
             stop.cancel();
-            tokio::time::timeout(Duration::from_secs(36), worker)
+            tokio::time::timeout(Duration::from_secs(22), worker)
                 .await
                 .unwrap()
                 .unwrap()
                 .unwrap();
-            assert!(start.elapsed() <= Duration::from_secs(35));
+            assert!(start.elapsed() <= Duration::from_secs(21));
         }
     }
 
@@ -448,7 +448,12 @@ mod tests {
         let shutdown = CancellationToken::new();
         let stop = shutdown.clone();
         let started = tokio::time::Instant::now();
-        let worker = tokio::spawn(super::run(service, factory, OutboxWorkerPoolConfig::default(), shutdown));
+        let worker = tokio::spawn(super::run(
+            service,
+            factory,
+            worker_config(128, 128, Duration::from_secs(1)),
+            shutdown,
+        ));
         wait_until(|| queue.incoming.lock().unwrap().is_empty()).await;
         stop.cancel();
         worker.await.unwrap().unwrap();

@@ -7,7 +7,7 @@
 //! operation, not advancement of aggregate state or completion of a workflow.
 //!
 //! Defaults are 128 registry-owning worker tasks, 128 queued deliveries, and a
-//! 120-second lease. Concurrency is process-wide and independent of CPU threads.
+//! 60-second lease. Concurrency is process-wide and independent of CPU threads.
 //! Startup validates lease > 2*S + H + ceil(Q/C)*(H+S) + 5-second margin,
 //! where S is storage timeout, H is handler timeout, Q is queue capacity and C
 //! is concurrency. Per-delivery deadlines preserve the original remaining
@@ -18,7 +18,7 @@
 //! Fatal supervisor errors cancel that token before drain, notifying other host
 //! adapters immediately. Shutdown cancels the token before closing the channel.
 //! Shutdown and restart-factory errors drain only started handler/settlement
-//! operations, then abort and join workers at the common H+S deadline.
+//! operations, then abort and join workers at the common H+S deadline (21 seconds with default H=15s/S=6s).
 //! Dropping/aborting a polled supervisor cancels its token through DropGuard and
 //! aborts owned workers; graceful drain requires cancellation followed by await.
 

@@ -1,6 +1,6 @@
 # JoinSet, async-channel и независимые ограничения C/Q
 
-Статус: реализовано. Defaults: C=128, Q=128, lease=120 секунд.
+Статус: реализовано. Defaults: C=128, Q=128, lease=60 секунд.
 Runtime использует одну bounded async-channel 2.5.0 очередь и JoinSet постоянных
 Tokio workers. Старые реализации очереди и сравнительные бенчмарки удалены.
 
@@ -78,8 +78,8 @@ for (index, mut registry) in registries.into_iter().enumerate() {
 
 Startup проверяет с checked arithmetic:
 `lease > 2*S + H + 5s + ceil(Q/C)*(H+S)`.
-Для C=128/Q=128/H=30s/S=5s требуется lease >80s; для C=2/Q=3 — >115s.
-Defaults lease=120s. Увеличение очереди требует большего lease или конкурентности.
+Для C=128/Q=128/H=15s/S=6s требуется lease >53s; для C=2/Q=3 — >74s.
+Defaults lease=60s; второй пример требует явного увеличения lease. Увеличение очереди требует большего lease или конкурентности.
 Оригинальный deadline проверяется coordinator и остается неизменным после dispatch.
 
 Отмена общего CancellationToken или ошибка restart factory запускают одинаковый

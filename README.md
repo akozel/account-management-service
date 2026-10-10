@@ -270,6 +270,55 @@ cargo build --release
 ./target/release/account-managements-service
 ```
 
+## Graceful shutdown timeline
+
+The service shares a `CancellationToken` between HTTP, the outbox supervisor,
+and the process runtime. SIGTERM/SIGINT or a critical component exit cancels it.
+Axum stops accepting new TCP connections and waits for current requests; outbox
+stops claiming/dequeuing and drains already-started operations concurrently.
+PostgreSQL closes after both components finish.
+
+| Setting | Default | Scope |
+| --- | --- | --- |
+| Handler timeout, H | 15s | One invocation, including its local retries. |
+| Storage timeout, S | 6s | One complete claim batch, recovery, or settlement, including pool acquisition and commit. |
+| PostgreSQL statement timeout | 4s | Each statement in an outbox transaction, including lock waiting. |
+| Lease | 60s | Fixed ownership duration, without renewal. |
+| Concurrency / queue capacity | 128 / 128 | Independent process-wide limits. |
+
+The outbox drain budget is `H+S = 21s`. Lease validation requires
+`60 > 2*6 + 15 + 5 + ceil(128/128)*(15+6) = 53s`. These budgets require
+cooperative async execution; a blocking synchronous handler cannot be preempted
+by a Tokio timer. SQL and runtime timeouts use different starting points;
+their 2s difference is headroom, not a guarantee of a known commit outcome.
+
+The target is to exit the whole application within **28s**, leaving 2s of margin
+for a deployment with `terminationGracePeriodSeconds: 30`. The table is a worst-case
+planning envelope from signal observation. HTTP and outbox drain in parallel;
+components that finish early immediately allow the next phase to proceed.
+**Only the outbox drain budget is enforced today.** HTTP, join observation,
+database closure, and teardown have no host deadline; the remaining timing
+policy is [known issue #10](doc/known_issues/http_shutdown.md).
+
+| Time after stop request | Planned phase | Current implementation |
+| --- | --- | --- |
+| 0s | Cancel the shared token and stop admission. | Axum stops accepting TCP connections; outbox stops new claims and dequeue. |
+| 0–21s | Drain HTTP and outbox concurrently: `max(HTTP drain, H+S) ≤21s`. | Started outbox work gets H+S; HTTP waits for current requests without a deadline. Queued claims remain for lease recovery. |
+| 21–23s | Reserve 2s to observe remaining task termination. | The supervisor aborts remaining workers after its drain budget and awaits their joins; the joins have no extra timeout. HTTP can still be running. |
+| 23–26s | Reserve 3s to close PostgreSQL. | `pool.close().await` starts after HTTP/outbox finish; it has no timeout and may start earlier or later than this interval. |
+| 26–28s | Reserve 2s for logging, Tokio teardown, and application margin. | Normal logging and runtime teardown; no watchdog or deadline forces process exit. |
+| 28–30s | Keep 2s of external termination margin. | A planning reserve; the application does not enforce exit at 28s. |
+| At Kubernetes grace expiry | Force termination if the container remains running. | Kubernetes sends SIGKILL to remaining processes; this does not confirm graceful completion. |
+
+Kubernetes defaults `terminationGracePeriodSeconds` to 30s and executes
+`preStop` before sending TERM, within the same grace period. The timeline assumes
+prompt signal delivery and no long `preStop` hook; its time origin is different
+from Kubernetes's grace-period origin. Run the service as the container's main
+process or forward TERM correctly. See the
+[Kubernetes termination flow](https://kubernetes.io/docs/concepts/workloads/pods/pod-lifecycle/#pod-termination-flow).
+Neither these calculations nor the table establish a guaranteed 28s shutdown
+with the current implementation.
+
 ## HTML coverage report
 
 Generate and open the coverage report with:

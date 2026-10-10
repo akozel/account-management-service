@@ -276,9 +276,9 @@ requests host cancellation on panic/abort, when asynchronous drain is impossible
 The host awaits HTTP and outbox before closing PostgreSQL, preserving the primary
 failure and logging secondary errors with safe task diagnostics. HTTP can publish
 new durable tasks while its in-flight requests finish; these tasks wait for a
-subsequent healthy pool. HTTP/DB cleanup has no overall deadline yet, and the
-synchronous development stdout adapter can exceed cooperative async budgets;
-both limitations remain separate backlog tasks.
+subsequent healthy pool. HTTP/DB cleanup has no overall deadline yet
+([known issue #10](../../doc/known_issues/http_shutdown.md)); the synchronous
+stdout adapter can exceed cooperative async budgets (backlog task #11).
 Interrupted work remains durable for expiry recovery. There is no lease renewal.
 
 A target command may atomically publish a successor task through the command
