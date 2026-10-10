@@ -5,9 +5,9 @@ use std::{future::Future, io};
 use thiserror::Error;
 use tokio::{sync::watch, task::JoinError};
 
-use cqrs_runtime::worker::OutboxWorkerPoolConfigError;
+use cqrs_runtime::worker::WorkerPoolError;
 
-type WorkerExit = Result<Result<(), OutboxWorkerPoolConfigError>, JoinError>;
+type WorkerExit = Result<Result<(), WorkerPoolError>, JoinError>;
 
 #[derive(Debug, Error)]
 pub enum RuntimeError {
@@ -20,7 +20,7 @@ pub enum RuntimeError {
     #[error("outbox supervisor task failed")]
     OutboxSupervisorTask(#[source] JoinError),
     #[error("outbox supervisor failed")]
-    OutboxSupervisor(#[source] OutboxWorkerPoolConfigError),
+    OutboxSupervisor(#[source] WorkerPoolError),
     #[error("outbox supervisor terminated before shutdown")]
     OutboxSupervisorStopped,
 }
@@ -38,7 +38,7 @@ enum StopReason {
 /// before the function returns to the composition root for resource cleanup.
 pub async fn run<Server, Signal>(
     server: Server,
-    worker: tokio::task::JoinHandle<Result<(), OutboxWorkerPoolConfigError>>,
+    worker: tokio::task::JoinHandle<Result<(), WorkerPoolError>>,
     shutdown: watch::Sender<bool>,
     signal: Signal,
 ) -> Result<(), RuntimeError>

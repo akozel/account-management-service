@@ -25,6 +25,9 @@ tracing = { version = "0.1.44", optional = true }
 uuid = { version = "1.26.1", features = ["serde", "v4"] }
 
 [dev-dependencies]
+async-channel = "2.5.0"
+flume = "=0.12.0"
+kanal = "=0.1.1"
 testcontainers = "0.28.0"
 tokio = { version = "1.53.1", features = ["macros", "rt-multi-thread", "sync", "test-util"] }
 tracing-subscriber = { version = "0.3.23", features = ["env-filter"] }

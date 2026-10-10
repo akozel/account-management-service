@@ -5,17 +5,19 @@ async fn explicit_batches_commit_once_and_rollback_with_events_and_snapshots() {
     let db = Database::new().await;
     let first = new_task();
     let mut second = new_task();
-    second.metadata = json!({"correlation_id": "delivery", "custom": {"worker": true}});
+    second = second
+        .with_metadata(json!({"correlation_id": "delivery", "custom": {"worker": true}}))
+        .unwrap();
     let repo = PostgresEventRepositoryWithOutbox::new(db.pool.clone()).with_outbox(vec![first.clone(), second.clone()]);
     let events = [event("batch", 1)];
     repo.persist::<TestAggregate>(&events, Some(("batch".into(), json!({"state": "original"}), 1)))
         .await
         .unwrap();
     for msg in [&first, &second] {
-        let saved = row(&db.pool, msg.id).await;
+        let saved = row(&db.pool, msg.id()).await;
         assert_eq!(saved.get::<i64, _>("aggregate_sequence"), 1);
-        assert_eq!(saved.get::<Value, _>("payload"), msg.payload);
-        assert_eq!(saved.get::<Value, _>("metadata"), msg.metadata);
+        assert_eq!(saved.get::<Value, _>("payload"), *msg.payload());
+        assert_eq!(saved.get::<Value, _>("metadata"), *msg.metadata());
         assert_eq!(saved.get::<String, _>("status"), "pending");
         assert_eq!(saved.get::<i32, _>("attempts"), 0);
     }
@@ -25,15 +27,25 @@ async fn explicit_batches_commit_once_and_rollback_with_events_and_snapshots() {
         .await
         .unwrap();
     assert_eq!(count, 2);
-    let mut invalid = new_task();
-    invalid.max_attempts = 0;
-    let bad_repo = PostgresEventRepositoryWithOutbox::new(db.pool.clone()).with_outbox(vec![new_task(), invalid]);
+    let invalid = new_task();
+    assert!(invalid.clone().with_max_attempts(0).is_err());
+    // Inject a storage rejection without constructing an invalid public DTO.
+    sqlx::query("ALTER TABLE transactional_outbox ADD CONSTRAINT reject_invalid_task CHECK (max_attempts < 10) NOT VALID")
+        .execute(&db.pool)
+        .await
+        .unwrap();
+    let bad_repo = PostgresEventRepositoryWithOutbox::new(db.pool.clone())
+        .with_outbox(vec![new_task().with_max_attempts(1).unwrap(), invalid]);
     assert!(
         bad_repo
             .persist::<TestAggregate>(&[event("batch", 2)], Some(("batch".into(), json!({"state": "bad"}), 2)))
             .await
             .is_err()
     );
+    sqlx::query("ALTER TABLE transactional_outbox DROP CONSTRAINT reject_invalid_task")
+        .execute(&db.pool)
+        .await
+        .unwrap();
     assert_eq!(repo.get_events::<TestAggregate>("batch").await.unwrap().len(), 1);
     assert_eq!(
         repo.get_snapshot::<TestAggregate>("batch").await.unwrap().unwrap().aggregate,
@@ -57,7 +69,7 @@ async fn explicit_batches_commit_once_and_rollback_with_events_and_snapshots() {
         .persist::<TestAggregate>(&[event("batch", 2)], Some(("batch".into(), json!({"state": "next"}), 2)))
         .await
         .unwrap();
-    assert_eq!(row(&db.pool, next_task.id).await.get::<i64, _>("aggregate_sequence"), 2);
+    assert_eq!(row(&db.pool, next_task.id()).await.get::<i64, _>("aggregate_sequence"), 2);
     assert_eq!(
         next_repo
             .get_snapshot::<TestAggregate>("batch")
@@ -68,15 +80,7 @@ async fn explicit_batches_commit_once_and_rollback_with_events_and_snapshots() {
         json!({"state": "next"})
     );
     assert!(fresh.persist::<TestAggregate>(&[], None).await.is_err());
-    let mut huge = new_task();
-    huge.schedule = Schedule::After(Duration::MAX);
-    assert!(
-        PostgresEventRepositoryWithOutbox::new(db.pool.clone())
-            .with_outbox(vec![huge])
-            .persist::<TestAggregate>(&[event("overflow", 1)], None)
-            .await
-            .is_err()
-    );
+    assert!(new_task().scheduled(TaskSchedule::After(Duration::MAX)).is_err());
     // A duplicate task ID is not an optimistic aggregate conflict. The whole
     // statement still rolls its otherwise valid new event back.
     assert!(matches!(

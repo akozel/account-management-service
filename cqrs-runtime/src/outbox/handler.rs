@@ -7,13 +7,13 @@
 //! Sender-required idempotency keys live in payload or metadata and are passed
 //! unchanged across retries; storing a key alone does not deduplicate an effect.
 
-use super::{queue::ClaimedTask, task::TaskFormat};
+use super::{delivery::TaskDelivery, task::TaskFormat};
 use async_trait::async_trait;
 use std::time::Duration;
 use thiserror::Error;
 
 #[derive(Clone, Debug, Error)]
-pub enum TaskExecutionError {
+pub enum TaskHandlerError {
     /// Request durable redelivery after optional backoff, subject to max_attempts.
     /// A safe reason is persisted; do not include payloads, credentials, or secrets.
     #[error("{reason}")]
@@ -25,13 +25,21 @@ pub enum TaskExecutionError {
 
 /// Application-owned operation handler; safe to repeat from the beginning.
 ///
+/// Handler input has no platform ownership API:
+/// ```compile_fail
+/// use cqrs_runtime::outbox::TaskDelivery;
+/// fn inspect_lease(task: &TaskDelivery) {
+///     let _ = task.lease();
+/// }
+/// ```
+///
 /// Local retries and backoff share one invocation timeout. Return success only
 /// when the operation's business contract is satisfied; target commands may
 /// classify an exact already-applied operation as success. External sends need
 /// receiver idempotency or explicitly permitted repeated effects.
 ///
 /// The runtime may redeliver after timeout, crash, or lost acknowledgement even
-/// without a returned [`TaskExecutionError::Retry`]. Use cooperative async I/O;
+/// without a returned [`TaskHandlerError::Retry`]. Use cooperative async I/O;
 /// cancellation cannot retract a request already accepted by a remote system.
 /// Do not construct/reset task lock tokens or lease deadlines in business code.
 #[async_trait]
@@ -40,5 +48,5 @@ pub trait TaskHandler: Send {
     fn formats(&self) -> Vec<TaskFormat>;
     /// Perform exactly one retryable target command or external effect.
     /// `Ok(())` requests completion; the coordinator separately settles ownership.
-    async fn handle(&mut self, task: &ClaimedTask) -> Result<(), TaskExecutionError>;
+    async fn handle(&mut self, task: &TaskDelivery) -> Result<(), TaskHandlerError>;
 }

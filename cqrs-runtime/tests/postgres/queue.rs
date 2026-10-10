@@ -1,19 +1,22 @@
 use super::*;
+use cqrs_runtime::outbox::{ClaimLease, TaskDelivery};
 
 #[tokio::test]
 async fn ready_time_formats_and_skip_locked_distribute_without_overlap() {
     let db = Database::new().await;
     let queue = PostgresOutboxQueue::new(db.pool.clone());
     let tasks: Vec<_> = (0..20).map(|_| new_task()).collect();
-    let ids: HashSet<_> = tasks.iter().map(|m| m.id).collect();
-    let delayed = new_task().scheduled(Schedule::After(Duration::from_secs(300)));
+    let ids: HashSet<_> = tasks.iter().map(|m| m.id()).collect();
+    let delayed = new_task().scheduled(TaskSchedule::After(Duration::from_secs(300))).unwrap();
     let absolute_time = DateTime::from_timestamp_micros((Utc::now() + chrono::Duration::hours(1)).timestamp_micros()).unwrap();
-    let absolute = new_task().scheduled(Schedule::At(absolute_time));
-    let past = new_task().scheduled(Schedule::At(Utc::now() - chrono::Duration::minutes(1)));
-    let mut unknown = new_task();
-    unknown.task_version = 3;
-    let mut unknown_type = new_task();
-    unknown_type.task_type = "future_task".into();
+    let absolute = new_task().scheduled(TaskSchedule::At(absolute_time)).unwrap();
+    let past = new_task()
+        .scheduled(TaskSchedule::At(Utc::now() - chrono::Duration::minutes(1)))
+        .unwrap();
+    let unknown =
+        NewOutboxTask::from_payload(TaskFormat::new(format().task_type(), 3).unwrap(), json!({"value":"runtime"})).unwrap();
+    let unknown_type =
+        NewOutboxTask::from_payload(TaskFormat::new("future_task", 1).unwrap(), json!({"value":"runtime"})).unwrap();
     enqueue(&db.pool, tasks).await;
     enqueue(
         &db.pool,
@@ -26,11 +29,11 @@ async fn ready_time_formats_and_skip_locked_distribute_without_overlap() {
         ],
     )
     .await;
-    let saved = row(&db.pool, delayed.id).await;
+    let saved = row(&db.pool, delayed.id()).await;
     let delta = saved.get::<DateTime<Utc>, _>("available_at") - saved.get::<DateTime<Utc>, _>("created_at");
     assert_eq!(delta.num_seconds(), 300);
     assert_eq!(
-        row(&db.pool, absolute.id).await.get::<DateTime<Utc>, _>("available_at"),
+        row(&db.pool, absolute.id()).await.get::<DateTime<Utc>, _>("available_at"),
         absolute_time
     );
     // Hold a row lock independently: another consumer must still make progress.
@@ -48,20 +51,20 @@ async fn ready_time_formats_and_skip_locked_distribute_without_overlap() {
     );
     let claimed: Vec<_> = left.unwrap().into_iter().chain(right.unwrap()).collect();
     assert_eq!(claimed.len(), 20);
-    let claimed_ids: HashSet<_> = claimed.iter().map(|m| m.id).collect();
+    let claimed_ids: HashSet<_> = claimed.iter().map(|m| m.delivery().id()).collect();
     assert_eq!(claimed_ids.len(), 20);
-    assert!(claimed_ids.contains(&past.id));
+    assert!(claimed_ids.contains(&past.id()));
     assert!(!claimed_ids.contains(&locked_id));
     tx.rollback().await.unwrap();
-    assert_eq!(claim(&queue).await[0].id, locked_id);
+    assert_eq!(claim(&queue).await[0].delivery().id(), locked_id);
     assert!(claim(&queue).await.is_empty());
     for task in &claimed {
-        assert!(queue.settle(task, TaskOutcome::Completed).await.unwrap().is_settled());
-        assert!(!queue.settle(task, TaskOutcome::Completed).await.unwrap().is_settled());
+        assert!(queue.settle(task, SettlementRequest::Completed).await.unwrap().is_applied());
+        assert!(!queue.settle(task, SettlementRequest::Completed).await.unwrap().is_applied());
     }
-    make_ready(&db.pool, delayed.id).await;
-    assert_eq!(claim(&queue).await[0].id, delayed.id);
-    for id in [unknown.id, unknown_type.id] {
+    make_ready(&db.pool, delayed.id()).await;
+    assert_eq!(claim(&queue).await[0].delivery().id(), delayed.id());
+    for id in [unknown.id(), unknown_type.id()] {
         let saved = row(&db.pool, id).await;
         assert_eq!(saved.get::<String, _>("status"), "pending");
         assert_eq!(saved.get::<i32, _>("attempts"), 0);
@@ -77,70 +80,76 @@ async fn retries_failed_tasks_and_expired_leases_preserve_identity_and_fence_old
     let db = Database::new().await;
     let queue = PostgresOutboxQueue::new(db.pool.clone());
     let mut msg = new_task();
-    msg.max_attempts = 2;
+    msg = msg.with_max_attempts(2).unwrap();
     enqueue(&db.pool, vec![msg.clone()]).await;
     let first = claim(&queue).await.pop().unwrap();
     assert!(
         queue
             .settle(
                 &first,
-                TaskOutcome::Retry {
+                SettlementRequest::Retry {
                     delay: Duration::from_secs(300),
                     reason: "try later".into()
                 }
             )
             .await
             .unwrap()
-            .is_settled()
+            .is_applied()
     );
     assert!(claim(&queue).await.is_empty());
-    assert_eq!(row(&db.pool, msg.id).await.get::<String, _>("last_error"), "try later");
-    make_ready(&db.pool, msg.id).await;
+    assert_eq!(row(&db.pool, msg.id()).await.get::<String, _>("last_error"), "try later");
+    make_ready(&db.pool, msg.id()).await;
     let second = claim(&queue).await.pop().unwrap();
-    assert_eq!(second.attempt, 2);
-    assert_ne!(first.lock_token, second.lock_token);
-    assert!(!queue.settle(&first, TaskOutcome::Completed).await.unwrap().is_settled());
-    expire(&db.pool, msg.id).await;
-    assert!(!queue.settle(&second, TaskOutcome::Completed).await.unwrap().is_settled());
-    assert_eq!(queue.recover_expired(10).await.unwrap().recovered, 1);
-    assert_eq!(row(&db.pool, msg.id).await.get::<String, _>("status"), "failed");
+    assert_eq!(second.delivery().attempt(), 2);
+    assert_ne!(first.lease().lock_token(), second.lease().lock_token());
+    assert!(!queue.settle(&first, SettlementRequest::Completed).await.unwrap().is_applied());
+    expire(&db.pool, msg.id()).await;
     assert!(
-        row(&db.pool, msg.id)
+        !queue
+            .settle(&second, SettlementRequest::Completed)
+            .await
+            .unwrap()
+            .is_applied()
+    );
+    assert_eq!(queue.recover_expired(10).await.unwrap().processed_count(), 1);
+    assert_eq!(row(&db.pool, msg.id()).await.get::<String, _>("status"), "failed");
+    assert!(
+        row(&db.pool, msg.id())
             .await
             .get::<Option<DateTime<Utc>>, _>("finished_at")
             .is_some()
     );
     sqlx::query(REQUEUE_FAILED_OUTBOX_TASK)
-        .bind(msg.id)
+        .bind(msg.id())
         .execute(&db.pool)
         .await
         .unwrap();
     let restarted = claim(&queue).await.pop().unwrap();
-    assert_eq!(restarted.id, msg.id);
-    assert_eq!(restarted.attempt, 1);
-    expire(&db.pool, msg.id).await;
-    assert_eq!(queue.recover_expired(10).await.unwrap().recovered, 1);
-    assert_eq!(queue.recover_expired(10).await.unwrap().recovered, 0);
-    assert_eq!(row(&db.pool, msg.id).await.get::<String, _>("status"), "pending");
+    assert_eq!(restarted.delivery().id(), msg.id());
+    assert_eq!(restarted.delivery().attempt(), 1);
+    expire(&db.pool, msg.id()).await;
+    assert_eq!(queue.recover_expired(10).await.unwrap().processed_count(), 1);
+    assert_eq!(queue.recover_expired(10).await.unwrap().processed_count(), 0);
+    assert_eq!(row(&db.pool, msg.id()).await.get::<String, _>("status"), "pending");
     assert!(claim(&queue).await.is_empty());
-    make_ready(&db.pool, msg.id).await;
+    make_ready(&db.pool, msg.id()).await;
     let last = claim(&queue).await.pop().unwrap();
     assert!(
         queue
             .settle(
                 &last,
-                TaskOutcome::Retry {
+                SettlementRequest::Retry {
                     delay: Duration::ZERO,
                     reason: "failed twice".into()
                 }
             )
             .await
             .unwrap()
-            .is_settled()
+            .is_applied()
     );
-    assert_eq!(row(&db.pool, msg.id).await.get::<String, _>("status"), "failed");
+    assert_eq!(row(&db.pool, msg.id()).await.get::<String, _>("status"), "failed");
     sqlx::query(REQUEUE_FAILED_OUTBOX_TASK)
-        .bind(msg.id)
+        .bind(msg.id())
         .execute(&db.pool)
         .await
         .unwrap();
@@ -149,31 +158,31 @@ async fn retries_failed_tasks_and_expired_leases_preserve_identity_and_fence_old
         queue
             .settle(
                 &permanent,
-                TaskOutcome::Failed {
+                SettlementRequest::Failed {
                     reason: "broken payload".into()
                 }
             )
             .await
             .unwrap()
-            .is_settled()
+            .is_applied()
     );
-    assert_eq!(row(&db.pool, msg.id).await.get::<i32, _>("attempts"), 1);
+    assert_eq!(row(&db.pool, msg.id()).await.get::<i32, _>("attempts"), 1);
     let zero_delay = new_task();
     enqueue(&db.pool, vec![zero_delay.clone()]).await;
     let claimed = claim(&queue).await.pop().unwrap();
     let settled = queue
         .settle(
             &claimed,
-            TaskOutcome::Retry {
+            SettlementRequest::Retry {
                 delay: Duration::ZERO,
                 reason: "retry".into(),
             },
         )
         .await
         .unwrap();
-    assert!(settled.is_settled());
-    assert!(settled.failed().is_none());
-    assert_eq!(claim(&queue).await[0].id, zero_delay.id);
+    assert!(settled.is_applied());
+    assert!(settled.failure().is_none());
+    assert_eq!(claim(&queue).await[0].delivery().id(), zero_delay.id());
     db.close().await;
 }
 
@@ -226,17 +235,12 @@ async fn queue_indexes_serve_ready_and_expired_queries_with_finished_history() {
         OutboxError::Unavailable
     );
     assert_eq!(queue.recover_expired(1).await.unwrap_err(), OutboxError::Unavailable);
-    let dummy = ClaimedTask {
-        lease_deadline: tokio::time::Instant::now() + Duration::from_secs(60),
-        id: Uuid::new_v4(),
-        format: format(),
-        payload: json!({}),
-        metadata: json!({}),
-        attempt: 1,
-        lock_token: Uuid::new_v4(),
-    };
+    let dummy = ClaimedTask::new(
+        TaskDelivery::new(Uuid::new_v4(), format(), json!({}), json!({}), 1).unwrap(),
+        ClaimLease::new(Uuid::new_v4(), tokio::time::Instant::now() + Duration::from_secs(60)),
+    );
     assert_eq!(
-        queue.settle(&dummy, TaskOutcome::Completed).await.unwrap_err(),
+        queue.settle(&dummy, SettlementRequest::Completed).await.unwrap_err(),
         OutboxError::Unavailable
     );
     db.close().await;

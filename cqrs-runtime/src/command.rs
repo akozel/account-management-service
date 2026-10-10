@@ -1,13 +1,10 @@
-//! Generic command execution with bounded optimistic-conflict retries.
-
-use std::{error::Error, future::Future, marker::PhantomData, time::Duration};
-
-use cqrs_es::{Aggregate, AggregateError, CqrsFramework, EventStore};
+//! Command gateways with bounded optimistic-conflict retry.
 use thiserror::Error;
-
-use crate::outbox::NewOutboxTask;
-
-/// Stable error categories exposed by aggregate-specific command gateways.
+mod executor;
+mod retry;
+pub use executor::CqrsCommandExecutor;
+pub use retry::{AggregateConflictRetryPolicy, AggregateConflictRetryPolicyError};
+/// Expected domain rejection, exhausted optimistic conflict, or unavailable storage.
 #[derive(Clone, Debug, Error, Eq, PartialEq)]
 pub enum CommandGatewayError<D> {
     #[error("domain command failed a domain rule: {0}")]
@@ -17,143 +14,6 @@ pub enum CommandGatewayError<D> {
     #[error("command gateway is temporarily unavailable")]
     Unavailable,
 }
-
-/// Controls the bounded, in-process retry of one unchanged aggregate command.
-///
-/// `max_attempts` counts the initial execution. Only optimistic aggregate
-/// conflicts are retried; failures with an unknown commit outcome are returned.
-#[derive(Clone, Copy, Debug, PartialEq)]
-pub struct AggregateConflictRetryPolicy {
-    max_attempts: usize,
-    initial_backoff: Duration,
-    max_backoff: Duration,
-    jitter_ratio: f64,
-}
-
-impl AggregateConflictRetryPolicy {
-    /// Creates an explicit retry policy. `jitter_ratio` is symmetric, so `0.2`
-    /// means ±20%.
-    pub fn new(max_attempts: usize, initial_backoff: Duration, max_backoff: Duration, jitter_ratio: f64) -> Self {
-        assert!(
-            max_attempts > 0,
-            "aggregate conflict retry policy requires at least one attempt"
-        );
-        assert!(initial_backoff <= max_backoff, "initial backoff must not exceed the cap");
-        assert!(
-            jitter_ratio.is_finite() && (0.0..=1.0).contains(&jitter_ratio),
-            "jitter ratio must be finite and between zero and one"
-        );
-        Self {
-            max_attempts,
-            initial_backoff,
-            max_backoff,
-            jitter_ratio,
-        }
-    }
-
-    fn backoff_bounds(self, retry: usize) -> (Duration, Duration) {
-        debug_assert!(retry > 0);
-        let exponent = u32::try_from(retry - 1).unwrap_or(u32::MAX);
-        let multiplier = 2_u32.checked_pow(exponent).unwrap_or(u32::MAX);
-        let backoff = self.initial_backoff.saturating_mul(multiplier).min(self.max_backoff);
-        let lower = backoff.mul_f64(1.0 - self.jitter_ratio);
-        let upper = backoff.mul_f64(1.0 + self.jitter_ratio).min(self.max_backoff);
-        (lower, upper)
-    }
-
-    fn backoff(self, retry: usize) -> Duration {
-        let (lower, upper) = self.backoff_bounds(retry);
-        if lower == upper {
-            lower
-        } else {
-            Duration::from_secs_f64(rand::random_range(lower.as_secs_f64()..=upper.as_secs_f64()))
-        }
-    }
-}
-
-impl Default for AggregateConflictRetryPolicy {
-    fn default() -> Self {
-        Self::new(3, Duration::from_millis(5), Duration::from_millis(50), 0.2)
-    }
-}
-
-/// Executes commands for one aggregate type through frameworks supplied by the
-/// composition root.
-///
-/// The framework is built exactly once per [`execute`](Self::execute) call.
-/// Every optimistic-conflict attempt reloads aggregate state through that same
-/// framework and repeats clones of the original command. The immutable outbox
-/// task list is handed to the factory once and therefore cannot be regenerated
-/// or changed between attempts.
-pub struct CqrsCommandExecutor<A, BuildFramework> {
-    build_framework: BuildFramework,
-    retry_policy: AggregateConflictRetryPolicy,
-    aggregate: PhantomData<fn() -> A>,
-}
-
-impl<A, BuildFramework> CqrsCommandExecutor<A, BuildFramework> {
-    pub fn new(build_framework: BuildFramework, retry_policy: AggregateConflictRetryPolicy) -> Self {
-        Self {
-            build_framework,
-            retry_policy,
-            aggregate: PhantomData,
-        }
-    }
-}
-
-impl<A, BuildFramework> CqrsCommandExecutor<A, BuildFramework>
-where
-    A: Aggregate,
-    A::Command: Clone + Send,
-{
-    pub async fn execute<ES>(
-        &self,
-        aggregate_id: &str,
-        command: A::Command,
-        tasks: Vec<NewOutboxTask>,
-    ) -> Result<(), CommandGatewayError<A::Error>>
-    where
-        BuildFramework: Fn(Vec<NewOutboxTask>) -> CqrsFramework<A, ES> + Send + Sync,
-        ES: EventStore<A> + 'static,
-        ES::AC: Send,
-    {
-        let framework = (self.build_framework)(tasks);
-        retry_on_aggregate_conflict(self.retry_policy, || framework.execute(aggregate_id, command.clone()))
-            .await
-            .map_err(map_aggregate_error)
-    }
-}
-
-async fn retry_on_aggregate_conflict<T, D, Operation, OperationFuture>(
-    policy: AggregateConflictRetryPolicy,
-    mut operation: Operation,
-) -> Result<T, AggregateError<D>>
-where
-    D: Error,
-    Operation: FnMut() -> OperationFuture,
-    OperationFuture: Future<Output = Result<T, AggregateError<D>>>,
-{
-    for attempt in 1..=policy.max_attempts {
-        let result = operation().await;
-        if matches!(result, Err(AggregateError::AggregateConflict)) && attempt < policy.max_attempts {
-            tokio::time::sleep(policy.backoff(attempt)).await;
-            continue;
-        }
-        return result;
-    }
-    unreachable!("aggregate conflict retry policy always has at least one attempt")
-}
-
-fn map_aggregate_error<D: Error>(error: AggregateError<D>) -> CommandGatewayError<D> {
-    match error {
-        AggregateError::UserError(error) => CommandGatewayError::Domain(error),
-        AggregateError::AggregateConflict => CommandGatewayError::Conflict,
-        AggregateError::DatabaseConnectionError(_)
-        | AggregateError::DeserializationError(_)
-        | AggregateError::UnexpectedError(_) => CommandGatewayError::Unavailable,
-    }
-}
-
 #[cfg(test)]
 mod tests {
     use std::{
@@ -169,8 +29,11 @@ mod tests {
     use serde::{Deserialize, Serialize};
     use serde_json::json;
 
+    use super::executor::map_aggregate_error;
     use super::*;
     use crate::outbox::{NewOutboxTask, TaskPayload};
+    use cqrs_es::{Aggregate, AggregateError, CqrsFramework, EventStore};
+    use std::time::Duration;
 
     #[derive(Clone, Debug, Error, Eq, PartialEq)]
     #[error("rejected")]
@@ -280,7 +143,7 @@ mod tests {
     }
 
     fn no_delay_policy(max_attempts: usize) -> AggregateConflictRetryPolicy {
-        AggregateConflictRetryPolicy::new(max_attempts, Duration::ZERO, Duration::ZERO, 0.0)
+        AggregateConflictRetryPolicy::new(max_attempts, Duration::ZERO, Duration::ZERO, 0.0).unwrap()
     }
 
     #[tokio::test]
@@ -450,12 +313,27 @@ mod tests {
     #[test]
     fn dummy_task_serializes_without_service_types() {
         let task = NewOutboxTask::new(DummyTask { value: "runtime" }).unwrap();
-        assert_eq!(task.payload, json!({"value": "runtime"}));
+        assert_eq!(task.payload(), &json!({"value": "runtime"}));
     }
 
     #[test]
-    #[should_panic(expected = "at least one attempt")]
     fn retry_policy_rejects_zero_attempts() {
-        AggregateConflictRetryPolicy::new(0, Duration::ZERO, Duration::ZERO, 0.0);
+        assert!(AggregateConflictRetryPolicy::new(0, Duration::ZERO, Duration::ZERO, 0.0).is_err());
+        assert!(AggregateConflictRetryPolicy::new(1, Duration::MAX, Duration::MAX, 0.2).is_err());
+        assert!(AggregateConflictRetryPolicy::new(1, Duration::ZERO, Duration::ZERO, f64::NAN).is_err());
+        assert!(AggregateConflictRetryPolicy::new(1, Duration::from_secs(2), Duration::from_secs(1), 0.2).is_err());
+    }
+
+    #[test]
+    fn large_representable_backoff_and_tiny_jitter_remain_bounded() {
+        let cap = Duration::from_millis(i64::MAX as u64);
+        for jitter in [0.0, 1e-20, 0.2, 1.0] {
+            let policy = AggregateConflictRetryPolicy::new(2, cap, cap, jitter).unwrap();
+            let (lower, upper) = policy.backoff_bounds(usize::MAX);
+            assert!(lower <= upper && upper <= cap);
+            for _ in 0..100 {
+                assert!((lower..=upper).contains(&policy.backoff(usize::MAX)));
+            }
+        }
     }
 }

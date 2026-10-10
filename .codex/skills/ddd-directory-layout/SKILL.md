@@ -40,7 +40,8 @@ components an aggregate needs.
   event-sourced aggregate, including event application and command dispatch.
   Its `Aggregate::handle` implementation only matches a command and delegates
   to the corresponding handler. Omit `aggregate.rs` when no such implementation
-  exists; keep constructor tests in the root module or a `tests.rs` child.
+  exists; keep constructor tests in an inline `#[cfg(test)] mod tests { ... }`
+  block in the aggregate's root file, not a separate `tests.rs` child.
 - `commands.rs` contains command types expressing intent toward that aggregate
   and their handlers. Handlers validate the current aggregate state and emit
   the resulting domain events.
@@ -146,7 +147,8 @@ execute concurrently and in any order. Do not use queue settlement or a
 delivery-order flag as the aggregate's workflow state. See
 [`cqrs-runtime/doc/task_processing.md`](../../../cqrs-runtime/doc/task_processing.md).
 An already-applied command may return a distinct exact-repeat domain rejection;
-the TaskHandler interprets it for its own Task. The aggregate must distinguish
+the TaskHandler interprets it for its own Task. Handlers receive immutable
+`TaskDelivery`; claim tokens and deadlines never enter aggregate state. The aggregate must distinguish
 that case from an existing record with different identity-defining data.
 
 Do not introduce placeholder domain types or modules solely to fill the layout.

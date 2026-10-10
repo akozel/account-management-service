@@ -38,7 +38,7 @@ use cqrs_es::{
 };
 use cqrs_runtime::{
     command::AggregateConflictRetryPolicy,
-    outbox::{OutboxQueue, TaskExecutionError, TaskFormat},
+    outbox::{OutboxQueue, TaskFormat, TaskHandlerError},
     postgres::{EVENT_STORE_SCHEMA, PostgresEventRepositoryWithOutbox, PostgresOutboxQueue, TRANSACTIONAL_OUTBOX_SCHEMA},
 };
 use serde_json::{Value, json};
@@ -510,7 +510,7 @@ struct RecordingSender(Arc<Mutex<Vec<VerificationCodeDelivery>>>);
 
 #[async_trait]
 impl VerificationCodeSender for RecordingSender {
-    async fn send(&mut self, message: VerificationCodeDelivery, _: DeliveryContext) -> Result<(), TaskExecutionError> {
+    async fn send(&mut self, message: VerificationCodeDelivery, _: DeliveryContext) -> Result<(), TaskHandlerError> {
         self.0.lock().unwrap().push(message);
         Ok(())
     }
@@ -538,7 +538,7 @@ async fn delayed_tasks_deliver_frozen_pairs_without_reactivating_old_ones() {
     let queue = PostgresOutboxQueue::new(db.pool.clone());
     let mut messages = queue
         .claim(
-            &TaskFormat::of::<SendVerificationCodeTaskV1>(),
+            &TaskFormat::of::<SendVerificationCodeTaskV1>().unwrap(),
             "test",
             2,
             Duration::from_secs(30),
@@ -549,9 +549,9 @@ async fn delayed_tasks_deliver_frozen_pairs_without_reactivating_old_ones() {
     messages.reverse();
     let sender = RecordingSender::default();
     let delivered = sender.0.clone();
-    let mut handler = send_verification_code_task_handler(Box::new(sender));
+    let mut handler = send_verification_code_task_handler(Box::new(sender)).unwrap();
     for message in &messages {
-        handler.handle(message).await.unwrap();
+        handler.handle(message.delivery()).await.unwrap();
     }
     {
         let delivered = delivered.lock().unwrap();

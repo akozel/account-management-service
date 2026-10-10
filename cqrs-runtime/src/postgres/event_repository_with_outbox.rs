@@ -1,12 +1,13 @@
-use crate::outbox::{NewOutboxTask, OutboxError, Schedule};
+use crate::outbox::NewOutboxTask;
 use cqrs_es::{
     Aggregate,
     persist::{PersistedEventRepository, PersistenceError, ReplayStream, SerializedEvent, SerializedSnapshot},
 };
 use postgres_es::PostgresEventRepository;
 use serde_json::Value;
-use sqlx::{PgPool, Postgres, QueryBuilder, Row};
+use sqlx::PgPool;
 use thiserror::Error;
+mod write;
 
 /// Commit one accepted event, its optional snapshot, and immutable tasks atomically.
 ///
@@ -36,132 +37,18 @@ impl PostgresEventRepositoryWithOutbox {
         self
     }
 
-    // PostgreSQL executes all modifying CTEs as one atomic statement. RETURNING
-    // carries the snapshot lock result to event insertion and written events
-    // to outbox insertion; sibling CTEs cannot inspect each other's table writes.
-    async fn persist_batch<A: Aggregate>(
+    async fn persist_command<A: Aggregate>(
         &self,
         events: &[SerializedEvent],
         snapshot_update: Option<(String, Value, usize)>,
     ) -> Result<(), PersistenceError> {
-        if events.len() > 1 {
-            return Err(invalid_batch("a command may commit at most one domain event"));
-        }
-        if events.is_empty() {
-            if snapshot_update.is_some() {
-                return Err(invalid_batch("a snapshot requires a committed domain event"));
-            }
-            if !self.tasks.is_empty() {
-                return Err(invalid_batch("outbox tasks require a committed domain event"));
-            }
-            return Ok(());
-        }
-        let snapshot_binds = snapshot_update
-            .as_ref()
-            .map(|(_, _, version)| if *version == 1 { 5 } else { 6 })
-            .unwrap_or_default();
-        validate_bind_count(events.len(), self.tasks.len(), snapshot_binds)?;
-
-        // Validate conversions before sending any write to PostgreSQL.
-        let event_sequences = events
-            .iter()
-            .map(|event| sequence_as_i64(event.sequence))
-            .collect::<Result<Vec<_>, _>>()?;
-        let schedules = self
-            .tasks
-            .iter()
-            .map(|task| match task.schedule {
-                Schedule::Now => Ok((None, 0_i64)),
-                Schedule::At(at) => Ok((Some(at), 0)),
-                Schedule::After(delay) => i64::try_from(delay.as_millis())
-                    .map(|millis| (None, millis))
-                    .map_err(|_| PersistenceError::UnknownError(Box::new(OutboxError::InvalidTask) as _)),
-            })
-            .collect::<Result<Vec<_>, _>>()?;
-
-        let has_snapshot = snapshot_update.is_some();
-        let mut query = QueryBuilder::<Postgres>::new("WITH ");
-        if let Some((aggregate_id, aggregate, current_snapshot)) = snapshot_update {
-            let last_sequence = event_sequences.last().copied().unwrap_or_default();
-            let current_snapshot = sequence_as_i64(current_snapshot)?;
-            query.push("written_snapshot AS (");
-            if current_snapshot == 1 {
-                query.push(
-                    "INSERT INTO snapshots (aggregate_type, aggregate_id, last_sequence, current_snapshot, payload) VALUES (",
-                );
-                query.push_bind(A::TYPE).push(", ");
-                query.push_bind(aggregate_id).push(", ");
-                query.push_bind(last_sequence).push(", ");
-                query.push_bind(current_snapshot).push(", ");
-                query.push_bind(aggregate);
-                query.push(") RETURNING 1");
-            } else {
-                query.push("UPDATE snapshots SET last_sequence = ");
-                query.push_bind(last_sequence).push(", current_snapshot = ");
-                query.push_bind(current_snapshot).push(", payload = ");
-                query.push_bind(aggregate).push(" WHERE aggregate_type = ");
-                query.push_bind(A::TYPE).push(" AND aggregate_id = ");
-                query.push_bind(aggregate_id).push(" AND current_snapshot = ");
-                query.push_bind(current_snapshot - 1).push(" RETURNING 1");
-            }
-            query.push(")");
-        }
-
-        if !events.is_empty() {
-            if has_snapshot {
-                query.push(", ");
-            }
-            query.push("written_events AS (INSERT INTO events (aggregate_type, aggregate_id, sequence, event_type, event_version, payload, metadata) ");
-            if has_snapshot {
-                query.push("SELECT * FROM (");
-            }
-            query.push_values(events.iter().zip(&event_sequences), |mut row, (event, sequence)| {
-                row.push_bind(A::TYPE)
-                    .push_bind(&event.aggregate_id)
-                    .push_bind(sequence)
-                    .push_bind(&event.event_type)
-                    .push_bind(&event.event_version)
-                    .push_bind(&event.payload)
-                    .push_bind(&event.metadata);
-            });
-            if has_snapshot {
-                query.push(") AS input(aggregate_type, aggregate_id, sequence, event_type, event_version, payload, metadata) WHERE EXISTS (SELECT 1 FROM written_snapshot)");
-            }
-            query.push(" RETURNING sequence)");
-        }
-
-        if !self.tasks.is_empty() {
-            let event = events.last().expect("outbox events were validated above");
-            let last_sequence = *event_sequences.last().expect("outbox events were validated above");
-            query.push(", written_tasks AS (INSERT INTO transactional_outbox (id, aggregate_type, aggregate_id, aggregate_sequence, task_type, task_version, payload, metadata, available_at, max_attempts) ");
-            query.push("SELECT id, aggregate_type, aggregate_id, aggregate_sequence, task_type, task_version, payload, metadata, COALESCE(scheduled_at, statement_timestamp() + delay_ms * interval '1 millisecond'), max_attempts FROM (");
-            query.push_values(self.tasks.iter().zip(&schedules), |mut row, (task, (at, delay))| {
-                row.push_bind(task.id)
-                    .push_bind(A::TYPE)
-                    .push_bind(&event.aggregate_id)
-                    .push_bind(last_sequence)
-                    .push_bind(&task.task_type)
-                    .push_bind(task.task_version)
-                    .push_bind(&task.payload)
-                    .push_bind(&task.metadata)
-                    .push_bind(*at)
-                    .push_bind(*delay as f64)
-                    .push_bind(task.max_attempts);
-            });
-            query.push(") AS input(id, aggregate_type, aggregate_id, aggregate_sequence, task_type, task_version, payload, metadata, scheduled_at, delay_ms, max_attempts) WHERE EXISTS (SELECT 1 FROM written_events) RETURNING id)");
-        }
-
-        if has_snapshot {
-            query.push(" SELECT COUNT(*)::bigint AS snapshot_count FROM written_snapshot");
-        } else {
-            query.push(" SELECT 1::bigint AS snapshot_count");
-        }
-        let row = query.build().fetch_one(&self.pool).await.map_err(map_sqlx_error)?;
-        let snapshot_count: i64 = row.try_get("snapshot_count").map_err(map_sqlx_error)?;
-        if snapshot_count == 1 {
-            Ok(())
-        } else {
-            Err(PersistenceError::OptimisticLockError)
+        match write::WritePlan::new(events, snapshot_update, &self.tasks)? {
+            write::WritePlan::NoOp => Ok(()),
+            write::WritePlan::OneEvent {
+                event,
+                sequence,
+                snapshot,
+            } => write::persist_one::<A>(&self.pool, &self.tasks, event, sequence, snapshot).await,
         }
     }
 }
@@ -188,7 +75,7 @@ impl PersistedEventRepository for PostgresEventRepositoryWithOutbox {
         events: &[SerializedEvent],
         snapshot_update: Option<(String, Value, usize)>,
     ) -> Result<(), PersistenceError> {
-        self.persist_batch::<A>(events, snapshot_update).await
+        self.persist_command::<A>(events, snapshot_update).await
     }
 
     async fn stream_events<A: Aggregate>(&self, aggregate_id: &str) -> Result<ReplayStream, PersistenceError> {
@@ -201,31 +88,36 @@ impl PersistedEventRepository for PostgresEventRepositoryWithOutbox {
 }
 
 #[derive(Debug, Error)]
-#[error("event sequence does not fit PostgreSQL bigint")]
-struct SequenceOverflow;
-
-#[derive(Debug, Error)]
-#[error("write batch exceeds PostgreSQL's bind parameter limit")]
-struct BatchTooLarge;
-
-fn invalid_batch(message: &'static str) -> PersistenceError {
-    PersistenceError::UnknownError(Box::new(std::io::Error::other(message)))
+enum WriteValidationError {
+    #[error("a command may commit at most one domain event")]
+    MultipleEvents,
+    #[error("a snapshot requires a committed domain event")]
+    SnapshotWithoutEvent,
+    #[error("outbox tasks require a committed domain event")]
+    TasksWithoutEvent,
+    #[error("event sequence does not fit PostgreSQL bigint")]
+    SequenceOverflow,
+    #[error("write batch exceeds PostgreSQL's bind parameter limit")]
+    BindLimitExceeded,
 }
-
-fn validate_bind_count(events: usize, tasks: usize, snapshot_binds: usize) -> Result<(), PersistenceError> {
-    let count = events
-        .checked_mul(7)
-        .and_then(|count| tasks.checked_mul(11).and_then(|tasks| count.checked_add(tasks)))
+fn invalid_write(reason: WriteValidationError) -> PersistenceError {
+    PersistenceError::UnknownError(Box::new(reason))
+}
+fn validate_bind_count(tasks: usize, snapshot_binds: usize) -> Result<(), PersistenceError> {
+    const EVENT_BINDS: usize = 7;
+    const TASK_BINDS: usize = 11;
+    let count = tasks
+        .checked_mul(TASK_BINDS)
+        .and_then(|count| count.checked_add(EVENT_BINDS))
         .and_then(|count| count.checked_add(snapshot_binds));
     if count.is_some_and(|count| count < u16::MAX as usize) {
         Ok(())
     } else {
-        Err(PersistenceError::UnknownError(Box::new(BatchTooLarge)))
+        Err(invalid_write(WriteValidationError::BindLimitExceeded))
     }
 }
-
 fn sequence_as_i64(sequence: usize) -> Result<i64, PersistenceError> {
-    i64::try_from(sequence).map_err(|_| PersistenceError::UnknownError(Box::new(SequenceOverflow)))
+    i64::try_from(sequence).map_err(|_| invalid_write(WriteValidationError::SequenceOverflow))
 }
 
 fn map_sqlx_error(error: sqlx::Error) -> PersistenceError {
@@ -254,13 +146,13 @@ mod tests {
 
     #[test]
     fn rejects_batches_over_the_postgres_bind_limit() {
-        assert!(validate_bind_count(1, 1, 6).is_ok());
-        assert!(validate_bind_count(0, 5_957, 0).is_ok());
+        assert!(validate_bind_count(1, 6).is_ok());
+        assert!(validate_bind_count(5_957, 0).is_ok());
         assert!(matches!(
-            validate_bind_count(0, 5_958, 0),
+            validate_bind_count(5_958, 0),
             Err(PersistenceError::UnknownError(_))
         ));
-        assert!(validate_bind_count(usize::MAX, 1, 0).is_err());
+        assert!(validate_bind_count(usize::MAX, 0).is_err());
     }
 
     #[cfg(target_pointer_width = "64")]

@@ -285,8 +285,18 @@ for safe structured error logging. Unknown formats stay `pending` without being
 claimed.
 
 Background polling comes from `cqrs-runtime`'s `worker` feature. Its Tokio
-supervisor owns bounded worker mailboxes, cancellation, polling and worker
-restarts. `main` composes the runtime queue, coordinator, business handler
+supervisor owns one bounded shared Tokio mpsc queue and a JoinSet of permanent
+Tokio workers. Each worker exclusively owns its mutable registry; lock the shared
+receiver only during recv, never during handler/settlement. Configure process-wide
+concurrency and queue capacity independently of CPU threads (defaults 128/128).
+Reserve channel permits before claim so batches cannot create a hidden buffer.
+Defaults use a 120-second lease; validate queued waves with checked arithmetic:
+lease > 2*S + H + 5s + ceil(Q/C)*(H+S). Original deadlines remain authoritative.
+Observe exits through JoinSet and rebuild one checked registry per replacement;
+never log panic payloads. Normal shutdown and restart-factory errors share bounded
+H+S draining of started work only; queued claims remain for recovery. Abort and
+observe remaining tasks after the deadline. Keep watch<bool> for host shutdown;
+false updates do not stop the pool. Recovery batches are capped at min(C, 32). `main` composes the runtime queue, coordinator, business handler
 factory, and supervisor alongside HTTP. Configuration parsing and validation
 stay in the runtime crate so they remain testable and covered.
 
@@ -298,10 +308,19 @@ It is the canonical portable contract; keep it with the runtime when moving
 the engine to another project.
 
 Preserve this project's aggregate-owned business sequence and one-operation
-Task invariant. Sender ports and business outcome classification belong to
+Task invariant. Import runtime APIs through its public `command`, `outbox`,
+`postgres`, and `worker` facades; child modules are private. Task DTOs and
+configs are created through checked constructors/builders, not public-field
+mutation. `SettlementRequest` is intent; `SettlementResult` is a confirmed
+transition. Do not equate scheduled retry with completed work. Registry factories
+are fallible; supervisor errors are distinct from config validation errors.
+Keep alternate lifecycle states in enums, and keep deadline/SQL loops explicit
+where cancellation or partial results matter.
+
+Sender ports and business outcome classification belong to
 application; delivery, storage deadlines, lease budgets, lock tokens, and
-`lease_deadline` belong to the runtime/queue adapter. Business handlers must not
-construct, reset, or change lease context. Configuration parsing/validation
+monotonic claim deadlines belong to the runtime/queue adapter. Business handlers receive only immutable `TaskDelivery`, not queue ownership.
+`ClaimedTask` and `ClaimLease` remain platform context. Configuration parsing/validation
 stays in `cqrs-runtime`; `main` loads explicit configs and validates the combined
 lease budget before accepting traffic. Update the runtime guide and API rustdoc
 together when changing this lasting contract.
@@ -353,7 +372,10 @@ account-managements-service/src/
 - Runtime unit tests use local dummy aggregate, task, error, and handler types;
   they must not import the service. Test executor retry/error behavior, payload
   construction, coordinator timeout/retry, registry routing, and worker
-  supervision beside their runtime modules.
+  supervision in inline `#[cfg(test)] mod tests { ... }` blocks in the module
+  file they exercise. Do not create separate `tests.rs` child files for unit
+  tests. A shared private `test_support` module may hold reusable runtime fakes;
+  integration suites remain under the crate's `tests/` directory.
 - `cqrs-runtime/tests/postgres.rs` roots the PostgreSQL suite. Its
   `postgres/support.rs` owns the shared database fixture; persistence, queue,
   processing and worker modules own persisted behavior. Service gateway tests

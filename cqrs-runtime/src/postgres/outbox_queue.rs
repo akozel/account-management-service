@@ -10,11 +10,11 @@ use std::time::Duration;
 
 use async_trait::async_trait;
 use sqlx::{PgPool, Postgres, Row, Transaction};
-use thiserror::Error;
 use tokio::time::Instant;
 
 use crate::outbox::{
-    ClaimedTask, FailedTask, OutboxError, OutboxQueue, RecoveryResult, SettleResult, TaskFormat, TaskOutcome, retry_delay,
+    ClaimLease, ClaimedTask, LeaseRecoveryReport, OutboxError, OutboxQueue, QueueRequestError, SettlementRequest,
+    SettlementResult, TaskDelivery, TaskFailure, TaskFailureCause, TaskFormat, redelivery_backoff,
 };
 
 pub struct PostgresOutboxQueue {
@@ -22,60 +22,13 @@ pub struct PostgresOutboxQueue {
     statement_timeout: Duration,
 }
 
-/// PostgreSQL queue SQL budgets, separate from coordinator storage deadlines.
-/// Defaults do not read environment variables; use [`Self::from_env`] explicitly.
-#[derive(Clone, Debug)]
-pub struct PostgresOutboxQueueConfig {
-    /// Per-statement server budget, including lock waiting; scoped to queue transactions.
-    pub statement_timeout: Duration,
-}
-
-#[derive(Debug, Error, PartialEq, Eq)]
-#[error("invalid PostgreSQL outbox configuration: {0}")]
-pub struct PostgresOutboxQueueConfigError(pub &'static str);
-
-impl Default for PostgresOutboxQueueConfig {
-    fn default() -> Self {
-        Self {
-            statement_timeout: Duration::from_secs(4),
-        }
-    }
-}
-
-impl PostgresOutboxQueueConfig {
-    pub fn from_env() -> Result<Self, PostgresOutboxQueueConfigError> {
-        Self::from_lookup(|name| std::env::var(name).ok())
-    }
-
-    pub fn from_lookup(mut lookup: impl FnMut(&str) -> Option<String>) -> Result<Self, PostgresOutboxQueueConfigError> {
-        let millis = match lookup("OUTBOX_POSTGRES_STATEMENT_TIMEOUT_MS") {
-            Some(value) => value
-                .parse::<u64>()
-                .map_err(|_| PostgresOutboxQueueConfigError("OUTBOX_POSTGRES_STATEMENT_TIMEOUT_MS"))?,
-            None => 4_000,
-        };
-        let config = Self {
-            statement_timeout: Duration::from_millis(millis),
-        };
-        config.validate()?;
-        Ok(config)
-    }
-
-    pub fn validate(&self) -> Result<(), PostgresOutboxQueueConfigError> {
-        if self.statement_timeout.as_millis() == 0 || self.statement_timeout.as_millis() > i32::MAX as u128 {
-            return Err(PostgresOutboxQueueConfigError(
-                "statement timeout must be 1..=2147483647 milliseconds",
-            ));
-        }
-        Ok(())
-    }
-}
-
+mod config;
+pub use config::{PostgresOutboxQueueConfig, PostgresOutboxQueueConfigError};
 impl PostgresOutboxQueue {
     pub fn new(pool: PgPool) -> Self {
         Self {
             pool,
-            statement_timeout: PostgresOutboxQueueConfig::default().statement_timeout,
+            statement_timeout: PostgresOutboxQueueConfig::default().statement_timeout(),
         }
     }
 
@@ -83,11 +36,11 @@ impl PostgresOutboxQueue {
         config.validate()?;
         Ok(Self {
             pool,
-            statement_timeout: config.statement_timeout,
+            statement_timeout: config.statement_timeout(),
         })
     }
 
-    async fn transaction(&self) -> Result<Transaction<'_, Postgres>, OutboxError> {
+    async fn begin_queue_transaction(&self) -> Result<Transaction<'_, Postgres>, OutboxError> {
         let mut tx = self.pool.begin().await.map_err(storage_error)?;
         // Transaction-local settings never change the shared pool's session defaults.
         sqlx::query("SELECT set_config('statement_timeout', $1, true)")
@@ -103,10 +56,10 @@ fn storage_error(_: sqlx::Error) -> OutboxError {
     OutboxError::Unavailable
 }
 
-fn milliseconds(duration: Duration) -> Result<f64, OutboxError> {
+fn milliseconds(duration: Duration, invalid: QueueRequestError) -> Result<f64, OutboxError> {
     i64::try_from(duration.as_millis())
         .map(|n| n as f64)
-        .map_err(|_| OutboxError::InvalidTask)
+        .map_err(|_| OutboxError::from(invalid))
 }
 
 #[async_trait]
@@ -116,16 +69,18 @@ impl OutboxQueue for PostgresOutboxQueue {
         format: &TaskFormat,
         owner: &str,
         limit: usize,
-        lease: Duration,
+        lease_duration: Duration,
     ) -> Result<Vec<ClaimedTask>, OutboxError> {
-        if lease.as_millis() == 0 {
-            return Err(OutboxError::InvalidTask);
+        if lease_duration.as_millis() == 0 {
+            return Err(QueueRequestError::InvalidLeaseDuration.into());
         }
         // PostgreSQL grants its lease later, during UPDATE. Starting our local
         // clock before any await gives a conservative bound without UTC skew.
-        let lease_deadline = Instant::now().checked_add(lease).ok_or(OutboxError::InvalidTask)?;
-        let limit = i64::try_from(limit).map_err(|_| OutboxError::InvalidTask)?;
-        let mut tx = self.transaction().await?;
+        let lease_deadline = Instant::now()
+            .checked_add(lease_duration)
+            .ok_or(QueueRequestError::InvalidLeaseDuration)?;
+        let limit = i64::try_from(limit).map_err(|_| OutboxError::from(QueueRequestError::InvalidLimit))?;
+        let mut tx = self.begin_queue_transaction().await?;
         let rows = sqlx::query(
             r#"
             WITH ready AS (
@@ -142,40 +97,46 @@ impl OutboxQueue for PostgresOutboxQueue {
             RETURNING o.id, o.payload, o.metadata, o.attempts, o.lock_token
         "#,
         )
-        .bind(&format.task_type)
-        .bind(format.task_version)
+        .bind(format.task_type())
+        .bind(format.task_version())
         .bind(limit)
         .bind(owner)
-        .bind(milliseconds(lease)?)
+        .bind(milliseconds(lease_duration, QueueRequestError::InvalidLeaseDuration)?)
         .fetch_all(&mut *tx)
         .await
         .map_err(storage_error)?;
         let tasks = rows
             .into_iter()
             .map(|row| {
-                Ok(ClaimedTask {
-                    id: row.try_get("id")?,
-                    format: format.clone(),
-                    payload: row.try_get("payload")?,
-                    metadata: row.try_get("metadata")?,
-                    attempt: row.try_get("attempts")?,
-                    lock_token: row.try_get("lock_token")?,
-                    lease_deadline,
-                })
+                let delivery = TaskDelivery::new(
+                    row.try_get("id").map_err(storage_error)?,
+                    format.clone(),
+                    row.try_get("payload").map_err(storage_error)?,
+                    row.try_get("metadata").map_err(storage_error)?,
+                    row.try_get("attempts").map_err(storage_error)?,
+                )
+                .map_err(|_| QueueRequestError::InvalidDelivery)?;
+                Ok(ClaimedTask::new(
+                    delivery,
+                    ClaimLease::new(row.try_get("lock_token").map_err(storage_error)?, lease_deadline),
+                ))
             })
-            .collect::<Result<Vec<_>, sqlx::Error>>()
-            .map_err(storage_error)?;
+            .collect::<Result<Vec<_>, OutboxError>>()?;
         tx.commit().await.map_err(storage_error)?;
         Ok(tasks)
     }
 
-    async fn settle(&self, task: &ClaimedTask, outcome: TaskOutcome) -> Result<SettleResult, OutboxError> {
-        let mut tx = self.transaction().await?;
-        let retry = matches!(outcome, TaskOutcome::Retry { .. });
-        let (status, delay, error) = match outcome {
-            TaskOutcome::Completed => ("completed", Duration::ZERO, None),
-            TaskOutcome::Retry { delay, reason } => ("pending", delay, Some(reason)),
-            TaskOutcome::Failed { reason } => ("failed", Duration::ZERO, Some(reason)),
+    async fn settle(&self, task: &ClaimedTask, request: SettlementRequest) -> Result<SettlementResult, OutboxError> {
+        let mut tx = self.begin_queue_transaction().await?;
+        let failure_cause = match &request {
+            SettlementRequest::Completed => None,
+            SettlementRequest::Retry { .. } => Some(TaskFailureCause::AttemptLimitReached),
+            SettlementRequest::Failed { .. } => Some(TaskFailureCause::HandlerPermanent),
+        };
+        let (status, delay, error) = match request {
+            SettlementRequest::Completed => ("completed", Duration::ZERO, None),
+            SettlementRequest::Retry { delay, reason } => ("pending", delay, Some(reason)),
+            SettlementRequest::Failed { reason } => ("failed", Duration::ZERO, Some(reason)),
         };
         let row = sqlx::query(r#"
             UPDATE transactional_outbox
@@ -185,25 +146,29 @@ impl OutboxQueue for PostgresOutboxQueue {
                 last_error = $5, locked_by = NULL, lock_token = NULL, locked_until = NULL
             WHERE id = $1 AND lock_token = $2 AND status = 'processing' AND locked_until > clock_timestamp()
             RETURNING status
-        "#).bind(task.id).bind(task.lock_token).bind(status).bind(milliseconds(delay)?)
+        "#).bind(task.delivery().id()).bind(task.lease().lock_token()).bind(status).bind(milliseconds(delay, QueueRequestError::InvalidRetryDelay)?)
             .bind(error.map(|e| e.chars().take(2048).collect::<String>()))
             .fetch_optional(&mut *tx).await.map_err(storage_error)?;
         tx.commit().await.map_err(storage_error)?;
         let Some(row) = row else {
-            return Ok(SettleResult::OwnershipLost);
+            return Ok(SettlementResult::OwnershipLost);
         };
         let status: String = row.try_get("status").map_err(storage_error)?;
-        let failed = (status == "failed").then(|| FailedTask {
-            id: task.id,
-            format: task.format.clone(),
-            attempt: task.attempt,
-            reason: if retry { "retry limit reached" } else { "permanent failure" },
-        });
-        Ok(SettleResult::Settled { failed })
+        match status.as_str() {
+            "completed" => Ok(SettlementResult::Completed),
+            "pending" => Ok(SettlementResult::RetryScheduled),
+            "failed" => Ok(SettlementResult::Failed(TaskFailure {
+                id: task.delivery().id(),
+                format: task.delivery().format().clone(),
+                attempt: task.delivery().attempt(),
+                cause: failure_cause.ok_or(QueueRequestError::InvalidDelivery)?,
+            })),
+            _ => Err(QueueRequestError::InvalidDelivery.into()),
+        }
     }
 
-    async fn recover_expired(&self, limit: usize) -> Result<RecoveryResult, OutboxError> {
-        let mut tx = self.transaction().await?;
+    async fn recover_expired(&self, limit: usize) -> Result<LeaseRecoveryReport, OutboxError> {
+        let mut tx = self.begin_queue_transaction().await?;
         let rows = sqlx::query(
             r#"
             SELECT id, task_type, task_version, attempts, max_attempts FROM transactional_outbox
@@ -211,7 +176,7 @@ impl OutboxQueue for PostgresOutboxQueue {
             ORDER BY locked_until, id LIMIT $1 FOR UPDATE SKIP LOCKED
         "#,
         )
-        .bind(i64::try_from(limit).map_err(|_| OutboxError::InvalidTask)?)
+        .bind(i64::try_from(limit).map_err(|_| OutboxError::from(QueueRequestError::InvalidLimit))?)
         .fetch_all(&mut *tx)
         .await
         .map_err(storage_error)?;
@@ -231,27 +196,28 @@ impl OutboxQueue for PostgresOutboxQueue {
             "#,
             )
             .bind(id)
-            .bind(milliseconds(retry_delay(attempt))?)
+            .bind(milliseconds(
+                redelivery_backoff(attempt),
+                QueueRequestError::InvalidRetryDelay,
+            )?)
             .execute(&mut *tx)
             .await
             .map_err(storage_error)?;
             if attempt >= max_attempts {
-                failed.push(FailedTask {
+                failed.push(TaskFailure {
                     id,
-                    format: TaskFormat {
-                        task_type: row.try_get("task_type").map_err(storage_error)?,
-                        task_version: row.try_get("task_version").map_err(storage_error)?,
-                    },
+                    format: TaskFormat::new(
+                        row.try_get::<String, _>("task_type").map_err(storage_error)?,
+                        row.try_get("task_version").map_err(storage_error)?,
+                    )
+                    .map_err(|_| QueueRequestError::InvalidDelivery)?,
                     attempt,
-                    reason: "worker lease expired",
+                    cause: TaskFailureCause::LeaseExpired,
                 });
             }
         }
         tx.commit().await.map_err(storage_error)?;
-        Ok(RecoveryResult {
-            recovered: rows.len() as u64,
-            failed,
-        })
+        Ok(LeaseRecoveryReport::new(rows.len() - failed.len(), failed))
     }
 }
 
@@ -262,13 +228,13 @@ mod tests {
     #[tokio::test]
     async fn statement_timeout_config_validates_defaults_overrides_and_server_range() {
         assert_eq!(
-            PostgresOutboxQueueConfig::from_lookup(|_| None).unwrap().statement_timeout,
+            PostgresOutboxQueueConfig::from_lookup(|_| None).unwrap().statement_timeout(),
             Duration::from_secs(4)
         );
         assert_eq!(
             PostgresOutboxQueueConfig::from_lookup(|_| Some("125".into()))
                 .unwrap()
-                .statement_timeout,
+                .statement_timeout(),
             Duration::from_millis(125)
         );
         assert!(PostgresOutboxQueueConfig::from_lookup(|_| Some(i32::MAX.to_string())).is_ok());
@@ -276,19 +242,7 @@ mod tests {
             assert!(PostgresOutboxQueueConfig::from_lookup(|_| Some(value.into())).is_err());
         }
         for statement_timeout in [Duration::ZERO, Duration::from_nanos(1), Duration::MAX] {
-            assert!(PostgresOutboxQueueConfig { statement_timeout }.validate().is_err());
+            assert!(PostgresOutboxQueueConfig::new(statement_timeout).is_err());
         }
-        let pool = sqlx::postgres::PgPoolOptions::new()
-            .connect_lazy("postgresql://localhost/test")
-            .unwrap();
-        assert!(
-            PostgresOutboxQueue::with_config(
-                pool,
-                PostgresOutboxQueueConfig {
-                    statement_timeout: Duration::ZERO
-                }
-            )
-            .is_err()
-        );
     }
 }

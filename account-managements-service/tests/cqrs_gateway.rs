@@ -118,10 +118,10 @@ async fn conflict_retry_reuses_one_framework_and_reloads_before_returning_domain
     let gateway = CqrsEmailReservationGateway::new(
         move |tasks: Vec<NewOutboxTask>| {
             built.fetch_add(1, Ordering::SeqCst);
-            observed_task_ids.lock().unwrap().extend(tasks.iter().map(|task| task.id));
+            observed_task_ids.lock().unwrap().extend(tasks.iter().map(|task| task.id()));
             CqrsFramework::new(store.clone(), Vec::new(), ())
         },
-        AggregateConflictRetryPolicy::new(3, Duration::ZERO, Duration::ZERO, 0.0),
+        AggregateConflictRetryPolicy::new(3, Duration::ZERO, Duration::ZERO, 0.0).unwrap(),
     );
     let command = EmailReservationCommand::ReserveEmail {
         email: email.clone(),
@@ -142,6 +142,6 @@ async fn conflict_retry_reuses_one_framework_and_reloads_before_returning_domain
     assert_eq!(builds.load(Ordering::SeqCst), 1);
     assert_eq!(loads.load(Ordering::SeqCst), 2);
     assert_eq!(commits.load(Ordering::SeqCst), 1);
-    assert_eq!(*task_ids.lock().unwrap(), vec![task.id]);
+    assert_eq!(*task_ids.lock().unwrap(), vec![task.id()]);
     assert_eq!(inner.load_events("alice@example.com").await.unwrap().len(), 1);
 }

@@ -1,4 +1,5 @@
 use super::*;
+use cqrs_runtime::outbox::TaskDelivery;
 
 pub(super) struct Database {
     pub(super) pool: PgPool,
@@ -41,7 +42,7 @@ pub(super) fn new_task() -> NewOutboxTask {
     .unwrap()
 }
 pub(super) fn format() -> TaskFormat {
-    TaskFormat::of::<DummyTaskV1>()
+    TaskFormat::of::<DummyTaskV1>().unwrap()
 }
 
 #[derive(Clone, Debug, Serialize, Deserialize)]
@@ -115,7 +116,7 @@ pub(super) async fn enqueue(pool: &PgPool, tasks: Vec<NewOutboxTask>) {
 }
 
 pub(super) struct TestHandler {
-    pub(super) outcome: Result<(), TaskExecutionError>,
+    pub(super) outcome: Result<(), TaskHandlerError>,
 }
 
 #[async_trait]
@@ -124,12 +125,12 @@ impl TaskHandler for TestHandler {
         vec![format()]
     }
 
-    async fn handle(&mut self, _: &ClaimedTask) -> Result<(), TaskExecutionError> {
+    async fn handle(&mut self, _: &TaskDelivery) -> Result<(), TaskHandlerError> {
         self.outcome.clone()
     }
 }
 
-pub(super) fn handler(outcome: Result<(), TaskExecutionError>) -> TestHandler {
+pub(super) fn handler(outcome: Result<(), TaskHandlerError>) -> TestHandler {
     TestHandler { outcome }
 }
 
@@ -141,7 +142,7 @@ impl TaskHandler for HangingHandler {
         vec![format()]
     }
 
-    async fn handle(&mut self, _: &ClaimedTask) -> Result<(), TaskExecutionError> {
+    async fn handle(&mut self, _: &TaskDelivery) -> Result<(), TaskHandlerError> {
         std::future::pending().await
     }
 }
@@ -154,7 +155,7 @@ impl TaskHandler for CountingHandler {
         vec![format()]
     }
 
-    async fn handle(&mut self, _: &ClaimedTask) -> Result<(), TaskExecutionError> {
+    async fn handle(&mut self, _: &TaskDelivery) -> Result<(), TaskHandlerError> {
         self.0.fetch_add(1, Ordering::SeqCst);
         Ok(())
     }

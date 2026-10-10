@@ -12,15 +12,15 @@ pub use create_account::v1::CreateAccountTaskV1;
 pub use record_account_created::v1::RecordAccountCreatedTaskV1;
 
 use crate::application::user_account::service::ContinuationError;
-use cqrs_runtime::outbox::TaskExecutionError;
+use cqrs_runtime::outbox::TaskHandlerError;
 
-fn delivery_error(error: ContinuationError) -> TaskExecutionError {
+fn delivery_error(error: ContinuationError) -> TaskHandlerError {
     match error {
-        ContinuationError::Retry => TaskExecutionError::Retry {
+        ContinuationError::Retry => TaskHandlerError::Retry {
             reason: "registration continuation temporarily unavailable".into(),
             retry_after: None,
         },
-        ContinuationError::Permanent => TaskExecutionError::Permanent {
+        ContinuationError::Permanent => TaskHandlerError::Permanent {
             reason: "registration continuation data does not match".into(),
         },
     }

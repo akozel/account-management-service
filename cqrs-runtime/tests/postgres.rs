@@ -19,12 +19,12 @@ use cqrs_es::{
 #[cfg(feature = "worker")]
 use cqrs_runtime::{
     outbox::TaskHandlerRegistry,
-    worker::{self as outbox_worker_pool, OutboxWorkerPoolConfig, TaskHandlerFactory},
+    worker::{self as outbox_worker_pool, HandlerRegistryFactory, OutboxWorkerPoolConfig},
 };
 use cqrs_runtime::{
     outbox::{
-        ClaimedTask, NewOutboxTask, OutboxError, OutboxQueue, Schedule, TaskExecutionError, TaskFormat, TaskHandler, TaskOutcome,
-        TaskPayload, outbox_task_coordinator,
+        ClaimedTask, NewOutboxTask, OutboxError, OutboxQueue, SettlementRequest, TaskFormat, TaskHandler, TaskHandlerError,
+        TaskPayload, TaskSchedule, outbox_task_coordinator,
     },
     postgres::{
         EVENT_STORE_SCHEMA, PostgresEventRepositoryWithOutbox, PostgresOutboxQueue, REQUEUE_FAILED_OUTBOX_TASK,

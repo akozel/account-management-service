@@ -1,3 +1,4 @@
+use cqrs_runtime::outbox::TaskDelivery;
 use std::sync::Mutex;
 
 use super::*;
@@ -10,11 +11,11 @@ impl TaskHandler for DummyHandler {
         vec![format()]
     }
 
-    async fn handle(&mut self, task: &ClaimedTask) -> Result<(), TaskExecutionError> {
-        let payload = serde_json::from_value::<DummyTaskV1>(task.payload.clone()).map_err(|_| TaskExecutionError::Permanent {
+    async fn handle(&mut self, task: &TaskDelivery) -> Result<(), TaskHandlerError> {
+        let payload = serde_json::from_value::<DummyTaskV1>(task.payload().clone()).map_err(|_| TaskHandlerError::Permanent {
             reason: "invalid dummy task payload".to_owned(),
         })?;
-        self.0.lock().unwrap().push((task.id, payload.value));
+        self.0.lock().unwrap().push((task.id(), payload.value));
         Ok(())
     }
 }
@@ -22,25 +23,25 @@ impl TaskHandler for DummyHandler {
 #[tokio::test]
 async fn two_live_workers_complete_every_supported_task_and_quarantine_bad_payloads() {
     let db = Database::new().await;
-    let mut first = new_task();
-    first.payload["value"] = json!("first");
-    let mut second = new_task();
-    second.payload["value"] = json!("second");
-    let mut bad = new_task();
-    bad.payload = json!({});
+    let first = NewOutboxTask::new(DummyTaskV1 { value: "first".into() }).unwrap();
+    let second = NewOutboxTask::new(DummyTaskV1 { value: "second".into() }).unwrap();
+    let bad = NewOutboxTask::from_payload(format(), json!({})).unwrap();
     enqueue(&db.pool, vec![first.clone(), second.clone(), bad.clone()]).await;
     let handled = Arc::new(Mutex::new(Vec::new()));
-    let factory: TaskHandlerFactory = Arc::new({
+    let factory: HandlerRegistryFactory = Arc::new({
         let handled = handled.clone();
-        move || TaskHandlerRegistry::try_new(vec![Box::new(DummyHandler(handled.clone()))]).unwrap()
+        move || TaskHandlerRegistry::try_new(vec![Box::new(DummyHandler(handled.clone()))])
     });
     let service = outbox_task_coordinator(Arc::new(PostgresOutboxQueue::new(db.pool.clone())), vec![format()]);
     let (stop, shutdown) = watch::channel(false);
-    let config = OutboxWorkerPoolConfig {
-        concurrency: 2,
-        poll_interval: Duration::from_millis(10),
-        ..Default::default()
-    };
+    let config = OutboxWorkerPoolConfig::new(
+        2,
+        2,
+        Duration::from_millis(10),
+        OutboxWorkerPoolConfig::default().handler_timeout(),
+        OutboxWorkerPoolConfig::default().lease_duration(),
+    )
+    .unwrap();
     let left = tokio::spawn(outbox_worker_pool::run(
         service.clone(),
         factory.clone(),
@@ -69,10 +70,10 @@ async fn two_live_workers_complete_every_supported_task_and_quarantine_bad_paylo
     let handled = handled.lock().unwrap().clone();
     assert_eq!(handled.len(), 2);
     for (task, expected) in [(first, "first"), (second, "second")] {
-        assert!(handled.contains(&(task.id, expected.to_owned())));
-        assert_eq!(row(&db.pool, task.id).await.get::<String, _>("status"), "completed");
+        assert!(handled.contains(&(task.id(), expected.to_owned())));
+        assert_eq!(row(&db.pool, task.id()).await.get::<String, _>("status"), "completed");
     }
-    assert_eq!(row(&db.pool, bad.id).await.get::<String, _>("status"), "failed");
+    assert_eq!(row(&db.pool, bad.id()).await.get::<String, _>("status"), "failed");
     db.close().await;
 }
 
@@ -83,13 +84,10 @@ async fn one_worker_pool_routes_two_registered_task_types() {
     #[async_trait]
     impl TaskHandler for AuditHandler {
         fn formats(&self) -> Vec<TaskFormat> {
-            vec![TaskFormat {
-                task_type: "audit".into(),
-                task_version: 1,
-            }]
+            vec![TaskFormat::new("audit", 1).unwrap()]
         }
 
-        async fn handle(&mut self, _: &ClaimedTask) -> Result<(), TaskExecutionError> {
+        async fn handle(&mut self, _: &TaskDelivery) -> Result<(), TaskHandlerError> {
             self.0.fetch_add(1, Ordering::SeqCst);
             Ok(())
         }
@@ -97,17 +95,13 @@ async fn one_worker_pool_routes_two_registered_task_types() {
 
     let db = Database::new().await;
     let dummy = new_task();
-    let mut audit = new_task();
-    audit.task_type = "audit".into();
-    audit.task_version = 1;
-    audit.payload = json!({"kind":"runtime"});
-    let mut unknown = new_task();
-    unknown.task_type = "future".into();
+    let audit = NewOutboxTask::from_payload(TaskFormat::new("audit", 1).unwrap(), json!({"kind":"runtime"})).unwrap();
+    let unknown = NewOutboxTask::from_payload(TaskFormat::new("future", 1).unwrap(), json!({"value":"runtime"})).unwrap();
     enqueue(&db.pool, vec![dummy.clone(), audit.clone(), unknown.clone()]).await;
 
     let handled = Arc::new(Mutex::new(Vec::new()));
     let audited = Arc::new(AtomicUsize::new(0));
-    let factory: TaskHandlerFactory = Arc::new({
+    let factory: HandlerRegistryFactory = Arc::new({
         let handled = handled.clone();
         let audited = audited.clone();
         move || {
@@ -115,24 +109,29 @@ async fn one_worker_pool_routes_two_registered_task_types() {
                 Box::new(DummyHandler(handled.clone())),
                 Box::new(AuditHandler(audited.clone())),
             ])
-            .unwrap()
         }
     });
-    let service = outbox_task_coordinator(Arc::new(PostgresOutboxQueue::new(db.pool.clone())), factory().formats());
+    let service = outbox_task_coordinator(
+        Arc::new(PostgresOutboxQueue::new(db.pool.clone())),
+        factory().unwrap().formats(),
+    );
     let (stop, shutdown) = watch::channel(false);
     let worker = tokio::spawn(outbox_worker_pool::run(
         service,
         factory,
-        OutboxWorkerPoolConfig {
-            concurrency: 2,
-            poll_interval: Duration::from_millis(10),
-            ..Default::default()
-        },
+        OutboxWorkerPoolConfig::new(
+            2,
+            2,
+            Duration::from_millis(10),
+            OutboxWorkerPoolConfig::default().handler_timeout(),
+            OutboxWorkerPoolConfig::default().lease_duration(),
+        )
+        .unwrap(),
         shutdown,
     ));
     tokio::time::timeout(Duration::from_secs(10), async {
-        while row(&db.pool, dummy.id).await.get::<String, _>("status") != "completed"
-            || row(&db.pool, audit.id).await.get::<String, _>("status") != "completed"
+        while row(&db.pool, dummy.id()).await.get::<String, _>("status") != "completed"
+            || row(&db.pool, audit.id()).await.get::<String, _>("status") != "completed"
         {
             tokio::time::sleep(Duration::from_millis(10)).await;
         }
@@ -143,7 +142,7 @@ async fn one_worker_pool_routes_two_registered_task_types() {
     worker.await.unwrap().unwrap();
     assert_eq!(handled.lock().unwrap().len(), 1);
     assert_eq!(audited.load(Ordering::SeqCst), 1);
-    assert_eq!(row(&db.pool, unknown.id).await.get::<String, _>("status"), "pending");
-    assert_eq!(row(&db.pool, unknown.id).await.get::<i32, _>("attempts"), 0);
+    assert_eq!(row(&db.pool, unknown.id()).await.get::<String, _>("status"), "pending");
+    assert_eq!(row(&db.pool, unknown.id()).await.get::<i32, _>("attempts"), 0);
     db.close().await;
 }

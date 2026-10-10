@@ -6,12 +6,15 @@ workspace as a path dependency. Copy the whole crate directory, including
 `Cargo.toml`, `src/`, `sql/`, `doc/`, and `tests/`.
 The crate requires Rust 1.98 or later and a Tokio runtime for async execution.
 
+See [Architecture and call flow](doc/architecture.md) for component
+responsibilities and Mermaid diagrams of command publication and task delivery.
+
 ## Features
 
 - Base: command execution, optimistic-conflict retry, durable task DTOs,
   handler routing, and task coordination.
 - `postgres`: event repository, queue, and canonical SQL assets.
-- `worker`: supervised Tokio polling, worker slots, and shutdown draining.
+- `worker`: JoinSet-supervised permanent Tokio workers, a bounded shared queue, and shutdown draining.
 
 Both optional features are enabled by default. Use
 `default-features = false` when only the base contracts are needed.
@@ -22,8 +25,9 @@ Read [Task processing](doc/task_processing.md) before implementing handlers or
 another queue adapter. It is the complete contract for ownership, ordering,
 idempotency, retry, configuration, timeouts, and leases.
 
-Business handlers perform one operation and classify its result. They do not
-manage `lease_deadline` or `lock_token`. Aggregates establish business
+Business handlers perform one operation through `TaskDelivery` and classify its
+result with `TaskHandlerError`. They cannot access the queue's `ClaimLease`.
+`ClaimedTask` is reserved for queue/coordinator ownership and settlement. Aggregates establish business
 prerequisites; workers may execute published tasks concurrently and out of
 order. Redelivery is expected, including after a successful effect.
 
@@ -39,14 +43,14 @@ use std::{error::Error, sync::Arc};
 use cqrs_runtime::{
     outbox::{OutboxTaskCoordinatorConfig, outbox_task_coordinator_with_config},
     postgres::{PostgresOutboxQueue, PostgresOutboxQueueConfig},
-    worker::{self, OutboxWorkerPoolConfig, TaskHandlerFactory},
+    worker::{self, OutboxWorkerPoolConfig, HandlerRegistryFactory},
 };
 use sqlx::PgPool;
 use tokio::sync::watch;
 
 pub async fn run_tasks(
     pool: PgPool,
-    factory: TaskHandlerFactory,
+    factory: HandlerRegistryFactory,
     shutdown: watch::Receiver<bool>,
 ) -> Result<(), Box<dyn Error + Send + Sync>> {
     let queue = Arc::new(PostgresOutboxQueue::with_config(
@@ -55,7 +59,7 @@ pub async fn run_tasks(
     )?);
     let coordinator = outbox_task_coordinator_with_config(
         queue,
-        factory().formats(),
+        factory()?.formats(),
         OutboxTaskCoordinatorConfig::from_env()?,
     )?;
     let config = OutboxWorkerPoolConfig::from_env()?;
@@ -66,7 +70,7 @@ pub async fn run_tasks(
 }
 ```
 
-Every factory invocation must return a fresh registry with the same ordered
+Every fallible factory invocation must return a fresh registry with the same ordered
 format list. Defaults do not read environment variables automatically: call
 `from_env` or pass explicit configurations as above. The guide lists every
 setting, its units/default, and the full lease-budget formula.
@@ -99,3 +103,42 @@ delivery; it must be addressed before relying on failure-safe replay.
 The queue does not purge/archive terminal tasks. A host must define retention
 and manual-recovery policies that preserve required failed work and the
 receiver's idempotency window.
+
+## Code organization and validated APIs
+
+The public namespaces are `command`, `outbox`, `postgres`, and `worker`;
+their child modules are private implementation details. Command execution and
+conflict retry are separate. Outbox modules group wire data, delivery/ownership,
+handler routing, queue transitions, and coordination. The worker groups config,
+supervision, and permanent worker lifecycle. PostgreSQL keeps queue SQL separate from the
+single-event write plan and its atomic CTE compiler.
+
+Unit tests stay in inline `#[cfg(test)] mod tests { ... }` blocks alongside
+the code they exercise; shared runtime fakes live in `outbox/test_support.rs`.
+PostgreSQL integration suites remain under `tests/postgres/`.
+
+`TaskFormat::new/of`, `NewOutboxTask` builders, and configuration constructors
+return typed validation errors. Their fields are private: use getters and
+checked builders, not struct literals. `AggregateConflictRetryPolicy::new` is
+also fallible; only representable backoff budgets are accepted.
+
+`SettlementRequest` expresses intent; `SettlementResult` distinguishes confirmed
+completion, scheduled retry, failure, and lost ownership. `TaskFailureCause`
+provides fixed safe log reasons, independent of persisted handler error text.
+`LeaseRecoveryReport` derives its total from retries and confirmed failures.
+
+`HandlerRegistryFactory` returns `Result<TaskHandlerRegistry, TaskHandlerRegistryError>`.
+`worker::run` reports `WorkerPoolError`, distinguishing configuration, registry
+construction, and format mismatch on startup or restart. It still supervises
+one mutable registry per permanent Tokio task and leaves interrupted work for recovery.
+Defaults are 128 concurrent deliveries, 128 queued deliveries, and a 120-second
+lease. `OUTBOX_QUEUE_CAPACITY` and `OUTBOX_WORKER_CONCURRENCY` are independent.
+The explicit worker config constructor now takes `queue_capacity` after
+`concurrency`; the combined lease validation includes queued waves.
+
+## Queue performance comparison
+
+See [Local worker queue performance](doc/queue_performance.md) for the manual
+release-mode comparison of the current worker receive path and bounded MPMC
+prototypes using async-channel, Flume and Kanal, including throughput and sampled
+queue-delay percentiles. The candidates are test-only dev-dependencies.

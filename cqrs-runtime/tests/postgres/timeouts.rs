@@ -1,4 +1,5 @@
 use super::*;
+use cqrs_runtime::outbox::ClaimLease;
 use cqrs_runtime::{
     outbox::{OutboxTaskCoordinatorConfig, outbox_task_coordinator_with_config},
     postgres::PostgresOutboxQueueConfig,
@@ -30,7 +31,11 @@ impl OutboxQueue for LostReplyQueue {
         Ok(result)
     }
 
-    async fn settle(&self, task: &ClaimedTask, outcome: TaskOutcome) -> Result<cqrs_runtime::outbox::SettleResult, OutboxError> {
+    async fn settle(
+        &self,
+        task: &ClaimedTask,
+        outcome: SettlementRequest,
+    ) -> Result<cqrs_runtime::outbox::SettlementResult, OutboxError> {
         let result = self.inner.settle(task, outcome).await?;
         if self.lose_settle_reply.load(Ordering::SeqCst) {
             std::future::pending::<()>().await;
@@ -38,7 +43,7 @@ impl OutboxQueue for LostReplyQueue {
         Ok(result)
     }
 
-    async fn recover_expired(&self, limit: usize) -> Result<cqrs_runtime::outbox::RecoveryResult, OutboxError> {
+    async fn recover_expired(&self, limit: usize) -> Result<cqrs_runtime::outbox::LeaseRecoveryReport, OutboxError> {
         self.inner.recover_expired(limit).await
     }
 }
@@ -57,19 +62,17 @@ async fn deadlines_after_committed_claim_or_settlement_preserve_durable_outcomes
     let coordinator = outbox_task_coordinator_with_config(
         queue.clone(),
         vec![format()],
-        OutboxTaskCoordinatorConfig {
-            storage_timeout: Duration::from_millis(200),
-        },
+        OutboxTaskCoordinatorConfig::new(Duration::from_millis(200)).unwrap(),
     )
     .unwrap();
     assert_eq!(
         coordinator.claim("test", 1, Duration::from_secs(60)).await.unwrap_err(),
         OutboxError::TimedOut
     );
-    assert_worker_state(&db.pool, task.id, "processing", 1, None).await;
-    expire(&db.pool, task.id).await;
-    assert_eq!(coordinator.recover_expired(1).await.unwrap().recovered, 1);
-    make_ready(&db.pool, task.id).await;
+    assert_worker_state(&db.pool, task.id(), "processing", 1, None).await;
+    expire(&db.pool, task.id()).await;
+    assert_eq!(coordinator.recover_expired(1).await.unwrap().processed_count(), 1);
+    make_ready(&db.pool, task.id()).await;
     queue.lose_claim_reply.store(false, Ordering::SeqCst);
     let owned = coordinator
         .claim("test", 1, Duration::from_secs(60))
@@ -77,15 +80,15 @@ async fn deadlines_after_committed_claim_or_settlement_preserve_durable_outcomes
         .unwrap()
         .pop()
         .unwrap();
-    assert_eq!(owned.id, task.id);
+    assert_eq!(owned.delivery().id(), task.id());
     assert_eq!(
         coordinator
             .execute_and_settle(&mut handler(Ok(())), owned, Duration::from_secs(1))
             .await,
         Err(OutboxError::TimedOut)
     );
-    assert_worker_state(&db.pool, task.id, "completed", 2, None).await;
-    assert_eq!(coordinator.recover_expired(1).await.unwrap().recovered, 0);
+    assert_worker_state(&db.pool, task.id(), "completed", 2, None).await;
+    assert_eq!(coordinator.recover_expired(1).await.unwrap().processed_count(), 0);
     assert!(
         coordinator
             .claim("test", 1, Duration::from_secs(60))
@@ -101,10 +104,7 @@ async fn delayed_batch_keeps_the_original_task_deadline_and_skips_expired_execut
     let db = Database::new().await;
     let task = new_task();
     enqueue(&db.pool, vec![task.clone()]).await;
-    let delayed_format = TaskFormat {
-        task_type: "delayed".into(),
-        task_version: 1,
-    };
+    let delayed_format = TaskFormat::new("delayed", 1).unwrap();
     let queue = Arc::new(LostReplyQueue {
         inner: PostgresOutboxQueue::new(db.pool.clone()),
         lose_claim_reply: std::sync::atomic::AtomicBool::new(false),
@@ -114,9 +114,7 @@ async fn delayed_batch_keeps_the_original_task_deadline_and_skips_expired_execut
     let coordinator = outbox_task_coordinator_with_config(
         queue.clone(),
         vec![format(), delayed_format],
-        OutboxTaskCoordinatorConfig {
-            storage_timeout: Duration::from_millis(300),
-        },
+        OutboxTaskCoordinatorConfig::new(Duration::from_millis(300)).unwrap(),
     )
     .unwrap();
     let old = coordinator
@@ -125,7 +123,7 @@ async fn delayed_batch_keeps_the_original_task_deadline_and_skips_expired_execut
         .unwrap()
         .pop()
         .unwrap();
-    assert!(old.lease_deadline <= tokio::time::Instant::now());
+    assert!(old.lease().deadline() <= tokio::time::Instant::now());
     let calls = Arc::new(AtomicUsize::new(0));
     assert_eq!(
         coordinator
@@ -134,23 +132,30 @@ async fn delayed_batch_keeps_the_original_task_deadline_and_skips_expired_execut
         Err(OutboxError::LeaseBudgetExhausted)
     );
     assert_eq!(calls.load(Ordering::SeqCst), 0);
-    assert_worker_state(&db.pool, task.id, "processing", 1, None).await;
+    assert_worker_state(&db.pool, task.id(), "processing", 1, None).await;
     // Force server expiry as well: the conservative local deadline may precede it.
-    expire(&db.pool, task.id).await;
-    assert_eq!(coordinator.recover_expired(1).await.unwrap().recovered, 1);
-    make_ready(&db.pool, task.id).await;
+    expire(&db.pool, task.id()).await;
+    assert_eq!(coordinator.recover_expired(1).await.unwrap().processed_count(), 1);
+    make_ready(&db.pool, task.id()).await;
     let fresh = claim(&queue.inner).await.pop().unwrap();
-    assert_ne!(old.lock_token, fresh.lock_token);
-    assert!(!queue.inner.settle(&old, TaskOutcome::Completed).await.unwrap().is_settled());
+    assert_ne!(old.lease().lock_token(), fresh.lease().lock_token());
+    assert!(
+        !queue
+            .inner
+            .settle(&old, SettlementRequest::Completed)
+            .await
+            .unwrap()
+            .is_applied()
+    );
     assert!(
         coordinator
             .execute_and_settle(&mut CountingHandler(calls.clone()), fresh, Duration::from_secs(1))
             .await
             .unwrap()
-            .is_settled()
+            .is_applied()
     );
     assert_eq!(calls.load(Ordering::SeqCst), 1);
-    assert_worker_state(&db.pool, task.id, "completed", 2, None).await;
+    assert_worker_state(&db.pool, task.id(), "completed", 2, None).await;
     db.close().await;
 }
 
@@ -163,9 +168,7 @@ async fn insufficient_remaining_lease_returns_task_to_retry_without_performing_i
     let coordinator = outbox_task_coordinator_with_config(
         queue.clone(),
         vec![format()],
-        OutboxTaskCoordinatorConfig {
-            storage_timeout: Duration::from_millis(300),
-        },
+        OutboxTaskCoordinatorConfig::new(Duration::from_millis(300)).unwrap(),
     )
     .unwrap();
     let mut old = coordinator
@@ -176,43 +179,49 @@ async fn insufficient_remaining_lease_returns_task_to_retry_without_performing_i
         .unwrap();
     // Model dispatch delay using a shorter conservative local budget; the DB
     // ownership remains live, so the original attempt can safely request retry.
-    old.lease_deadline = tokio::time::Instant::now() + Duration::from_secs(10);
+    old = ClaimedTask::new(
+        old.delivery().clone(),
+        ClaimLease::new(
+            old.lease().lock_token(),
+            tokio::time::Instant::now() + Duration::from_secs(10),
+        ),
+    );
     let calls = Arc::new(AtomicUsize::new(0));
     assert!(
         coordinator
             .execute_and_settle(&mut CountingHandler(calls.clone()), old.clone(), Duration::from_secs(30))
             .await
             .unwrap()
-            .is_settled()
+            .is_applied()
     );
     assert_eq!(calls.load(Ordering::SeqCst), 0);
     assert_worker_state(
         &db.pool,
-        task.id,
+        task.id(),
         "pending",
         1,
         Some("insufficient lease budget before handler execution"),
     )
     .await;
-    make_ready(&db.pool, task.id).await;
+    make_ready(&db.pool, task.id()).await;
     let fresh = coordinator
         .claim("test", 1, Duration::from_secs(60))
         .await
         .unwrap()
         .pop()
         .unwrap();
-    assert_eq!(fresh.id, old.id);
-    assert_eq!(fresh.payload, old.payload);
-    assert_ne!(fresh.lock_token, old.lock_token);
+    assert_eq!(fresh.delivery().id(), old.delivery().id());
+    assert_eq!(fresh.delivery().payload(), old.delivery().payload());
+    assert_ne!(fresh.lease().lock_token(), old.lease().lock_token());
     assert!(
         coordinator
             .execute_and_settle(&mut CountingHandler(calls.clone()), fresh, Duration::from_secs(30))
             .await
             .unwrap()
-            .is_settled()
+            .is_applied()
     );
     assert_eq!(calls.load(Ordering::SeqCst), 1);
-    assert_worker_state(&db.pool, task.id, "completed", 2, None).await;
+    assert_worker_state(&db.pool, task.id(), "completed", 2, None).await;
     db.close().await;
 }
 
@@ -232,9 +241,7 @@ async fn server_timeout_bounds_queue_lock_waits_rolls_back_and_restores_pool_set
     sqlx::query("SET statement_timeout = '10s'").execute(&pool).await.unwrap();
     let queue = PostgresOutboxQueue::with_config(
         pool.clone(),
-        PostgresOutboxQueueConfig {
-            statement_timeout: Duration::from_millis(100),
-        },
+        PostgresOutboxQueueConfig::new(Duration::from_millis(100)).unwrap(),
     )
     .unwrap();
 
@@ -247,7 +254,7 @@ async fn server_timeout_bounds_queue_lock_waits_rolls_back_and_restores_pool_set
 
     for operation in ["claim", "settle", "recovery"] {
         if operation == "recovery" {
-            expire(&db.pool, processing.id).await;
+            expire(&db.pool, processing.id()).await;
         }
         let mut blocker = db.pool.begin().await.unwrap();
         sqlx::query("LOCK TABLE transactional_outbox IN ACCESS EXCLUSIVE MODE")
@@ -257,7 +264,7 @@ async fn server_timeout_bounds_queue_lock_waits_rolls_back_and_restores_pool_set
         let result = tokio::time::timeout(Duration::from_secs(3), async {
             match operation {
                 "claim" => queue.claim(&format(), "test", 1, Duration::from_secs(60)).await.map(|_| ()),
-                "settle" => queue.settle(&owned, TaskOutcome::Completed).await.map(|_| ()),
+                "settle" => queue.settle(&owned, SettlementRequest::Completed).await.map(|_| ()),
                 _ => queue.recover_expired(1).await.map(|_| ()),
             }
         })
@@ -266,18 +273,18 @@ async fn server_timeout_bounds_queue_lock_waits_rolls_back_and_restores_pool_set
         assert_eq!(result, Err(OutboxError::Unavailable));
         blocker.rollback().await.unwrap();
         assert_session_timeout(&pool).await;
-        assert_worker_state(&db.pool, pending.id, "pending", 0, None).await;
-        assert_worker_state(&db.pool, processing.id, "processing", 1, None).await;
+        assert_worker_state(&db.pool, pending.id(), "pending", 0, None).await;
+        assert_worker_state(&db.pool, processing.id(), "processing", 1, None).await;
     }
 
-    assert_eq!(queue.recover_expired(1).await.unwrap().recovered, 1);
+    assert_eq!(queue.recover_expired(1).await.unwrap().processed_count(), 1);
     assert_session_timeout(&pool).await;
-    make_ready(&db.pool, processing.id).await;
+    make_ready(&db.pool, processing.id()).await;
     let tasks = queue.claim(&format(), "test", 2, Duration::from_secs(60)).await.unwrap();
     assert_eq!(tasks.len(), 2);
-    assert!(!queue.settle(&owned, TaskOutcome::Completed).await.unwrap().is_settled());
+    assert!(!queue.settle(&owned, SettlementRequest::Completed).await.unwrap().is_applied());
     for task in tasks {
-        assert!(queue.settle(&task, TaskOutcome::Completed).await.unwrap().is_settled());
+        assert!(queue.settle(&task, SettlementRequest::Completed).await.unwrap().is_applied());
     }
     assert_session_timeout(&pool).await;
     pool.close().await;
@@ -303,9 +310,7 @@ async fn server_timeout_cancels_slow_execution_and_claim_changes_are_rolled_back
     .unwrap();
     let queue = PostgresOutboxQueue::with_config(
         db.pool.clone(),
-        PostgresOutboxQueueConfig {
-            statement_timeout: Duration::from_millis(100),
-        },
+        PostgresOutboxQueueConfig::new(Duration::from_millis(100)).unwrap(),
     )
     .unwrap();
     let result = tokio::time::timeout(
@@ -315,14 +320,14 @@ async fn server_timeout_cancels_slow_execution_and_claim_changes_are_rolled_back
     .await
     .expect("the server must cancel slow execution before the test deadline");
     assert_eq!(result.unwrap_err(), OutboxError::Unavailable);
-    assert_worker_state(&db.pool, task.id, "pending", 0, None).await;
+    assert_worker_state(&db.pool, task.id(), "pending", 0, None).await;
     sqlx::raw_sql("DROP TRIGGER slow_outbox ON transactional_outbox; DROP FUNCTION slow_outbox_update();")
         .execute(&db.pool)
         .await
         .unwrap();
     let owned = claim(&queue).await.pop().unwrap();
-    assert!(queue.settle(&owned, TaskOutcome::Completed).await.unwrap().is_settled());
-    assert_worker_state(&db.pool, task.id, "completed", 1, None).await;
+    assert!(queue.settle(&owned, SettlementRequest::Completed).await.unwrap().is_applied());
+    assert_worker_state(&db.pool, task.id(), "completed", 1, None).await;
     db.close().await;
 }
 
@@ -339,9 +344,7 @@ async fn runtime_deadline_includes_connection_acquisition() {
     let coordinator = outbox_task_coordinator_with_config(
         queue,
         vec![format()],
-        OutboxTaskCoordinatorConfig {
-            storage_timeout: Duration::from_millis(200),
-        },
+        OutboxTaskCoordinatorConfig::new(Duration::from_millis(200)).unwrap(),
     )
     .unwrap();
     assert_eq!(
@@ -365,16 +368,16 @@ async fn runtime_deadline_includes_connection_acquisition() {
             .await,
         Err(OutboxError::TimedOut)
     );
-    assert_worker_state(&db.pool, task.id, "processing", 1, None).await;
+    assert_worker_state(&db.pool, task.id(), "processing", 1, None).await;
     drop(held_connection);
     assert!(
         coordinator
             .execute_and_settle(&mut handler(Ok(())), owned, Duration::from_secs(1))
             .await
             .unwrap()
-            .is_settled()
+            .is_applied()
     );
-    assert_worker_state(&db.pool, task.id, "completed", 1, None).await;
+    assert_worker_state(&db.pool, task.id(), "completed", 1, None).await;
     pool.close().await;
     db.close().await;
 }

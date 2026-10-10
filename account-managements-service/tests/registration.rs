@@ -1,3 +1,4 @@
+use cqrs_runtime::outbox::{ClaimLease, TaskDelivery};
 use std::{
     sync::{Arc, Mutex},
     time::Duration,
@@ -286,15 +287,10 @@ async fn tasks(pool: &PgPool, task_type: &str) -> Vec<(Uuid, Value)> {
 }
 
 fn claimed<T: TaskPayload>(row: &(Uuid, Value)) -> ClaimedTask {
-    ClaimedTask {
-        lease_deadline: tokio::time::Instant::now() + Duration::from_secs(60),
-        id: row.0,
-        format: TaskFormat::of::<T>(),
-        payload: row.1.clone(),
-        metadata: json!({}),
-        attempt: 1,
-        lock_token: Uuid::new_v4(),
-    }
+    ClaimedTask::new(
+        TaskDelivery::new(row.0, TaskFormat::of::<T>().unwrap(), row.1.clone(), json!({}), 1).unwrap(),
+        ClaimLease::new(Uuid::new_v4(), tokio::time::Instant::now() + Duration::from_secs(60)),
+    )
 }
 
 #[tokio::test]
@@ -413,8 +409,8 @@ async fn reused_http_token_is_rejected_while_create_task_redelivery_completes() 
         clock,
     );
     let queue = Arc::new(PostgresOutboxQueue::new(db.pool.clone()));
-    let coordinator = outbox_task_coordinator(queue, vec![TaskFormat::of::<CreateAccountTaskV1>()]);
-    let mut handler = create_account_task_handler(task_service);
+    let coordinator = outbox_task_coordinator(queue, vec![TaskFormat::of::<CreateAccountTaskV1>().unwrap()]);
+    let mut handler = create_account_task_handler(task_service).unwrap();
 
     let first = coordinator
         .claim("create-account-worker-1", 1, Duration::from_secs(30))
@@ -422,9 +418,9 @@ async fn reused_http_token_is_rejected_while_create_task_redelivery_completes() 
         .unwrap()
         .pop()
         .unwrap();
-    assert_eq!(first.id, create_task_id);
-    assert_eq!(first.attempt, 1);
-    handler.handle(&first).await.unwrap();
+    assert_eq!(first.delivery().id(), create_task_id);
+    assert_eq!(first.delivery().attempt(), 1);
+    handler.handle(first.delivery()).await.unwrap();
     assert_eq!(account_events(&db.pool, id(1)).await.len(), 1);
     assert_eq!(tasks(&db.pool, "record_account_created").await.len(), 1);
     let first_delivery_state: (String, i32) = sqlx::query_as("SELECT status, attempts FROM transactional_outbox WHERE id = $1")
@@ -445,7 +441,7 @@ async fn reused_http_token_is_rejected_while_create_task_redelivery_completes() 
         .await
         .unwrap();
     let recovery = coordinator.recover_expired(1).await.unwrap();
-    assert_eq!(recovery.recovered, 1);
+    assert_eq!(recovery.processed_count(), 1);
     sqlx::query("UPDATE transactional_outbox SET available_at = clock_timestamp() - interval '1 second' WHERE id = $1")
         .bind(create_task_id)
         .execute(&db.pool)
@@ -458,15 +454,15 @@ async fn reused_http_token_is_rejected_while_create_task_redelivery_completes() 
         .unwrap()
         .pop()
         .unwrap();
-    assert_eq!(second.id, create_task_id);
-    assert_eq!(second.attempt, 2);
-    assert_ne!(second.lock_token, first.lock_token);
+    assert_eq!(second.delivery().id(), create_task_id);
+    assert_eq!(second.delivery().attempt(), 2);
+    assert_ne!(second.lease().lock_token(), first.lease().lock_token());
     assert!(
         coordinator
             .execute_and_settle(handler.as_mut(), second, Duration::from_secs(1))
             .await
             .unwrap()
-            .is_settled()
+            .is_applied()
     );
     assert_eq!(*aggregate_rejections.lock().unwrap(), vec![UserAccountError::AlreadyCreated]);
     let completed: (String, i32, Option<String>, Option<DateTime<Utc>>) =
@@ -535,10 +531,10 @@ async fn profile_acceptance_creates_one_account_and_consumes_the_token() {
     );
     assert_eq!(email_events(&db.pool).await, first_events);
     assert_eq!(tasks(&db.pool, "create_account").await.len(), 1);
-    let mut create_handler = create_account_task_handler(service.clone());
+    let mut create_handler = create_account_task_handler(service.clone()).unwrap();
     let task = claimed::<CreateAccountTaskV1>(&create_tasks[0]);
-    create_handler.handle(&task).await.unwrap();
-    create_handler.handle(&task).await.unwrap();
+    create_handler.handle(task.delivery()).await.unwrap();
+    create_handler.handle(task.delivery()).await.unwrap();
     let account = account_events(&db.pool, id(1)).await;
     assert_eq!(account.len(), 1);
     let UserAccountEvent::AccountCreated {
@@ -583,9 +579,9 @@ async fn profile_acceptance_creates_one_account_and_consumes_the_token() {
         service.submit_profile(submission()).await,
         Err(SubmissionError::Domain(EmailReservationError::ProfileAlreadySubmitted))
     );
-    let mut completion_handler = record_account_created_task_handler(service.clone());
+    let mut completion_handler = record_account_created_task_handler(service.clone()).unwrap();
     completion_handler
-        .handle(&claimed::<RecordAccountCreatedTaskV1>(&completion[0]))
+        .handle(claimed::<RecordAccountCreatedTaskV1>(&completion[0]).delivery())
         .await
         .unwrap();
     assert_eq!(email_events(&db.pool).await.len(), 4);
@@ -670,30 +666,44 @@ async fn stale_or_mismatched_tasks_cannot_create_or_complete_accounts() {
     );
     service.submit_profile(submission()).await.unwrap();
     let mut malformed = claimed::<CreateAccountTaskV1>(&tasks(&db.pool, "create_account").await[0]);
-    malformed.payload = json!({});
+    malformed = with_payload(malformed, json!({}));
     assert!(matches!(
-        create_account_task_handler(service.clone()).handle(&malformed).await,
-        Err(cqrs_runtime::outbox::TaskExecutionError::Permanent { .. })
+        create_account_task_handler(service.clone())
+            .unwrap()
+            .handle(malformed.delivery())
+            .await,
+        Err(cqrs_runtime::outbox::TaskHandlerError::Permanent { .. })
     ));
-    malformed.format.task_version = 2;
+    malformed = with_format(
+        malformed.clone(),
+        TaskFormat::new(malformed.delivery().format().task_type(), 2).unwrap(),
+    );
     assert!(matches!(
-        create_account_task_handler(service.clone()).handle(&malformed).await,
-        Err(cqrs_runtime::outbox::TaskExecutionError::Permanent { .. })
+        create_account_task_handler(service.clone())
+            .unwrap()
+            .handle(malformed.delivery())
+            .await,
+        Err(cqrs_runtime::outbox::TaskHandlerError::Permanent { .. })
     ));
     let mut malformed_completion = claimed::<RecordAccountCreatedTaskV1>(&tasks(&db.pool, "create_account").await[0]);
-    malformed_completion.payload = json!({});
+    malformed_completion = with_payload(malformed_completion, json!({}));
     assert!(matches!(
         record_account_created_task_handler(service.clone())
-            .handle(&malformed_completion)
+            .unwrap()
+            .handle(malformed_completion.delivery())
             .await,
-        Err(cqrs_runtime::outbox::TaskExecutionError::Permanent { .. })
+        Err(cqrs_runtime::outbox::TaskHandlerError::Permanent { .. })
     ));
-    malformed_completion.format.task_version = 2;
+    malformed_completion = with_format(
+        malformed_completion.clone(),
+        TaskFormat::new(malformed_completion.delivery().format().task_type(), 2).unwrap(),
+    );
     assert!(matches!(
         record_account_created_task_handler(service.clone())
-            .handle(&malformed_completion)
+            .unwrap()
+            .handle(malformed_completion.delivery())
             .await,
-        Err(cqrs_runtime::outbox::TaskExecutionError::Permanent { .. })
+        Err(cqrs_runtime::outbox::TaskHandlerError::Permanent { .. })
     ));
     assert_eq!(
         service.record_account_created(missing.clone()).await,
@@ -934,21 +944,26 @@ async fn completion_task_recovers_account_committed_before_email_confirmation() 
     );
     failing.submit_profile(submission()).await.unwrap();
     let task_row = tasks(&db.pool, "create_account").await;
-    let mut handler = create_account_task_handler(failing.clone());
-    handler.handle(&claimed::<CreateAccountTaskV1>(&task_row[0])).await.unwrap();
+    let mut handler = create_account_task_handler(failing.clone()).unwrap();
+    handler
+        .handle(claimed::<CreateAccountTaskV1>(&task_row[0]).delivery())
+        .await
+        .unwrap();
     assert_eq!(account_events(&db.pool, id(1)).await.len(), 1);
     assert_eq!(email_events(&db.pool).await.len(), 3);
     let completion = tasks(&db.pool, "record_account_created").await;
     assert_eq!(completion.len(), 1);
     assert!(matches!(
         record_account_created_task_handler(failing)
-            .handle(&claimed::<RecordAccountCreatedTaskV1>(&completion[0]))
+            .unwrap()
+            .handle(claimed::<RecordAccountCreatedTaskV1>(&completion[0]).delivery())
             .await,
-        Err(cqrs_runtime::outbox::TaskExecutionError::Retry { .. })
+        Err(cqrs_runtime::outbox::TaskHandlerError::Retry { .. })
     ));
     let normal = registration(&db.pool, Arc::new(TestClock::new()));
     record_account_created_task_handler(normal.clone())
-        .handle(&claimed::<RecordAccountCreatedTaskV1>(&completion[0]))
+        .unwrap()
+        .handle(claimed::<RecordAccountCreatedTaskV1>(&completion[0]).delivery())
         .await
         .unwrap();
     assert_eq!(email_events(&db.pool).await.len(), 4);
@@ -1011,4 +1026,19 @@ async fn competing_completion_workers_record_one_event() {
     assert_eq!(email_events(&db.pool).await.len(), 4);
     assert_eq!(tasks(&db.pool, "record_account_created").await.len(), 1);
     db.close().await;
+}
+
+fn with_payload(task: ClaimedTask, payload: Value) -> ClaimedTask {
+    let d = task.delivery();
+    ClaimedTask::new(
+        TaskDelivery::new(d.id(), d.format().clone(), payload, d.metadata().clone(), d.attempt()).unwrap(),
+        task.lease().clone(),
+    )
+}
+fn with_format(task: ClaimedTask, format: TaskFormat) -> ClaimedTask {
+    let d = task.delivery();
+    ClaimedTask::new(
+        TaskDelivery::new(d.id(), format, d.payload().clone(), d.metadata().clone(), d.attempt()).unwrap(),
+        task.lease().clone(),
+    )
 }

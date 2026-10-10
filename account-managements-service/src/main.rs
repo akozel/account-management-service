@@ -66,16 +66,19 @@ async fn main() -> Result<(), RuntimeError> {
     ));
     let registration = registration_service(gateway.clone(), account_gateway, Arc::new(SystemRegistrationClock));
     let http_registration = registration.clone();
-    let handler_factory: worker::TaskHandlerFactory = Arc::new(move || {
+    let handler_factory: worker::HandlerRegistryFactory = Arc::new(move || {
         TaskHandlerRegistry::try_new(vec![
-            send_verification_code_task_handler(Box::new(ConsoleVerificationCodeSender::new(std::io::stdout()))),
-            create_account_task_handler(registration.clone()),
-            record_account_created_task_handler(registration.clone()),
+            send_verification_code_task_handler(Box::new(ConsoleVerificationCodeSender::new(std::io::stdout())))?,
+            create_account_task_handler(registration.clone())?,
+            record_account_created_task_handler(registration.clone())?,
         ])
-        .expect("valid outbox handler registry")
     });
-    let outbox = outbox_task_coordinator_with_config(queue, handler_factory().formats(), coordinator_config)
-        .expect("valid outbox coordinator configuration");
+    let outbox = outbox_task_coordinator_with_config(
+        queue,
+        handler_factory().expect("valid handler registry").formats(),
+        coordinator_config,
+    )
+    .expect("valid outbox coordinator configuration");
     let worker_config = worker::OutboxWorkerPoolConfig::from_env().expect("valid worker configuration");
     worker_config
         .validate_for_storage_timeout(outbox.storage_timeout())
