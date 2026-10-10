@@ -8,6 +8,13 @@ use serde_json::Value;
 use sqlx::{PgPool, Postgres, QueryBuilder, Row};
 use thiserror::Error;
 
+/// Commit one accepted event, its optional snapshot, and immutable tasks atomically.
+///
+/// Multi-event batches, snapshot-only writes, and tasks without an event are
+/// rejected. Bind a fresh repository/task list per command; share the pool.
+/// Reads/replay delegate to postgres-es. Its streaming producer may terminate
+/// on SQL failure without forwarding that error; EOF alone is not proof of
+/// successful projection replay. This limitation is separate from task delivery.
 pub struct PostgresEventRepositoryWithOutbox {
     pool: PgPool,
     reader: PostgresEventRepository,

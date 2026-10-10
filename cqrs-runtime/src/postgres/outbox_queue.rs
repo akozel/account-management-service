@@ -1,3 +1,11 @@
+//! PostgreSQL task ownership with transaction-local statement timeouts.
+//!
+//! Claims, recovery, and settlement use the canonical outbox schema. Each queue
+//! transaction applies its own statement timeout, including lock waiting, and
+//! restores the shared connection's previous settings on commit/rollback.
+//! The coordinator separately bounds pool acquisition, SQL, commit, and responses.
+//! Timeout does not establish rollback or cancel an already accepted remote effect.
+
 use std::time::Duration;
 
 use async_trait::async_trait;
@@ -14,6 +22,8 @@ pub struct PostgresOutboxQueue {
     statement_timeout: Duration,
 }
 
+/// PostgreSQL queue SQL budgets, separate from coordinator storage deadlines.
+/// Defaults do not read environment variables; use [`Self::from_env`] explicitly.
 #[derive(Clone, Debug)]
 pub struct PostgresOutboxQueueConfig {
     /// Per-statement server budget, including lock waiting; scoped to queue transactions.

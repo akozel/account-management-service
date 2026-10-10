@@ -13,6 +13,10 @@ use serde_json::Value;
 use std::time::Duration;
 use uuid::Uuid;
 
+/// Versioned application wire DTO, independently versioned from domain events.
+///
+/// PostgreSQL requires an object payload, a nonempty type, and a positive version.
+/// Keep older DTOs readable while their durable tasks can still be retried.
 pub trait TaskPayload: Serialize {
     const TASK_TYPE: &'static str;
     const TASK_VERSION: i32;
@@ -28,12 +32,14 @@ pub enum Schedule {
 
 #[derive(Clone, Debug, PartialEq)]
 pub struct NewOutboxTask {
+    /// Generated once for durable work; preserve on command retries and requeue.
     pub id: Uuid,
     pub task_type: String,
     pub task_version: i32,
     pub payload: Value,
     pub metadata: Value,
     pub schedule: Schedule,
+    /// Total claims, including the initial attempt; skipped execution also counts.
     pub max_attempts: i32,
 }
 

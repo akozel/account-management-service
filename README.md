@@ -51,8 +51,8 @@ Business sequence is enforced by aggregate phases and transition invariants.
 Dependent tasks are committed with the events that establish their
 prerequisites. Tasks may run concurrently and in any order, including tasks
 sharing a source aggregate or `aggregate_sequence`; workers do not serialize
-the business process. See the [task processing contract](doc/task_processing_contract.md)
-and [open worker questions](doc/known_issues/2026-10-10-task_worker_open_questions.md).
+the business process. See the [runtime task processing guide](cqrs-runtime/doc/task_processing.md).
+Current deployment limitations are tracked in [known issues](doc/known_issues).
 
 ## Workspace layout
 

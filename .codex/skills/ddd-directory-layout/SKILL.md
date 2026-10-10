@@ -144,7 +144,7 @@ prerequisite; aggregate state cannot stop an external Task already enqueued.
 Tasks from one aggregate, including Tasks sharing `aggregate_sequence`, may
 execute concurrently and in any order. Do not use queue settlement or a
 delivery-order flag as the aggregate's workflow state. See
-[`doc/task_processing_contract.md`](../../../doc/task_processing_contract.md).
+[`cqrs-runtime/doc/task_processing.md`](../../../cqrs-runtime/doc/task_processing.md).
 An already-applied command may return a distinct exact-repeat domain rejection;
 the TaskHandler interprets it for its own Task. The aggregate must distinguish
 that case from an existing record with different identity-defining data.

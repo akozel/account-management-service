@@ -31,6 +31,10 @@ pub trait OutboxTaskCoordinator: Send + Sync {
     fn storage_timeout(&self) -> Duration;
     async fn claim(&self, owner: &str, limit: usize, lease: Duration) -> Result<Vec<ClaimedTask>, OutboxError>;
     async fn recover_expired(&self, limit: usize) -> Result<RecoveryResult, OutboxError>;
+    /// Apply the invocation and remaining-lease budgets, then settle its outcome.
+    /// A settled result can be retry/pending; it is not necessarily completion.
+    /// LeaseBudgetExhausted skips unsafe execution/settlement and leaves recovery
+    /// to the durable queue. The handler never owns or renews platform leases.
     async fn execute_and_settle(
         &self,
         handler: &mut dyn TaskHandler,
@@ -39,6 +43,8 @@ pub trait OutboxTaskCoordinator: Send + Sync {
     ) -> Result<SettleResult, OutboxError>;
 }
 
+/// Coordinator storage budgets. Defaults do not read environment variables;
+/// use [`Self::from_env`] explicitly in the host's composition root.
 #[derive(Clone, Debug)]
 pub struct OutboxTaskCoordinatorConfig {
     /// End-to-end budget for claim (all formats), recovery, or settlement.
@@ -94,6 +100,7 @@ pub fn retry_delay(attempt: i32) -> Duration {
     Duration::from_secs_f64((base as f64 * jitter).min(300.0))
 }
 
+/// Compose a coordinator with default storage budgets, without reading the environment.
 pub fn outbox_task_coordinator(queue: Arc<dyn OutboxQueue>, formats: Vec<TaskFormat>) -> Arc<dyn OutboxTaskCoordinator> {
     Arc::new(DefaultOutboxTaskCoordinator::new(
         queue,
@@ -102,6 +109,7 @@ pub fn outbox_task_coordinator(queue: Arc<dyn OutboxQueue>, formats: Vec<TaskFor
     ))
 }
 
+/// Compose a coordinator with validated explicit budgets and registry-derived formats.
 pub fn outbox_task_coordinator_with_config(
     queue: Arc<dyn OutboxQueue>,
     formats: Vec<TaskFormat>,

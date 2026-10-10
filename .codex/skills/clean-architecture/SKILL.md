@@ -235,7 +235,8 @@ Use cases choose between `FeatureGateway::execute(command)` (events only) and
 `execute_with_outbox(command, tasks)` (events and explicit durable work).
 Outbox tasks are application contracts with independent payload versions;
 do not add delivery controls to domain events or serialize tasks into event
-metadata. Failed commands or commits must not leave queued work. With the
+metadata. Rejected commands or rolled-back writes commit neither events nor
+tasks; connection/response failure can leave an unknown commit outcome. With the
 current prebuilt-task gateway, ensure the task fields match the event that the
 aggregate can actually emit; a rejected exact repeat must not enqueue a new
 Task. Exact-repeat success is reserved for internal at-least-once Task handling.
@@ -291,51 +292,19 @@ stay in the runtime crate so they remain testable and covered.
 
 ### Task handlers and workers
 
-When reviewing or extending task delivery, handlers, sender ports, ordering,
-or idempotency, read [Task processing contracts](references/task-processing.md).
-Business sequence belongs to the aggregate state machine. Create dependent
-work only with the accepted event that establishes its prerequisite; the
-aggregate rejects conflicting or premature transitions. Tasks may execute
-concurrently and in any order, including tasks from the same source aggregate
-or event. `aggregate_sequence` identifies the source event, not delivery order.
-Do not add a sequential/parallel flag or an aggregate-wide queue barrier for
-this contract. A successor may execute before its predecessor's settlement
-when the prerequisite event and successor task are already committed.
+Before reviewing or changing handlers, queues, retry, or worker configuration,
+read the [runtime task processing guide](../../../cqrs-runtime/doc/task_processing.md).
+It is the canonical portable contract; keep it with the runtime when moving
+the engine to another project.
 
-Handlers perform one operation, delegate transition checks to the target
-aggregate, and classify exact redelivery separately from mismatched data.
-If an external effect needs an idempotency key, persist it in the versioned
-payload or task metadata and pass it unchanged to the sender on every retry;
-`task.id` is available for identifying one task's redeliveries. An attempt
-number or lock token is not an operation identity. The key does not itself
-provide receiver deduplication. Delivery uncertainty follows the handler
-replay-safety contract. Queue-operation deadlines belong at the runtime boundary
-and must cover the full claim, recovery, or settlement call, including adapter
-connection acquisition and commit. `OutboxTaskCoordinatorConfig` owns the
-positive `OUTBOX_STORAGE_TIMEOUT_MS` budget (default 5000 ms); multi-format
-claim shares one deadline and preserves already confirmed tasks on later
-timeouts. `PostgresOutboxQueueConfig` owns the positive
-`OUTBOX_POSTGRES_STATEMENT_TIMEOUT_MS` server budget (default 4000 ms), applied
-transaction-locally for queue SQL, including lock waiting. Keep these settings
-out of shared-pool session state and event-store command policy. Runtime
-timeout means an unknown storage outcome; free the waiting capacity without
-inferring task success or failure.
-
-The whole handler invocation (all local attempts, SDK retries, backoff, and
-overhead) must fit `OUTBOX_HANDLER_TIMEOUT_SECS`. Three retries after an initial
-ten-second attempt are not three total attempts; four ten-second attempts need
-forty seconds before backoff and cannot be promised inside a thirty-second cap.
-Validate `lease > 2 * storage_timeout + handler_timeout + LEASE_SAFETY_MARGIN`
-against the coordinator's actual budget at startup. The fixed margin is five
-seconds; defaults give `60 > 5 + 30 + 5 + 5 = 45`, with fifteen seconds extra.
-
-Each `ClaimedTask` carries a conservative monotonic `lease_deadline` anchored
-before the DB claim request, never reset at dispatch and never derived by
-comparing database UTC to the worker's wall clock. Run a handler only when its
-full budget and settlement reserve fit. Otherwise request retry without the
-effect, or leave the task for recovery when safe settlement time is exhausted.
-Bound acknowledgement by the earlier storage deadline and lease minus margin.
-Keep database token/expiry fencing and replay-safe handlers; no renewal is enabled.
+Preserve this project's aggregate-owned business sequence and one-operation
+Task invariant. Sender ports and business outcome classification belong to
+application; delivery, storage deadlines, lease budgets, lock tokens, and
+`lease_deadline` belong to the runtime/queue adapter. Business handlers must not
+construct, reset, or change lease context. Configuration parsing/validation
+stays in `cqrs-runtime`; `main` loads explicit configs and validates the combined
+lease budget before accepting traffic. Update the runtime guide and API rustdoc
+together when changing this lasting contract.
 
 ## Presentation layout
 

@@ -25,6 +25,8 @@ use crate::outbox::{LEASE_SAFETY_MARGIN, OutboxTaskCoordinator, TaskFormat, Task
 mod task_worker;
 use task_worker::{log_failed, spawn_worker};
 
+/// Fresh handler registry per worker/restart; every instance must expose the
+/// same ordered format list as the coordinator. Sender state belongs to a worker.
 pub type TaskHandlerFactory = Arc<dyn Fn() -> TaskHandlerRegistry + Send + Sync>;
 
 fn checked_handler(
@@ -117,6 +119,13 @@ impl OutboxWorkerPoolConfig {
     }
 }
 
+/// Poll ready work and recover expired ownership until shutdown is requested.
+///
+/// Validates the full lease budget before polling and verifies each registry's
+/// formats, including on restart. Shutdown stops claims, drains a remaining
+/// invocation plus the actual settlement budget, then aborts unfinished workers.
+/// Aborted work remains durable for expiry recovery. The host owns signals,
+/// HTTP draining, and process-level error handling.
 pub async fn run(
     service: Arc<dyn OutboxTaskCoordinator>,
     factory: TaskHandlerFactory,
