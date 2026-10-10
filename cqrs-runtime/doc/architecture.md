@@ -26,7 +26,7 @@ flowchart TB
     subgraph Runtime["cqrs-runtime: reusable orchestration"]
         Executor["CqrsCommandExecutor<br/>bounded optimistic-conflict retry"]
         Supervisor["worker::run<br/>polling, capacity, restarts, shutdown"]
-        Channel["Bounded shared queue<br/>Q reserved/waiting deliveries"]
+        Channel["Bounded async-channel queue<br/>Q waiting deliveries"]
         Slot["Permanent Tokio worker<br/>one registry; one in-flight delivery"]
         JoinSet["JoinSet<br/>worker lifecycle, restart and abort"]
         Coordinator["OutboxTaskCoordinator<br/>formats, execution budget, settlement"]
@@ -56,7 +56,7 @@ flowchart TB
     Repository -->|"read; atomic write"| Database
 
     Supervisor -->|"claim / recover_expired"| Coordinator
-    Supervisor -->|"reserve capacity before claim; publish ClaimedTask"| Channel
+    Supervisor -->|"snapshot free capacity before claim; publish ClaimedTask"| Channel
     Channel -->|"dequeue; Notify available capacity"| Slot
     Supervisor -.->|"observe exit / restart"| JoinSet
     JoinSet -.->|"owns C worker tasks"| Slot
@@ -159,7 +159,7 @@ do **not** automatically apply to event-store reads/writes on the shared pool.
 ## Claim, execute, settle and release capacity
 
 The supervisor shares one coordinator; each permanent Tokio worker owns a registry.
-The diagram shows reserved queue capacity followed by one claimed task; other workers and
+The diagram shows a free-capacity snapshot followed by one claimed task; other workers and
 tasks can run concurrently, including tasks from the same aggregate.
 
 ```mermaid
@@ -194,8 +194,8 @@ sequenceDiagram
     Queue-->>Coordinator: LeaseRecoveryReport
     Coordinator-->>Supervisor: Recovery report, log confirmed failures
 
-    Supervisor->>Channel: Reserve free permits (includes claim batch)
-    Supervisor->>Coordinator: claim(owner, reserved capacity, lease duration)
+    Supervisor->>Channel: Snapshot free capacity Q - sender.len()
+    Supervisor->>Coordinator: claim(owner, Q - sender.len(), lease duration)
     loop Supported formats, one shared claim deadline
         Coordinator->>Queue: claim(format, owner, remaining capacity, lease)
         Queue->>Queue: Anchor local lease deadline BEFORE pool acquisition
@@ -204,8 +204,8 @@ sequenceDiagram
         Queue-->>Coordinator: ClaimedTask batch with original local deadlines
     end
     Coordinator-->>Supervisor: Confirmed tasks, including any earlier partial batch
-    Supervisor->>Channel: Publish ClaimedTask through permits
-    Slot->>Channel: Dequeue one task; release receiver mutex
+    Supervisor->>Channel: try_send each ClaimedTask, sole producer
+    Slot->>Channel: recv through worker's cloned receiver
     Slot-->>Supervisor: Notify queue capacity available
     Note over Slot,Coordinator: ClaimedTask contains TaskDelivery + ClaimLease
     Slot->>Coordinator: execute_and_settle(registry, task, handler_timeout)
@@ -254,7 +254,8 @@ the entire await, including pool acquisition and commit. The local lease estimat
 never replaces PostgreSQL token/expiry fencing. A retry request may become
 `Failed` at the attempt limit. Unknown formats remain pending.
 
-Shutdown and restart-factory failure stop claims and dequeue, then drain started
+Shutdown and restart-factory failure set internal stop before closing the channel,
+stop claims and dequeue, then drain started
 invocations plus settlement for H+S. Waiting claims remain for recovery; remaining
 workers are aborted and joined after the deadline.
 Interrupted work remains durable for expiry recovery. There is no lease renewal.

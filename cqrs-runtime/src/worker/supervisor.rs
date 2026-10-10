@@ -1,13 +1,13 @@
 //! Bounded delivery admission and JoinSet supervision of permanent registry-owning workers.
 use super::{
     OutboxWorkerPoolConfig, OutboxWorkerPoolConfigError,
-    worker_task::{WorkerInbox, log_failed, run_worker, stop_requested},
+    worker_task::{log_failed, run_worker, stop_requested},
 };
-use crate::outbox::{OutboxTaskCoordinator, TaskFormat, TaskHandlerRegistry, TaskHandlerRegistryError};
+use crate::outbox::{ClaimedTask, OutboxTaskCoordinator, TaskFormat, TaskHandlerRegistry, TaskHandlerRegistryError};
 use std::{collections::HashMap, sync::Arc, time::Duration};
 use thiserror::Error;
 use tokio::{
-    sync::{mpsc, watch},
+    sync::{Notify, watch},
     task::{Id, JoinSet},
     time::MissedTickBehavior,
 };
@@ -52,7 +52,8 @@ struct WorkerPool {
     workers: JoinSet<usize>,
     indices: HashMap<Id, usize>,
     coordinator: Arc<dyn OutboxTaskCoordinator>,
-    inbox: Arc<WorkerInbox>,
+    receiver: async_channel::Receiver<ClaimedTask>,
+    available: Arc<Notify>,
     handler_timeout: Duration,
     stop: watch::Sender<bool>,
 }
@@ -62,7 +63,8 @@ impl WorkerPool {
             index,
             handler,
             self.coordinator.clone(),
-            self.inbox.clone(),
+            self.receiver.clone(),
+            self.available.clone(),
             self.handler_timeout,
             self.stop.subscribe(),
         ));
@@ -71,6 +73,9 @@ impl WorkerPool {
 
     async fn drain(&mut self) {
         self.stop.send_replace(true);
+        // Closing a channel still permits receiving buffered tasks. Stop must win
+        // the worker's biased select before closure wakes pending receives.
+        self.receiver.close();
         let _ = tokio::time::timeout(self.handler_timeout + self.coordinator.storage_timeout(), async {
             while self.workers.join_next().await.is_some() {}
         })
@@ -80,9 +85,9 @@ impl WorkerPool {
     }
 }
 
-/// Poll under reserved bounded-channel capacity; at most C deliveries run and Q wait.
-/// Each worker owns its registry for its entire Tokio task lifetime. True shutdown
-/// or sender closure stops admission/dequeue and drains only started invocations.
+/// One producer claims under free bounded-channel capacity; at most C deliveries run and Q wait.
+/// Each worker owns its registry for its entire Tokio task lifetime. True host shutdown
+/// or closure of its watch sender stops admission/dequeue and drains only started invocations.
 /// Startup/restart validates formats; restart failures use the same bounded drain.
 /// Original lease deadlines and database fencing remain authoritative.
 pub async fn run(
@@ -97,14 +102,15 @@ pub async fn run(
         .map(|index| checked_handler(&factory, &formats, index))
         .collect::<Result<Vec<_>, _>>()?;
     let owner = Uuid::new_v4().to_string();
-    let (sender, receiver) = mpsc::channel(config.queue_capacity());
-    let inbox = Arc::new(WorkerInbox::new(receiver));
+    let (sender, receiver) = async_channel::bounded(config.queue_capacity());
+    let available = Arc::new(Notify::new());
     let (stop, _) = watch::channel(false);
     let mut pool = WorkerPool {
         workers: JoinSet::new(),
         indices: HashMap::new(),
         coordinator: coordinator.clone(),
-        inbox: inbox.clone(),
+        receiver,
+        available: available.clone(),
         handler_timeout: config.handler_timeout(),
         stop,
     };
@@ -142,17 +148,14 @@ pub async fn run(
                         Err(error) => error!(error = %error, "outbox lease recovery failed"),
                     }
                 }
-                _ = inbox.available.notified() => {},
+                _ = available.notified() => {},
             }
-            let limit = sender.capacity();
+            let limit = config.queue_capacity() - sender.len();
             if limit == 0 {
                 continue;
             }
-            // Single producer: consumers only increase free capacity. Reservations
-            // account for the entire claim batch, including its SQL/commit wait.
-            let permits = sender
-                .try_reserve_many(limit)
-                .expect("the single producer's free channel capacity cannot decrease");
+            // This is the only producer. While claim awaits, consumers can only
+            // reduce occupancy, so the returned batch fits without reservations.
             let claimed = tokio::select! {
                 biased;
                 _ = stop_requested(&mut shutdown) => break,
@@ -161,8 +164,13 @@ pub async fn run(
             match claimed {
                 Ok(tasks) => {
                     assert!(tasks.len() <= limit, "queue must honor the claim limit");
-                    for (permit, task) in permits.zip(tasks) {
-                        permit.send(task);
+                    for task in tasks {
+                        // TrySendError contains ClaimedTask; never format it into
+                        // a panic or log because payload and lease token are private.
+                        assert!(
+                            sender.try_send(task).is_ok(),
+                            "single producer's claimed batch must fit an open queue"
+                        );
                     }
                 }
                 Err(error) => error!(error = %error, "outbox claim failed"),
@@ -628,6 +636,142 @@ mod tests {
         }
     }
 
+    #[tokio::test]
+    async fn consumers_free_capacity_during_claim_without_parallel_claims_or_overflow() {
+        struct PausedClaimCoordinator {
+            inner: Arc<dyn OutboxTaskCoordinator>,
+            calls: AtomicUsize,
+            gate: tokio::sync::Semaphore,
+        }
+        #[async_trait]
+        impl OutboxTaskCoordinator for PausedClaimCoordinator {
+            fn formats(&self) -> Vec<TaskFormat> {
+                self.inner.formats()
+            }
+            fn storage_timeout(&self) -> Duration {
+                self.inner.storage_timeout()
+            }
+            async fn claim(&self, owner: &str, limit: usize, lease: Duration) -> Result<Vec<ClaimedTask>, OutboxError> {
+                if self.calls.fetch_add(1, Ordering::SeqCst) == 2 {
+                    self.gate.acquire().await.unwrap().forget();
+                }
+                self.inner.claim(owner, limit, lease).await
+            }
+            async fn recover_expired(&self, limit: usize) -> Result<LeaseRecoveryReport, OutboxError> {
+                self.inner.recover_expired(limit).await
+            }
+            async fn execute_and_settle(
+                &self,
+                handler: &mut dyn TaskHandler,
+                task: ClaimedTask,
+                timeout: Duration,
+            ) -> Result<SettlementResult, OutboxError> {
+                self.inner.execute_and_settle(handler, task, timeout).await
+            }
+        }
+        let queue = Arc::new(Queue::default());
+        queue.incoming.lock().unwrap().extend((0..7).map(|_| claimed()));
+        let coordinator = Arc::new(PausedClaimCoordinator {
+            inner: outbox_task_coordinator(queue.clone(), vec![format()]),
+            calls: AtomicUsize::new(0),
+            gate: tokio::sync::Semaphore::new(0),
+        });
+        let probe = Arc::new(IoProbe::default());
+        let (stop, shutdown) = watch::channel(false);
+        let pool = tokio::spawn(super::run(
+            coordinator.clone(),
+            io_factory(probe.clone()),
+            worker_config(1, 2, Duration::from_secs(3600)),
+            shutdown,
+        ));
+        // One active delivery and two waiting; the next claim starts on dequeue.
+        wait_until(|| probe.active.load(Ordering::SeqCst) == 1 && queue.incoming.lock().unwrap().len() == 4).await;
+        probe.gate.add_permits(1);
+        wait_until(|| coordinator.calls.load(Ordering::SeqCst) == 3).await;
+        // Finish the second delivery and dequeue the third while claim is pending.
+        probe.gate.add_permits(1);
+        wait_until(|| probe.calls.lock().unwrap().len() == 3).await;
+        assert_eq!(queue.outcomes.lock().unwrap().len(), 2);
+        assert_eq!(queue.incoming.lock().unwrap().len(), 4);
+        assert_eq!(
+            coordinator.calls.load(Ordering::SeqCst),
+            3,
+            "dequeue notifications cannot start a parallel claim"
+        );
+        coordinator.gate.add_permits(1);
+        // The captured limit still fits; a subsequent claim refills the remaining slot.
+        wait_until(|| queue.incoming.lock().unwrap().len() == 2).await;
+        assert_eq!(*queue.claim_limits.lock().unwrap(), vec![2, 1, 1, 1]);
+        assert_eq!(probe.peak.load(Ordering::SeqCst), 1);
+        assert_eq!(probe.calls.lock().unwrap().len(), 3);
+        stop.send(true).unwrap();
+        // Observe internal stop before releasing the active invocation.
+        tokio::task::yield_now().await;
+        probe.gate.add_permits(1);
+        pool.await.unwrap().unwrap();
+        assert_eq!(queue.outcomes.lock().unwrap().len(), 3);
+        assert_eq!(
+            probe.calls.lock().unwrap().len(),
+            3,
+            "the two buffered deliveries stay for recovery"
+        );
+    }
+
+    #[tokio::test]
+    async fn thousand_tasks_are_each_executed_and_settled_successfully() {
+        struct RecordingHandler(Arc<std::sync::Mutex<Vec<Uuid>>>);
+        #[async_trait]
+        impl TaskHandler for RecordingHandler {
+            fn formats(&self) -> Vec<TaskFormat> {
+                vec![format()]
+            }
+            async fn handle(&mut self, task: &TaskDelivery) -> Result<(), TaskHandlerError> {
+                self.0.lock().unwrap().push(task.id());
+                tokio::task::yield_now().await;
+                Ok(())
+            }
+        }
+        let tasks: Vec<_> = (0..1000).map(|_| claimed()).collect();
+        let mut expected: Vec<_> = tasks.iter().map(|task| task.delivery().id()).collect();
+        expected.sort_unstable();
+        let queue = Arc::new(Queue::default());
+        queue.incoming.lock().unwrap().extend(tasks);
+        let executed = Arc::new(std::sync::Mutex::new(Vec::new()));
+        let factory: HandlerRegistryFactory = Arc::new({
+            let executed = executed.clone();
+            move || TaskHandlerRegistry::try_new(vec![Box::new(RecordingHandler(executed.clone()))])
+        });
+        let (stop, shutdown) = watch::channel(false);
+        let pool = tokio::spawn(super::run(
+            outbox_task_coordinator(queue.clone(), vec![format()]),
+            factory,
+            // More deliveries than C+Q exercises batch admission and Notify refill.
+            worker_config(16, 32, Duration::from_secs(3600)),
+            shutdown,
+        ));
+        wait_until(|| queue.outcomes.lock().unwrap().len() >= expected.len()).await;
+        stop.send(true).unwrap();
+        tokio::time::timeout(Duration::from_secs(5), pool)
+            .await
+            .unwrap()
+            .unwrap()
+            .unwrap();
+
+        let mut actual = executed.lock().unwrap().clone();
+        actual.sort_unstable();
+        assert_eq!(
+            actual, expected,
+            "each delivery must execute exactly once in this successful run"
+        );
+        let outcomes = queue.outcomes.lock().unwrap();
+        assert!(outcomes.iter().all(|(_, outcome)| *outcome == SettlementRequest::Completed));
+        let mut settled: Vec<_> = outcomes.iter().map(|(id, _)| *id).collect();
+        settled.sort_unstable();
+        assert_eq!(settled, expected, "each delivered ID must have one successful settlement");
+        assert!(queue.incoming.lock().unwrap().is_empty());
+        assert!(queue.claim_limits.lock().unwrap().iter().all(|&limit| limit <= 32));
+    }
+
     #[tokio::test(flavor = "current_thread")]
     async fn thousand_io_workers_wait_concurrently_on_one_runtime_thread() {
         let queue = Arc::new(Queue::default());
@@ -830,14 +974,14 @@ mod tests {
             }
         }
         let probe = Arc::new(IoProbe::default());
-        let (sender, receiver) = mpsc::channel(1);
-        let inbox = Arc::new(WorkerInbox::new(receiver));
+        let (sender, receiver) = async_channel::bounded(1);
         let (stop, _) = watch::channel(false);
         let mut pool = WorkerPool {
             workers: JoinSet::new(),
             indices: HashMap::new(),
             coordinator: Arc::new(StalledCoordinator(probe.clone())),
-            inbox,
+            receiver,
+            available: Arc::new(Notify::new()),
             handler_timeout: Duration::from_millis(20),
             stop,
         };

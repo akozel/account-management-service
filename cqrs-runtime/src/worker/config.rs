@@ -1,6 +1,10 @@
 use crate::outbox::LEASE_SAFETY_MARGIN;
 use std::time::Duration;
 use thiserror::Error;
+
+// Preserve the existing configuration range independently of Tokio internals.
+const MAX_QUEUE_CAPACITY: usize = usize::MAX >> 3;
+
 /// Independent process-wide execution and waiting limits, with validated local values.
 /// Defaults: C=128, Q=128, poll=1s, handler=30s, lease=120s.
 /// Validate the combined queued-wave lease against the actual coordinator.
@@ -57,7 +61,7 @@ impl OutboxWorkerPoolConfig {
         if concurrency == 0 {
             return Err(OutboxWorkerPoolConfigError::InvalidConcurrency);
         }
-        if queue_capacity == 0 || queue_capacity > tokio::sync::Semaphore::MAX_PERMITS {
+        if queue_capacity == 0 || queue_capacity > MAX_QUEUE_CAPACITY {
             return Err(OutboxWorkerPoolConfigError::InvalidQueueCapacity);
         }
         if poll_interval.is_zero() || poll_interval.as_millis() > i64::MAX as u128 {
@@ -260,7 +264,7 @@ mod tests {
             Err(OutboxWorkerPoolConfigError::LeaseBudgetOverflow)
         );
         assert_eq!(
-            build(1, tokio::sync::Semaphore::MAX_PERMITS, 120).validate_for_storage_timeout(Duration::from_secs(5)),
+            build(1, MAX_QUEUE_CAPACITY, 120).validate_for_storage_timeout(Duration::from_secs(5)),
             Err(OutboxWorkerPoolConfigError::LeaseBudgetOverflow)
         );
     }

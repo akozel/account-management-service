@@ -154,7 +154,7 @@ includes both rescheduled work and confirmed terminal failures; use
 
 Use the configuration types' `from_env` methods to load these settings.
 Constructors without explicit configuration use defaults; they do not read
-environment variables automatically. Positive values are required. Queue capacity must fit Tokio bounded-channel limits;
+environment variables automatically. Positive values are required. Queue capacity must fit the runtime's validated range;
 zero-capacity rendezvous is not supported. Defaults for concurrency and queue
 capacity are independent, even when only one environment variable is overridden. The
 PostgreSQL setting must fit `1..=2147483647` milliseconds; the other types
@@ -198,13 +198,19 @@ between deliveries until the worker exits. Concurrency is a process-wide setting
 independent of CPU count or runtime OS threads; HTTP I/O can overlap on one thread.
 It does not bound remote effects that continue after a local timeout.
 
-A shared bounded Tokio mpsc channel holds at most Q waiting deliveries. Its receiver
-is behind a Tokio Mutex held only during recv, never during handler/settlement.
-One poller reserves channel permits before claim; the claim batch consumes those
-reservations rather than creating an extra buffer. Full channels cause no claims;
-unclaimed work stays pending in PostgreSQL. Q bounds element count, not payload
-bytes or durable backlog. Locally known deliveries fit C+Q; an unknown claim result
-can leave additional processing rows in PostgreSQL for recovery.
+A bounded async-channel queue holds at most Q waiting deliveries. Each worker
+owns a cloned receiver and awaits recv directly, without an external receiver
+mutex. There is exactly one private sender, owned by the poller.
+Before claim, the poller snapshots free capacity as Q - sender.len(). Consumers
+can only reduce occupancy during that await, so a batch no larger than this
+limit fits through try_send without permits or a second buffer. Full channels
+cause no claims; unclaimed work stays pending in PostgreSQL. Changing to multiple
+producers would require a new admission protocol.
+Q bounds element count, not payload bytes or durable backlog. The pending claim
+batch plus queued deliveries fits Q; locally known deliveries fit C+Q. An unknown
+claim result can leave additional processing rows in PostgreSQL for recovery.
+Cancelling a pending receive does not consume a delivery, including when a sender
+has notified the waiter before it is polled again.
 
 Dequeue sends a coalesced Notify to refill the channel without a polling delay.
 The interval remains a fallback and runs recovery in batches of min(C, 32), because
@@ -219,7 +225,10 @@ Panic payloads are not logged by supervision; panic=abort ends the process.
 
 True shutdown or closure of the shutdown sender stops claims and dequeue; false
 updates do not stop the pool. The same path applies to restart-factory failures.
-Only already-started handler/settlement work drains, for a common H+S deadline.
+The internal stop is set before explicitly closing the channel, because closure
+alone still allows buffered deliveries to be received. Workers prioritize stop
+over recv and check stop again before execution. Only already-started
+handler/settlement work drains, for a common H+S deadline.
 Waiting claimed tasks remain durable for expiry recovery. At the drain deadline,
 remaining workers are aborted and their join results are observed before return.
 Dropping/cancelling the supervisor aborts workers through JoinSet's drop behavior;

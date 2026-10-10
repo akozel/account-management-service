@@ -14,7 +14,7 @@ responsibilities and Mermaid diagrams of command publication and task delivery.
 - Base: command execution, optimistic-conflict retry, durable task DTOs,
   handler routing, and task coordination.
 - `postgres`: event repository, queue, and canonical SQL assets.
-- `worker`: JoinSet-supervised permanent Tokio workers, a bounded shared queue, and shutdown draining.
+- `worker`: JoinSet-supervised permanent Tokio workers, a bounded async-channel queue, and shutdown draining.
 
 Both optional features are enabled by default. Use
 `default-features = false` when only the base contracts are needed.
@@ -116,6 +116,9 @@ single-event write plan and its atomic CTE compiler.
 Unit tests stay in inline `#[cfg(test)] mod tests { ... }` blocks alongside
 the code they exercise; shared runtime fakes live in `outbox/test_support.rs`.
 PostgreSQL integration suites remain under `tests/postgres/`.
+Worker unit tests include a 1,000-delivery run through the supervisor and coordinator
+with test storage, checking every handler invocation ID and its Completed settlement.
+Queue limits, cancellation, restart and shutdown have separate behavioral checks.
 
 `TaskFormat::new/of`, `NewOutboxTask` builders, and configuration constructors
 return typed validation errors. Their fields are private: use getters and
@@ -135,10 +138,3 @@ Defaults are 128 concurrent deliveries, 128 queued deliveries, and a 120-second
 lease. `OUTBOX_QUEUE_CAPACITY` and `OUTBOX_WORKER_CONCURRENCY` are independent.
 The explicit worker config constructor now takes `queue_capacity` after
 `concurrency`; the combined lease validation includes queued waves.
-
-## Queue performance comparison
-
-See [Local worker queue performance](doc/queue_performance.md) for the manual
-release-mode comparison of the current worker receive path and bounded MPMC
-prototypes using async-channel, Flume and Kanal, including throughput and sampled
-queue-delay percentiles. The candidates are test-only dev-dependencies.

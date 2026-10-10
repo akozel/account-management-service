@@ -14,9 +14,9 @@
 | 4 | Batch recovery просроченных leases | Backlog | Заменить SELECT + N UPDATE пакетным обновлением, сохранив блокировки, индивидуальный jitter, attempts и подтвержденные failures после commit. |
 | 5 | Проверить целесообразность готового PostgreSQL runner | Backlog: исследование | Прототип sqlxmq или Apalis: атомарное enqueue с event-store, версии DTO, attempts, failure, lease/recovery и миграция существующих записей. |
 | 6 | Оценивать streams и дополнительные примитивы по сокращению конкретного кода | Отложено | tokio-stream, buffer_unordered и Semaphore вводить при явной необходимости. Они сами по себе не заменяют durable queue, supervision и settlement. |
-| 7 | [Performance test текущей очереди и bounded MPMC](../../cqrs-runtime/doc/queue_performance.md) | Выполнено | Настоящий run_worker как baseline; 128/1000 workers, 1/4 runtime threads, fast/yield/I/O, 168 samples с latency percentiles и raw CSV. |
-| 8 | Расширить benchmark на Flume и Kanal | Выполнено | Четыре backend в одном release-прогоне, восемь сбалансированных повторений, 384 samples; прежние результаты архивированы. |
-| 9 | [Имитация HTTP 5 мс на четырех runtime threads](../../cqrs-runtime/doc/queue_performance_results_io5ms.md) | Выполнено | Четыре очереди, C=Q=128/1000, 100 доставок на worker, 64 release samples; отдельные report/CSV. |
+| 7 | Удалить локальный perf-harness после выбора очереди | Выполнено | Модуль performance, smoke-тест его измерений, инструкции, отчеты и CSV удалены. Оставлены поведенческие unit-тесты runtime. |
+| 8 | Миграция на async-channel 2.5.0 | Выполнено | Клонируемые receivers, один producer, независимые C/Q; старые реализации, адаптеры, тесты и сравнительные бенчмарки удалены. |
+| 9 | Проверка успешного выполнения 1000 задач | Выполнено | Реальные supervisor, async-channel, registry и coordinator с тестовым storage; каждый ID обработан один раз и получил Completed. |
 
 ## Границы изменений
 
@@ -48,20 +48,19 @@ workspace tests и llvm-cov с порогом 90%. При новой настр�
 Задачу считать выполненной только после реализации и проверок; завершенный
 дизайн отдельно не означает завершенный рефакторинг.
 
-Проверка первой задачи: `cargo fmt --all --check`, workspace Clippy с `-D warnings`,
-workspace tests (138 passed, включая PostgreSQL и doctests) и обязательный
-`cargo llvm-cov` с порогом 90% прошли. Line coverage workspace: 97.83%.
-Есть проверка 1000 одновременно ожидающих I/O workers на одном потоке Tokio;
-это функциональный тест конкурентности, не throughput benchmark реального HTTP.
+Миграция сохраняет публичные интерфейсы, defaults C=128/Q=128/lease=120s,
+исходные deadlines и bounded drain. Единственный poller берет claim limit из
+Q - sender.len(); consumers могут только освобождать место во время claim.
+Тесты проверяют отмену notified receive без потери доставки и освобождение
+очереди во время claim без второго параллельного запроса.
 
-Performance comparison (задача 7) выполнен отдельно в release; production queue
-не переключена на MPMC. [Результаты](../../cqrs-runtime/doc/queue_performance_results.md)
-и [raw CSV](../../cqrs-runtime/doc/queue_performance_results.csv) сохранены.
-После добавления benchmark workspace checks прошли: 139 тестов, один manual
-benchmark ignored в обычном запуске, line coverage 96.97%.
+Локальные perf-эксперименты помогли выбрать очередь и удалены после миграции.
+В unit-тесте supervisor проверяются 1000 уникальных доставок: выполнение каждой
+ровно один раз и успешный Completed settlement для каждого ID. C=16/Q=32
+проверяют несколько batch/refill циклов; часовой polling interval позволяет
+проверить refill через Notify. Idle shutdown остается отдельным unit-тестом
+без измерительной инфраструктуры.
 
-Расширение comparison (задача 8): четыре backend заново измерены в одном release
-прогоне, 384 samples. Порядок сбалансирован по позициям и парам; проверки доставки
-прошли. Старый двухканальный прогон сохранен отдельным архивом, без смешивания
-samples. Workspace checks прошли: 141 тест, один manual benchmark ignored;
-line coverage 97.16%. Актуальные таблицы и CSV доступны по ссылкам выше.
+После удаления perf-модуля обязательные проверки прошли: fmt, workspace Clippy
+с `-D warnings`, workspace tests (142 passed, включая PostgreSQL и doctests;
+без ignored тестов) и llvm-cov с порогом 90%. Line coverage workspace: 97.89%.

@@ -285,16 +285,20 @@ for safe structured error logging. Unknown formats stay `pending` without being
 claimed.
 
 Background polling comes from `cqrs-runtime`'s `worker` feature. Its Tokio
-supervisor owns one bounded shared Tokio mpsc queue and a JoinSet of permanent
-Tokio workers. Each worker exclusively owns its mutable registry; lock the shared
-receiver only during recv, never during handler/settlement. Configure process-wide
+supervisor owns one bounded async-channel queue and a JoinSet of permanent
+Tokio workers. Each worker exclusively owns its mutable registry and a cloned
+receiver; await recv directly without an external mutex. Configure process-wide
 concurrency and queue capacity independently of CPU threads (defaults 128/128).
-Reserve channel permits before claim so batches cannot create a hidden buffer.
+Only the poller owns a sender. Before claim, snapshot Q - sender.len(); consumers
+only free space during that await, so the batch fits through try_send. No hidden
+buffer or per-send Tokio tasks. Multiple producers would require a new admission
+protocol. Never format TrySendError<ClaimedTask> into logs or panic messages.
 Defaults use a 120-second lease; validate queued waves with checked arithmetic:
 lease > 2*S + H + 5s + ceil(Q/C)*(H+S). Original deadlines remain authoritative.
 Observe exits through JoinSet and rebuild one checked registry per replacement;
 never log panic payloads. Normal shutdown and restart-factory errors share bounded
-H+S draining of started work only; queued claims remain for recovery. Abort and
+H+S draining of started work only; set internal stop before closing the channel,
+as closure alone permits buffered receives. Queued claims remain for recovery. Abort and
 observe remaining tasks after the deadline. Keep watch<bool> for host shutdown;
 false updates do not stop the pool. Recovery batches are capped at min(C, 32). `main` composes the runtime queue, coordinator, business handler
 factory, and supervisor alongside HTTP. Configuration parsing and validation

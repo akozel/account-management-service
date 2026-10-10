@@ -1,263 +1,113 @@
-# JoinSet: постоянные workers, bounded queue и конкурентность
+# JoinSet, async-channel и независимые ограничения C/Q
 
-Статус: выполнено. fmt, Clippy, workspace tests (138 passed) и coverage прошли;
-line coverage workspace — 97.83%.
-Defaults: C=128, Q=128, lease=120 секунд; C задается на процесс независимо от CPU.
-Production runtime использует JoinSet и общий bounded Tokio mpsc channel.
+Статус: реализовано. Defaults: C=128, Q=128, lease=120 секунд.
+Runtime использует одну bounded async-channel 2.5.0 очередь и JoinSet постоянных
+Tokio workers. Старые реализации очереди и сравнительные бенчмарки удалены.
 
-## Требования
+## Владение и конкурентность
 
-1. Отдельно задавать число workers `C` и емкость локальной очереди ожидания `Q`.
-2. Каждая постоянная Tokio task владеет своим mutable TaskHandlerRegistry.
-   Registry и sender state сохраняются между доставками до выхода/panic worker.
-3. Worker выполняет одну доставку от начала handler до окончания settlement,
-   прежде чем брать следующую. Не запускать вложенный spawn на каждую доставку.
-4. JoinSet отслеживает workers, сообщает об их выходе/panic и предоставляет
-   abort; очередь предоставляет backpressure. JoinSet сам не ограничивает
-   число вызовов spawn и не является очередью доставок.
-5. Задачи, на которые нет локальной емкости, остаются в PostgreSQL.
+Каждый worker — постоянная Tokio task с собственным mutable TaskHandlerRegistry
+и клоном Receiver. Registry и состояние обработчиков сохраняются между доставками.
+Worker выполняет одну доставку целиком, включая settlement, затем берет следующую.
+Внешний mutex для приема и вложенный spawn на каждую доставку не нужны.
 
-Согласовано: «bind к Tokio task» означает постоянный worker с
-собственным handler registry. Предыдущий вариант с переносом registry в новую
-Tokio task на каждую доставку не дает постоянной привязки и здесь не выбран.
-Привязка к Tokio task не означает привязку к OS thread: Tokio может перемещать
-Send task между потоками. Для thread-affine / !Send handlers нужен отдельный
-LocalSet-дизайн, который текущий TaskHandler: Send не предусматривает.
+JoinSet отслеживает завершение, panic и abort. Supervisor хранит map Tokio task ID
+→ worker index и запускает один replacement с заново проверенным registry.
+Это устраняет ручной учет Busy/Idle поверх task lifecycle и обнаружение panic
+только по polling tick. In-progress storage await может задержать обработку выхода.
+Не логировать panic payload; panic=abort завершает весь процесс.
 
-## Проблемы прежней реализации (до рефакторинга)
-
-### Дублирование учета lifecycle
-
-Supervisor хранит Vec<WorkerSlot>, каждый slot содержит JoinHandle и
-Idle/Busy/Draining. Еще существуют mailbox на worker и отдельный канал
-worker_available. Для освобождения capacity worker отправляет свой index,
-а supervisor меняет Busy на Idle. Это рабочий протокол, но его состояние
-приходится поддерживать вручную поверх lifecycle Tokio task.
-
-При panic сообщение worker_available не отправляется. Supervisor обнаруживает
-завершившийся worker через is_finished на polling tick. До следующего такого
-обхода capacity остается занятой; причина panic не извлекается из JoinError.
-JoinSet позволяет ожидать завершение worker напрямую через join_next_with_id.
-Это убирает зависимость обнаружения от polling tick, но supervisor все еще
-должен вернуться из ограниченного storage await к обработке событий.
-
-### Не было независимой настройки очереди
-
-Сейчас есть concurrency и mailbox емкостью 1 на каждый worker. Supervisor
-выдает работу только Idle slots, поэтому Busy worker не получает дополнительную
-доставку. Независимо настроить общую очередь ожидания нельзя: увеличение
-concurrency одновременно увеличивает число handler registry и Tokio workers.
-
-Привязка registry к постоянной Tokio task уже реализована через spawn_worker;
-рефакторинг должен сохранить это свойство. Проблема состоит в устройстве
-очереди и ручном supervision, а не в отсутствии привязки сейчас.
-
-В предлагаемом дизайне отдельный bounded channel хранит ожидающие доставки,
-а C workers определяют число одновременно выполняемых доставок.
-
-### Разные пути остановки
-
-Обычный shutdown закрывает mailboxes и дает работникам время завершить работу.
-Ошибка factory при restart выходит через `?` и приводит к abort остальных
-WorkerSlot через Drop без этой процедуры drain. Новая реализация должна
-явно согласовать выходы с задачей 2 из backlog.
-
-## Реализованная схема
+C ограничивает число конкурентных доставок, Q — число ожидающих в локальной
+очереди. Оба параметра независимы от числа CPU и runtime threads.
+Привязка registry к Tokio task не означает привязку к OS thread.
 
 ```mermaid
 flowchart LR
-    DB[(PostgreSQL outbox)] -->|claim только под зарезервированную емкость| P[Poller / supervisor]
-    P --> B[Bounded channel: Q ожидающих доставок]
-    B --> W1[Tokio task 1: свой registry]
-    B --> WC[Tokio task C: свой registry]
-    J[JoinSet: lifecycle C workers] -. spawn / join / abort .-> W1
-    J -. spawn / join / abort .-> WC
-    W1 --> E[Coordinator: handler + settlement]
-    WC --> E
-    E --> DB
+    DB[(PostgreSQL pending)] --> P[Единственный poller]
+    P --> Q[async-channel: Q ожидающих]
+    Q --> W1[Tokio worker 1: registry 1]
+    Q --> WC[Tokio worker C: registry C]
+    J[JoinSet supervisor] --> W1
+    J --> WC
 ```
 
-Одновременно выполняется не больше C доставок, включая settlement; в channel
-находится не больше Q ожидающих доставок. Еще есть poller/supervisor и задачи
-приложения: C не является глобальным пределом всех Tokio tasks в процессе.
-Async I/O может ожидать, но доставка продолжает занимать один worker.
+Например, при C=2/Q=3 доставки A/B выполняются, C/D/E ждут в очереди,
+а F/G остаются pending в PostgreSQL. После завершения A worker берет C;
+poller может claim F на освободившееся место. Увеличение Q не добавляет
+workers; увеличение C добавляет независимые registry и Tokio tasks.
 
-Выбранный и реализованный вариант: tokio::sync::mpsc::channel(Q) и общий Receiver под
-tokio::sync::Mutex. Mutex удерживается только во время recv, затем освобождается
-до handler и settlement. Получение очередной доставки сериализовано; сами
-handler выполняются конкурентно и не делят mutable registry.
+## Claim и backpressure
 
-Отложенная альтернатива: bounded MPMC async-channel с клонируемыми receivers. Это убирает
-Mutex для приема, но добавляет зависимость. Выбирать по читаемости и реальной
-нагрузке, не вводить свой MPMC channel. broadcast непригоден: одну доставку
-должен получить один worker.
+- Sender принадлежит только poller. Перед claim он вычисляет `limit = Q - sender.len()`.
+  При нуле новый claim не выполняется.
+- Во время claim consumers могут только освобождать очередь. Поэтому batch не
+  больше limit гарантированно помещается через try_send без резервирования permits.
+  Pending batch вместе с текущим содержимым очереди не превышает Q.
+- Не добавлять вторую очередь, фоновые send tasks или другие producers без нового
+  admission-протокола. Ошибка try_send — нарушение внутреннего инварианта; ее Debug
+  содержит ClaimedTask и не должен попадать в логи или panic text.
+- Dequeue отправляет coalesced Notify для refill. Polling interval остается fallback;
+  recovery ограничен min(C, 32). Notify и worker exits не отменяют текущий claim.
+- Partial multi-format results сохраняются. Неизвестный результат storage timeout
+  может оставить дополнительные processing rows; C+Q ограничивает известные
+  локальные доставки, а не все processing rows в PostgreSQL.
+- Отмена pending recv после уведомления не расходует сообщение: другой receiver
+  получает ту же доставку с исходными token и monotonic deadline.
 
-Для обоих bounded channel нужна положительная емкость. Режим Q=0 («совсем без
-prefetch») потребует другого механизма rendezvous/worker readiness; не подменять
-его молча channel(1). Настройка max backlog в PostgreSQL — отдельная admission
-policy публикации, а не значение Q.
-
-## Пример: C=2, Q=3
-
-В БД готовы A, B, C, D, E, F и G.
-
-| Место | Доставки |
-| --- | --- |
-| Worker 1 | A: handler/settlement |
-| Worker 2 | B: handler/settlement |
-| Локальная очередь | C, D, E |
-| PostgreSQL pending | F, G |
-
-Завершение A позволяет worker 1 взять C. На освободившееся место в channel
-poller может claim F. Увеличение Q с 3 до 10 оставляет два workers и два
-registry. Увеличение C с 2 до 4 дает четыре независимых registry и до четырех
-конкурентных доставок, сохраняя Q=3.
-
-Если worker 1 паникует на A, JoinSet возвращает JoinError. Supervisor использует
-JoinError::id и небольшую map Tokio task ID → worker index, проверяет новый
-registry и запускает один replacement worker. A остается для lease recovery;
-доставки C/D/E не принадлежали упавшему worker и остаются в общей очереди.
-Panic восстанавливается при unwind; panic=abort завершает весь процесс.
-
-## Минимальная демонстрация владения
-
-Фрагмент иллюстрирует владение и конкурентность; это не готовый production
-supervisor: здесь опущены polling, reserve перед claim, shutdown и restart.
+Минимальный пример владения, без polling, shutdown и settlement logging:
 
 ```rust
-let (tx, rx) = tokio::sync::mpsc::channel::<ClaimedTask>(queue_capacity);
-let inbox = Arc::new(tokio::sync::Mutex::new(rx));
+let (sender, receiver) = async_channel::bounded::<ClaimedTask>(queue_capacity);
 let mut workers = tokio::task::JoinSet::new();
-
-// Все registries заранее построены и проверены до начала claim.
-for (worker_index, mut registry) in registries.into_iter().enumerate() {
-    let inbox = inbox.clone();
+for (index, mut registry) in registries.into_iter().enumerate() {
+    let receiver = receiver.clone();
     let coordinator = coordinator.clone();
     workers.spawn(async move {
-        loop {
-            let task = {
-                let mut rx = inbox.lock().await;
-                rx.recv().await
-            }; // Mutex освобожден до выполнения операции.
-            let Some(task) = task else { break };
+        while let Ok(task) = receiver.recv().await {
             let result = coordinator
                 .execute_and_settle(&mut registry, task, handler_timeout)
                 .await;
             report_settlement(result);
         }
-        worker_index
+        index
     });
 }
 ```
 
-C — число запущенных worker loops, Q — емкость channel. Предел конкурентности
-обеспечивает фиксированное число loops с последовательной обработкой.
-Semaphore дополнительно не нужен, пока нет других путей запуска handlers.
-JoinSet::len показывает число tracked workers, включая завершенные, результаты
-которых еще не извлечены; это не счетчик выполняемых handler invocations.
+## Lease и shutdown
 
-## Claim и backpressure
+Startup проверяет с checked arithmetic:
+`lease > 2*S + H + 5s + ceil(Q/C)*(H+S)`.
+Для C=128/Q=128/H=30s/S=5s требуется lease >80s; для C=2/Q=3 — >115s.
+Defaults lease=120s. Увеличение очереди требует большего lease или конкурентности.
+Оригинальный deadline проверяется coordinator и остается неизменным после dispatch.
 
-- Единственный poller резервирует свободные channel slots ДО обращения к БД:
-  через try_reserve_many; ожидание claim отменяется при shutdown.
-- Claim limit не превышает число зарезервированных slots. Если места нет,
-  новые задачи не переводятся в processing.
-- Подтвержденные задачи публикуются через полученные permits; не добавлять
-  скрытый VecDeque или новую Tokio task, ожидающую send, поверх полного channel.
-- Резервация на время claim тоже потребляет локальную емкость. Claim batch и
-  channel вместе не должны обходить Q; недоиспользованные permits освобождаются.
-- Извлечение доставки worker освобождает место в channel; после этого она
-  занимает один из C execution slots до окончания settlement.
-- Сохранять partial multi-format claim results и неизвестный результат timeout.
-  Shutdown при claim может оставлять неизвестную ownership для durable recovery.
-- Эти пределы относятся к известным локально доставкам. При неизвестном
-  результате claim в БД могут остаться дополнительные processing rows;
-  ограничение Q+C не является глобальным пределом processing rows в storage.
-- Коалесцируемое уведомление о появлении места может ускорить refill. Оно не
-  хранит Busy/Idle workers и не является подтверждением бизнес-успеха.
+True host shutdown, закрытие host watch или ошибка restart factory запускают
+одинаковый drain. Сначала выставляется internal stop, затем закрывается канал:
+close сам по себе разрешает чтение buffered сообщений. Worker проверяет stop
+с приоритетом перед recv и повторно перед handler; false updates игнорируются.
+Только начатые handler/settlement завершаются в общем бюджете H+S, затем оставшиеся
+workers abort-ятся и join-ятся. Ожидающие claims остаются для lease recovery.
+Отмена supervisor abort-ит принадлежащие JoinSet задачи без detached workers.
 
-## Очередь и lease budget
+## Проверки
 
-Локальная очередь содержит уже claimed задачи: lease идет во время ожидания.
-Q нельзя бездумно увеличивать только ради throughput. Текущая startup-формула
-не предусматривает очередь из нескольких последовательных волн:
+Проверяются независимые C/Q, отсутствие claims при полной очереди, постоянные
+registry/task IDs, replacement после panic, bounded drain и abort/join,
+отмена notified recv, освобождение capacity во время pending claim,
+а также 1000 ожидающих I/O workers на одном runtime thread.
 
-```text
-S = storage timeout; H = handler timeout; M = safety margin
-прежняя оценка без prefetch: lease > 2*S + H + M
-с prefetch:     lease > 2*S + H + M + ceil(Q/C)*(H+S)
-```
+Публичный constructor сохраняется: `OutboxWorkerPoolConfig::new(C, Q,
+poll_interval, handler_timeout, lease_duration)`.
+Q=0 отвергается; Q ограничивает количество элементов, не байты payload и не
+размер durable backlog. PostgreSQL schema, DTO, fencing и settlement не меняются.
 
-Вторая формула — консервативная оценка при здоровых C workers и FIFO dequeue.
-Она не гарантирует бюджет после panic, длительной паузы runtime или других
-сбоев; проверка исходного deadline на каждой доставке остается обязательной.
-Реализация использует checked arithmetic и проверяет совместно Q и lease. Defaults C=128/Q=128/lease=120s дают 40s запаса.
+- [Runtime contract](../../cqrs-runtime/doc/task_processing.md).
+- [Tokio JoinSet](https://docs.rs/tokio/1.53.1/tokio/task/struct.JoinSet.html).
+- [async-channel 2.5.0](https://docs.rs/async-channel/2.5.0/async_channel/).
 
-Например, C=2, Q=3, H=30s, S=5s, M=5s требуют lease >115s по этой оценке.
-С прежними 60s ожидающая доставка может не иметь полного execution budget;
-coordinator запросит retry без вызова handler, а claim уже потратит attempt.
-Увеличение lease замедляет recovery после падения процесса. Heartbeat или
-claim только непосредственно перед выполнением — отдельные варианты дизайна.
-
-Лимит Q ограничивает число элементов, не суммарные байты JSON payloads и не
-удаленные эффекты, продолжающиеся после локального timeout.
-
-## Shutdown
-
-Предпочтительная политика: остановить claim и получение новых доставок;
-workers завершают уже начатые handler + settlement. Ожидающие claimed задачи
-остаются для expiry recovery; их извлечение/удаление из памяти не завершает
-их в БД. Не запускать всю очередь после shutdown по инерции.
-
-Сигнал остановки проверять до recv и после получения доставки, но не отменять
-уже начатый execute_and_settle при обычном graceful shutdown. Supervisor дает
-общий deadline H+S, затем вызывает abort_all и извлекает join results.
-JoinSet::shutdown сразу abort-ит workers; это этап принудительной остановки,
-а не замена drain. Если потребуется drain всей очереди, это отдельная политика
-с отдельным бюджетом, зависящим от Q/C.
-
-## Критерии приемки реализации
-
-- C и Q независимо валидируются и документируются; новые env settings есть
-  в .env.example, runtime guide и rustdoc.
-- Все registries проверяются до первого claim; restart проверяет formats.
-- Ни при backlog, ни при storage stall/panic не выполняется больше C доставок.
-- При полной очереди нет новых claims; reserved slots и claim batches не
-  создают скрытый дополнительный буфер сверх Q.
-- Две доставки одного worker используют один registry и один Tokio task ID;
-  replacement после panic получает новый registry/task ID.
-- JoinSet обнаруживает panic без ожидания polling tick; replacement не
-  увеличивает размер пула сверх C.
-- Сохраняются tests на partial claims, storage timeout после commit, original
-  lease deadline, lease fencing, retry и safe failure logging.
-- Shutdown и ошибочный выход supervisor имеют явную политику drain; после
-  принудительной остановки остаются только durable задачи для recovery.
-- Обязательные fmt, clippy, workspace tests и coverage >=90% проходят.
-
-## Источники
-
-- [Tokio JoinSet 1.53.1](https://docs.rs/tokio/1.53.1/tokio/task/struct.JoinSet.html).
-- [Tokio bounded mpsc Sender: capacity и reserve](https://docs.rs/tokio/latest/tokio/sync/mpsc/struct.Sender.html).
-- [Tokio mpsc Receiver](https://docs.rs/tokio/latest/tokio/sync/mpsc/struct.Receiver.html).
-- [async-channel: bounded MPMC](https://docs.rs/async-channel/latest/async_channel/).
-- [Текущий runtime contract](../../cqrs-runtime/doc/task_processing.md).
-
-## Итог реализации
-
-Supervisor использует JoinSet и map Tokio task ID → worker index, единый channel
-и try_reserve_many перед claim. Worker сохраняет registry между доставками;
-Notify после dequeue запускает refill. Recovery limit — min(C, 32).
-Один internal watch останавливает dequeue перед drain как при host shutdown,
-так и при restart-factory error. По истечении H+S workers abort-ятся и join-ятся.
-Отмена самого supervisor не оставляет detached workers.
-
-Явный constructor: `OutboxWorkerPoolConfig::new(C, Q, poll_interval,
-handler_timeout, lease_duration)`. Defaults/env overrides независимы;
-нулевая или неподдерживаемая емкость отвергается typed error. Startup отвергает
-недостаточный lease, сохраняя исходные per-delivery deadlines.
-
-Тесты проверяют independent C/Q, полный channel без claims, shutdown с ожидающими
-задачами, постоянные registry/task IDs, replacement после panic без polling tick,
-restart error drain, forced abort/join и cancellation supervisor. Проверка
-1000 I/O workers на одном runtime thread моделирует ожидание через Semaphore;
-она не измеряет производительность HTTP, PostgreSQL или connection pools.
+Perf-harness и его отчеты удалены после выбора очереди. В unit-тесте supervisor
+1000 уникальных задач проходят через реальные workers и coordinator с тестовым
+storage. Проверяются точные ID вызовов и Completed settlement каждой задачи;
+refill работает через Notify при C=16/Q=32. Остановка idle worker проверяется
+отдельно, без измерений latency/throughput.
