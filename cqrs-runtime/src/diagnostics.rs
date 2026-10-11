@@ -87,11 +87,15 @@ pub(crate) mod test_support {
     }
 
     pub(crate) async fn capture<T>(work: impl Future<Output = T>) -> (T, String) {
+        capture_at(tracing::Level::ERROR, work).await
+    }
+
+    pub(crate) async fn capture_at<T>(level: tracing::Level, work: impl Future<Output = T>) -> (T, String) {
         let writer = Writer::default();
         let dispatch = tracing::Dispatch::new(
             tracing_subscriber::fmt()
                 .with_writer(writer.clone())
-                .with_max_level(tracing::Level::ERROR)
+                .with_max_level(level)
                 .with_ansi(false)
                 .without_time()
                 .finish(),

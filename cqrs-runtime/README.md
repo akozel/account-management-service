@@ -9,13 +9,15 @@ The crate requires Rust 1.98 or later and a Tokio runtime for async execution.
 See [Architecture and call flow](doc/architecture.md) for component
 responsibilities and Mermaid diagrams of command publication and task delivery.
 
+See [Components and terminology](doc/components.md) for the role tree and naming rules.
+
 ## Features
 
 - Base: command execution, optimistic-conflict retry, durable task DTOs,
-  typed handler adaptation, handler routing, and task coordination.
+  typed handler adaptation, handler routing, and task execution.
 - `postgres`: checked command factory, event repository, queue, and canonical SQL assets.
 - `worker`: JoinSet-supervised permanent Tokio workers, a bounded async-channel queue, and shutdown draining.
-- `host`: process signals, shared cancellation and inbound/outbox draining; enables `worker` and `tokio/signal`, with no HTTP framework dependency.
+- `host`: process signals, shared cancellation and inbound/task-runtime draining; enables `worker` and `tokio/signal`, with no HTTP framework dependency.
 - `logging`: explicit fmt logger configuration and fallible installation; independent of other optional features.
 
 `postgres` and `worker` are enabled by default; `host` and `logging` are opt-in.
@@ -51,7 +53,7 @@ bridge. It returns `LoggingInitError` if installation fails, including an existi
 global subscriber/logger; the original `TryInitError` is retained as source with
 safe Display/Debug. This feature installs only a logger.
 
-With `postgres`, `postgres::connect_pool(PgConnectOptions)` returns
+With `postgres`, `postgres::pool::connect_pool(PgConnectOptions)` returns
 `Result<PgPool, sqlx::Error>`, using ten connections and other SQLx defaults.
 Parse options before logger setup and connection; the helper accepts ready
 options, adds no custom retry policy, and returns the original connection error.
@@ -86,16 +88,16 @@ summary events remain; public errors and unknown commit semantics are unchanged.
 
 The host's aggregate gateway selects the aggregate ID and delegates to
 `Arc<dyn command::CommandExecutor<A>>`. With the `postgres` feature, assemble
-the standard snapshot-backed executor through `postgres::command_executor`:
+the standard snapshot-backed executor through `postgres::command_factory::command_executor`:
 
 ```rust
-use std::sync::Arc;
 use cqrs_es::Aggregate;
 use cqrs_runtime::{
     command::CommandExecutor,
-    postgres::{PostgresCommandConfig, command_executor},
+    postgres::command_factory::{PostgresCommandConfig, command_executor},
 };
 use sqlx::PgPool;
+use std::sync::Arc;
 
 fn executor_for<A>(pool: PgPool) -> Arc<dyn CommandExecutor<A>>
 where
@@ -132,27 +134,36 @@ Read [Task processing](doc/task_processing.md) before implementing handlers or
 another queue adapter. It is the complete contract for ownership, ordering,
 idempotency, retry, configuration, timeouts, and leases.
 
-Business handlers perform one operation through `TaskDelivery` and classify its
-result with `TaskHandlerError`. They cannot access the queue's `ClaimLease`.
-`ClaimedTask` is reserved for queue/coordinator ownership and settlement. Aggregates establish business
+Business handlers perform one operation through `TaskAttempt` and classify its
+result with `TaskHandlerError`. They cannot access the queue's `TaskLease`.
+`LeasedTask` is reserved for queue/executor ownership and settlement. Aggregates establish business
 prerequisites; workers may execute published tasks concurrently and out of
 order. Redelivery is expected, including after a successful effect.
 
-Use `outbox::TypedTaskHandler<P>` for one durable DTO version and adapt it through
-`outbox::typed_task_handler::<P, _>(handler)`. The helper returns
-`Result<Box<dyn TaskHandler>, TaskFormatError>` for the existing registry. It is
+Use `task::handling::handler::TaskHandler<P>` for one durable DTO version and adapt it through
+`task::handling::json_adapter::task_adapter::<P, _>(handler)`. The helper returns
+`Result<Box<dyn TaskAdapter>, TaskFormatError>` for the existing dispatcher. It is
 part of the base API, with no optional feature requirement.
 
 ```rust
 use async_trait::async_trait;
-use cqrs_runtime::outbox::{
-    TaskDelivery, TaskFormatError, TaskHandler, TaskHandlerError, TaskPayload,
-    TypedTaskHandler, typed_task_handler,
+use cqrs_runtime::task::{
+    data::{
+        attempt::TaskAttempt,
+        format::{TaskFormatError, TaskPayload},
+    },
+    handling::{
+        adapter::TaskAdapter,
+        handler::{TaskHandler, TaskHandlerError},
+        json_adapter::task_adapter,
+    },
 };
 use serde::{Deserialize, Serialize};
 
 #[derive(Serialize, Deserialize)]
-struct InvoiceTaskV1 { invoice_id: String }
+struct InvoiceTaskV1 {
+    invoice_id: String,
+}
 impl TaskPayload for InvoiceTaskV1 {
     const TASK_TYPE: &'static str = "process_invoice";
     const TASK_VERSION: i32 = 1;
@@ -160,10 +171,8 @@ impl TaskPayload for InvoiceTaskV1 {
 
 struct InvoiceHandler;
 #[async_trait]
-impl TypedTaskHandler<InvoiceTaskV1> for InvoiceHandler {
-    async fn handle(&mut self, payload: InvoiceTaskV1, delivery: &TaskDelivery)
-        -> Result<(), TaskHandlerError>
-    {
+impl TaskHandler<InvoiceTaskV1> for InvoiceHandler {
+    async fn handle(&mut self, payload: InvoiceTaskV1, delivery: &TaskAttempt) -> Result<(), TaskHandlerError> {
         // Invoke one replay-safe business operation using payload.invoice_id.
         // delivery.id()/metadata() carry any required stable operation context.
         let _ = (payload.invoice_id, delivery.id());
@@ -171,26 +180,26 @@ impl TypedTaskHandler<InvoiceTaskV1> for InvoiceHandler {
     }
 }
 
-fn handler() -> Result<Box<dyn TaskHandler>, TaskFormatError> {
-    typed_task_handler::<InvoiceTaskV1, _>(InvoiceHandler)
+fn invoice_adapter() -> Result<Box<dyn TaskAdapter>, TaskFormatError> {
+    task_adapter::<InvoiceTaskV1, _>(InvoiceHandler)
 }
 ```
 
 The adapter checks the expected format at construction, then compares format and
 decodes an owned DTO from borrowed JSON before each invocation. Payloads and
-handlers need `Send`, not `Clone` or `Sync`; the original `&TaskDelivery` and
+handlers need `Send`, not `Clone` or `Sync`; the original `&TaskAttempt` and
 mutable handler state are preserved. Format/decode failures are `Permanent`
 with sanitized expected type/version, without payload, metadata or serde error
 text. Business errors, including backoff, pass unchanged. Additional fields
 follow the DTO's serde policy; current service v1 DTOs keep accepting them.
-Use separate adapters for v1/v2 or implement `TaskHandler` for a multi-version
-handler. Business validation, DTO conversion and exact-repeat classification
-remain application responsibilities. Sender ports may borrow `&TaskDelivery`
+Use separate adapters for v1/v2 or implement `TaskAdapter` for multi-version
+adaptation to a business handler. Business validation, DTO conversion and exact-repeat classification
+remain application responsibilities. Sender ports may borrow `&TaskAttempt`
 throughout async work instead of constructing an owned context or cloning
 metadata; lease credentials remain inaccessible.
 
 The host applies [event-store SQL](sql/001-event-store.sql) and
-[outbox SQL](sql/002-transactional-outbox.sql), supplies handler factories and
+[outbox SQL](sql/002-transactional-outbox.sql), supplies dispatcher factories and
 a database pool. The optional `host` facade owns process signals and
 inbound-adapter draining; the application constructs its inbound adapter and
 closes the pool after the host returns.
@@ -201,60 +210,66 @@ using Tokio and tokio-util 0.7:
 
 ```rust
 use cqrs_runtime::{
-    postgres::{PostgresOutboxQueueConfig, prepare_outbox_runtime},
-    worker::{OutboxRuntimeConfig, HandlerRegistryFactory, PreparedOutboxRuntime, WorkerRegistryError},
+    postgres::{task_queue::config::PostgresTaskQueueConfig, task_runtime_factory::prepare_task_runtime},
+    runtime::{
+        config::TaskRuntimeConfig,
+        dispatcher_factory::{TaskDispatcherFactory, WorkerSetupError},
+        preparation::TaskRuntime,
+    },
 };
 use sqlx::PgPool;
 
 pub fn prepare_tasks(
     pool: PgPool,
-    factory: HandlerRegistryFactory,
-    queue_config: PostgresOutboxQueueConfig,
-    runtime_config: OutboxRuntimeConfig,
-) -> Result<PreparedOutboxRuntime, WorkerRegistryError> {
-    prepare_outbox_runtime(pool, factory, queue_config, runtime_config)
+    factory: TaskDispatcherFactory,
+    queue_config: PostgresTaskQueueConfig,
+    runtime_config: TaskRuntimeConfig,
+) -> Result<TaskRuntime, WorkerSetupError> {
+    prepare_task_runtime(pool, factory, queue_config, runtime_config)
 }
-
 ```
 
-The host shares a `CancellationToken` with HTTP and the outbox supervisor. Call
+The host shares a `CancellationToken` with HTTP and the task supervisor. Call
 `cancel()` and await the supervisor for graceful drain. Fatal supervisor errors
 cancel the supplied token before drain, so HTTP can stop admission immediately.
 Pass a `child_token()` for an isolated pool. Dropping a token handle does not
 cancel it; a lifecycle owner can hold `shutdown.clone().drop_guard()`.
 
-Prepare before binding inbound listeners. `worker::prepare(queue, factory, config)`
-works with any queue; `postgres::prepare_outbox_runtime` assembles the PostgreSQL
+Prepare before binding inbound listeners. `runtime::preparation::prepare(queue, factory, config)`
+works with any queue; `postgres::task_runtime_factory::prepare_task_runtime` assembles the PostgreSQL
 adapter when both `postgres` and `worker` features are enabled. Neither function
 performs storage I/O or starts background tasks. Preparation calls the factory
-exactly C times, freezes ordered formats, and keeps the first registry for worker
-zero. Every fallible factory invocation must return a fresh registry with the same ordered
+exactly C times, freezes ordered formats, and keeps the first dispatcher for worker
+zero. Every fallible factory invocation must return a fresh dispatcher with the same ordered
 format list. Defaults do not read environment variables automatically: call
 `from_env` or pass explicit configurations as above. The guide lists every
 setting, its units/default, and the full lease-budget formula.
+The private poller claims and recovers work with the executor's effective storage
+budget. TaskExecutor only executes and settles one attempt; it exposes no claim,
+recovery or format-routing methods.
 
-`OutboxRuntimeConfig` combines the existing coordinator and worker configs,
+`TaskRuntimeConfig` combines storage and worker pool configs,
 checks the complete lease budget at construction/load time, and keeps PostgreSQL
 statement timeout separate. The service loads configs before connecting to the
-database. `PreparedOutboxRuntime` is consumed by `run`; it rebuilds registries only
+database. `TaskRuntime` is consumed by `run`; it rebuilds dispatchers only
 on restart, preserving each worker's mutable state. Dropping the prepared object
 releases handlers without cancellation. A polled run owns a cancellation DropGuard;
 a pre-cancelled token starts no tasks or storage operations.
 
-Configuration errors (`OutboxRuntimeConfigError`), preparation errors
-(`WorkerRegistryError`) and runtime exits
-(`OutboxWorkerPoolError`) remain distinct. Low-level `worker::run` is retained for
-custom coordinators; it uses the same supervisor engine and preserves cancelled
-startup and actual-coordinator budget validation.
+Configuration errors (`TaskRuntimeConfigError`), preparation errors
+(`WorkerSetupError`) and runtime exits
+(`TaskRuntimeError`) remain distinct. Low-level `runtime::supervisor::run` is retained for
+custom executors; it uses the same supervisor engine and preserves cancelled
+startup and actual-executor budget validation.
 
-Configs validate local values at construction; `OutboxRuntimeConfig` validates
-their combined lease budget. Building a coordinator or PostgreSQL queue from
-checked configs is infallible. Both preparation APIs return `WorkerRegistryError`
+Configs validate local values at construction; `TaskRuntimeConfig` validates
+their combined lease budget. Building a executor or PostgreSQL queue from
+checked configs is infallible. Both preparation APIs return `WorkerSetupError`
 directly: `Build` retains its source and worker index, while `FormatsMismatch`
 identifies the worker with a different ordered format list.
-`OutboxWorkerPoolError::{Configuration, Registry}` covers low-level startup budget
-validation and startup/restart registry errors. Registry getters borrow their
-stored formats; handler and coordinator traits still return owned format lists.
+`TaskRuntimeError::{Configuration, WorkerSetup}` covers low-level startup budget
+validation and startup/restart dispatcher errors. Dispatcher getters borrow their
+stored formats; adapter traits return owned format lists.
 
 Generate local API documentation with:
 
@@ -264,47 +279,48 @@ cargo doc --all-features --no-deps
 
 ## Process lifecycle integration
 
-Enable `features = ["host"]` and give the inbound adapter and outbox the same
+Enable `features = ["host"]` and give the inbound adapter and tasks the same
 `CancellationToken`. The inbound future returns `io::Result<()>`; it may borrow
-local state and need not be `Send`. The outbox future returns
-`Result<(), worker::OutboxWorkerPoolError>` and must be `Send + 'static`, because host
+local state and need not be `Send`. The tasks future returns
+`Result<(), runtime::supervisor::TaskRuntimeError>` and must be `Send + 'static`, because host
 spawns it. Signal futures can also borrow local state and need not be `Send`.
 
 ```rust,no_run
+use cqrs_runtime::{
+    host::{error::HostError, lifecycle::run, signal::shutdown_signal},
+    runtime::supervisor::TaskRuntimeError,
+};
 use std::{future::Future, io};
-use cqrs_runtime::{host::{self, HostError}, worker::OutboxWorkerPoolError};
 use tokio_util::sync::CancellationToken;
 
-async fn serve<Inbound, Outbox>(
-    inbound: Inbound, outbox: Outbox, shutdown: CancellationToken,
-) -> Result<(), HostError>
+async fn serve<Inbound, Tasks>(inbound: Inbound, tasks: Tasks, shutdown: CancellationToken) -> Result<(), HostError>
 where
     Inbound: Future<Output = io::Result<()>>,
-    Outbox: Future<Output = Result<(), OutboxWorkerPoolError>> + Send + 'static,
+    Tasks: Future<Output = Result<(), TaskRuntimeError>> + Send + 'static,
 {
-    host::run(inbound, outbox, shutdown, host::shutdown_signal()).await
+    run(inbound, tasks, shutdown, shutdown_signal()).await
 }
 ```
 
-For a prepared runtime, pass `outbox.run(shutdown.clone())` directly to `host::run`.
-The host installs its cancellation DropGuard before spawning outbox on first
+For a prepared runtime, pass `tasks.run(shutdown.clone())` directly to `host::lifecycle::run`.
+The host installs its cancellation DropGuard before spawning tasks on first
 poll; simply creating or dropping an unpolled host future starts nothing and
 leaves the token unchanged. `shutdown_signal` observes SIGINT/SIGTERM on Unix
 and Ctrl-C elsewhere, returning observation errors, including a closed SIGTERM
 stream.
 
-Stop observation uses biased priority: signal → token → inbound exit → outbox
+Stop observation uses biased priority: signal → token → inbound exit → tasks
 exit. The host cancels the token and awaits both components. An unexpected exit
-remains the primary error; requested shutdown prefers signal observation, outbox,
+remains the primary error; requested shutdown prefers signal observation, tasks,
 then inbound errors. Secondary failures are logged. `HostError::log` and `Debug`
 render task failures as task ID and panic/cancellation flags, preserving the
 original `JoinError` as a source without rendering its panic payload.
 
 Normal return happens after both components drain; the caller then closes the
 pool even on error. Dropping/aborting a polled host cancels the token and detaches
-the outbox task so its independent drain can finish while Tokio remains running.
+the tasks task so its independent drain can finish while Tokio remains running.
 The inbound future is dropped, and the host cannot await components or guarantee
-resource cleanup. Outbox retains its H+S budget; inbound drain and pool closure
+resource cleanup. Tasks retains its H+S budget; inbound drain and pool closure
 have no host timeout ([known issue #10](../doc/known_issues/http_shutdown.md)).
 
 ## PostgreSQL persistence and operational limits
@@ -332,21 +348,34 @@ receiver's idempotency window.
 
 ## Code organization and validated APIs
 
-The public namespaces are `command`, `outbox`, `postgres`, `worker`, `host`, and `logging`;
-their child modules are private implementation details. Command execution and
-conflict retry are separate. Outbox modules group wire data, delivery/ownership,
-handler routing, queue transitions, and coordination. The worker groups combined config, startup preparation,
-supervision, and permanent worker lifecycle. PostgreSQL keeps queue SQL separate from the
-single-event write plan and its atomic CTE compiler.
+The public namespaces are `command`, `task`, `postgres`, `runtime`, `host`, and
+`logging`. Types and functions are imported from their defining modules; old
+flattened paths have no compatibility re-exports. Polling, worker-pool internals,
+SQL operations and checked write plans remain private. The
+[component source map](doc/components.md#source-layout) describes the directory
+layout. Task's `data`, `handling`, `queue`, and `executor` module roots only
+declare components. Each implementation has its own file; queue and
+executor ports are separate from concrete adapters. Handler-visible attempts
+live with data, while leases live with queue ownership.
+
+The runtime separates dispatcher construction, polling, worker-pool ownership,
+supervision, and the receive/execute loop. PostgreSQL queue operations each keep
+their SQL, row decoding, and complete transaction in one file. The event
+repository separates its adapter, checked write plan, and atomic CTE compiler.
 
 Unit tests stay in inline `#[cfg(test)] mod tests { ... }` blocks alongside
-the code they exercise; shared runtime fakes live in `outbox/test_support.rs`.
-PostgreSQL integration suites remain under `tests/postgres/`.
-Worker unit tests include a 1,000-delivery run through the supervisor and coordinator
+the code they exercise; shared runtime fakes live in `task/test_support.rs`.
+Public runtime behavior is exercised under `tests/runtime/`, rooted by
+`tests/runtime.rs`; that suite owns its queue and handler fixtures. PostgreSQL
+integration suites remain under `tests/postgres/`.
+The [coverage audit](doc/test_coverage.md) maps the runtime invariants to their
+unit, runtime and PostgreSQL regression suites, including concurrent writes, settlement,
+recovery and expiry during lock waits.
+Runtime integration tests include a 1,000-delivery run through the supervisor and executor
 with test storage, checking every handler invocation ID and its Completed settlement.
 Queue limits, cancellation, restart and shutdown have separate behavioral checks.
 
-`TaskFormat::new/of`, `NewOutboxTask` builders, and configuration constructors
+`TaskFormat::new/of`, `NewTask` builders, and configuration constructors
 return typed validation errors. Their fields are private: use getters and
 checked builders, not struct literals. `AggregateConflictRetryPolicy::new` is
 also fallible; only representable backoff budgets are accepted.
@@ -356,20 +385,20 @@ completion, scheduled retry, failure, and lost ownership. `TaskFailureCause`
 provides fixed safe log reasons, independent of persisted handler error text.
 `LeaseRecoveryReport` derives its total from retries and confirmed failures.
 
-`OutboxError::InvalidRequest` only describes invalid queue request parameters.
+`TaskProcessingError::InvalidRequest` only describes invalid queue request parameters.
 `InvalidDelivery` describes structurally invalid queue data or settlement results;
 `InvalidExecutionBudget` describes an invalid invocation budget. Storage timeout
 and exhausted lease budgets remain distinct and do not establish a failed commit.
 
-Host I/O diagnostics expose only the error kind, and registry error formatting
+Host I/O diagnostics expose only the error kind, and dispatcher error formatting
 sanitizes task type names. Original sources and duplicate formats remain available
 for programmatic inspection, without appearing as arbitrary text in host logs.
 
-`HandlerRegistryFactory` returns `Result<TaskHandlerRegistry, TaskHandlerRegistryError>`.
-`PreparedOutboxRuntime::run` reports `OutboxWorkerPoolError` for runtime failures.
-Low-level `worker::run` also reports configuration and registry errors on startup.
+`TaskDispatcherFactory` returns `Result<TaskDispatcher, TaskDispatcherError>`.
+`TaskRuntime::run` reports `TaskRuntimeError` for runtime failures.
+Low-level `runtime::supervisor::run` also reports configuration and dispatcher errors on startup.
 Preparation reports typed errors before any workers start. It still supervises
-one mutable registry per permanent Tokio task and leaves interrupted work for recovery.
+one mutable dispatcher per permanent Tokio task and leaves interrupted work for recovery.
 Defaults are 128 concurrent deliveries, 128 queued deliveries, and a 60-second
 lease. `OUTBOX_QUEUE_CAPACITY` and `OUTBOX_WORKER_CONCURRENCY` are independent.
 The explicit worker config constructor now takes `queue_capacity` after

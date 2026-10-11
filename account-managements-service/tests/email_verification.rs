@@ -13,7 +13,7 @@ use account_managements_service::{
             gateway::EmailReservationGateway,
             service::{RegistrationMaterialGenerator, email_reservation_service},
             tasks::send_verification_code::{
-                VerificationCodeDelivery, VerificationCodeSender, send_verification_code_task_handler,
+                VerificationCodeDelivery, VerificationCodeSender, send_verification_code_task_adapter,
                 v1::SendVerificationCodeTaskV1,
             },
         },
@@ -37,12 +37,14 @@ use cqrs_es::{
     persist::{EventStoreAggregateContext, PersistedEventRepository, PersistedEventStore},
 };
 use cqrs_runtime::{
-    command::{AggregateConflictRetryPolicy, CqrsCommandExecutor},
-    outbox::{OutboxQueue, TaskFormat, TaskHandlerError},
+    command::{executor::CqrsCommandExecutor, retry::AggregateConflictRetryPolicy},
     postgres::{
-        EVENT_STORE_SCHEMA, PostgresCommandConfig, PostgresEventRepositoryWithOutbox, PostgresOutboxQueue,
-        TRANSACTIONAL_OUTBOX_SCHEMA, command_executor,
+        EVENT_STORE_SCHEMA, TRANSACTIONAL_OUTBOX_SCHEMA,
+        command_factory::{PostgresCommandConfig, command_executor},
+        event_repository_with_outbox::repository::PostgresEventRepositoryWithOutbox,
+        task_queue::queue::PostgresTaskQueue,
     },
+    task::{data::format::TaskFormat, handling::handler::TaskHandlerError, queue::port::TaskQueue},
 };
 use serde_json::{Value, json};
 use sha2::{Digest, Sha256};
@@ -512,7 +514,7 @@ impl VerificationCodeSender for RecordingSender {
     async fn send(
         &mut self,
         message: VerificationCodeDelivery,
-        _: &cqrs_runtime::outbox::TaskDelivery,
+        _: &cqrs_runtime::task::data::attempt::TaskAttempt,
     ) -> Result<(), TaskHandlerError> {
         self.0.lock().unwrap().push(message);
         Ok(())
@@ -538,7 +540,7 @@ async fn delayed_tasks_deliver_frozen_pairs_without_reactivating_old_ones() {
         .as_str()
         .unwrap()
         .to_owned();
-    let queue = PostgresOutboxQueue::new(db.pool.clone());
+    let queue = PostgresTaskQueue::new(db.pool.clone());
     let mut messages = queue
         .claim(
             &TaskFormat::of::<SendVerificationCodeTaskV1>().unwrap(),
@@ -552,9 +554,9 @@ async fn delayed_tasks_deliver_frozen_pairs_without_reactivating_old_ones() {
     messages.reverse();
     let sender = RecordingSender::default();
     let delivered = sender.0.clone();
-    let mut handler = send_verification_code_task_handler(Box::new(sender)).unwrap();
+    let mut handler = send_verification_code_task_adapter(Box::new(sender)).unwrap();
     for message in &messages {
-        handler.handle(message.delivery()).await.unwrap();
+        handler.invoke(message.attempt()).await.unwrap();
     }
     {
         let delivered = delivered.lock().unwrap();

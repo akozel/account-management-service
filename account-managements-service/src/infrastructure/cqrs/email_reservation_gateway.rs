@@ -3,7 +3,7 @@ use std::sync::Arc;
 use async_trait::async_trait;
 use cqrs_runtime::{
     command::{CommandExecutor, CommandGatewayError},
-    outbox::NewOutboxTask,
+    task::data::new_task::NewTask,
 };
 
 use crate::{
@@ -30,7 +30,7 @@ impl EmailReservationGateway for CqrsEmailReservationGateway {
     async fn execute_with_outbox(
         &self,
         command: EmailReservationCommand,
-        tasks: Vec<NewOutboxTask>,
+        tasks: Vec<NewTask>,
     ) -> Result<(), CommandGatewayError<EmailReservationError>> {
         let aggregate_id = aggregate_id(&command);
         self.executor.execute(&aggregate_id, command, tasks).await

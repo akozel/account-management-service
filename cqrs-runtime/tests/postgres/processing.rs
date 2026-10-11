@@ -3,19 +3,19 @@ use super::*;
 #[tokio::test]
 async fn worker_test_aggregate_covers_success_retry_exhaustion_and_permanent_failure() {
     let db = Database::new().await;
-    let queue = Arc::new(PostgresOutboxQueue::new(db.pool.clone()));
-    let service = outbox_task_coordinator(queue.clone(), vec![format()]);
+    let queue = Arc::new(PostgresTaskQueue::new(db.pool.clone()));
+    let service = task_executor(queue.clone());
 
     let succeeded = new_task();
     enqueue(&db.pool, vec![succeeded.clone()]).await;
     assert_worker_state(&db.pool, succeeded.id(), "pending", 0, None).await;
     let first = claim(&queue).await.pop().unwrap();
-    assert_eq!(first.delivery().id(), succeeded.id());
-    assert_eq!(first.delivery().attempt(), 1);
+    assert_eq!(first.attempt().id(), succeeded.id());
+    assert_eq!(first.attempt().number(), 1);
     assert_worker_state(&db.pool, succeeded.id(), "processing", 1, None).await;
     assert!(
         service
-            .execute_and_settle(&mut handler(Ok(())), first.clone(), Duration::from_secs(1))
+            .execute_and_settle(&mut dispatcher(adapter(Ok(()))), first.clone(), Duration::from_secs(1))
             .await
             .unwrap()
             .is_applied()
@@ -40,10 +40,10 @@ async fn worker_test_aggregate_covers_success_retry_exhaustion_and_permanent_fai
     assert!(
         service
             .execute_and_settle(
-                &mut handler(Err(TaskHandlerError::Retry {
+                &mut dispatcher(adapter(Err(TaskHandlerError::Retry {
                     reason: "remote busy".into(),
                     retry_after: Some(Duration::from_secs(300)),
-                })),
+                }))),
                 first.clone(),
                 Duration::from_secs(1),
             )
@@ -57,8 +57,8 @@ async fn worker_test_aggregate_covers_success_retry_exhaustion_and_permanent_fai
     assert!(claim(&queue).await.is_empty());
     make_ready(&db.pool, transient.id()).await;
     let second = claim(&queue).await.pop().unwrap();
-    assert_eq!(second.delivery().id(), transient.id());
-    assert_eq!(second.delivery().attempt(), 2);
+    assert_eq!(second.attempt().id(), transient.id());
+    assert_eq!(second.attempt().number(), 2);
     assert_ne!(second.lease().lock_token(), first.lease().lock_token());
     assert!(
         !queue
@@ -70,7 +70,7 @@ async fn worker_test_aggregate_covers_success_retry_exhaustion_and_permanent_fai
     assert_worker_state(&db.pool, transient.id(), "processing", 2, Some("remote busy")).await;
     assert!(
         service
-            .execute_and_settle(&mut handler(Ok(())), second, Duration::from_secs(1))
+            .execute_and_settle(&mut dispatcher(adapter(Ok(()))), second, Duration::from_secs(1))
             .await
             .unwrap()
             .is_applied()
@@ -83,10 +83,10 @@ async fn worker_test_aggregate_covers_success_retry_exhaustion_and_permanent_fai
     let claimed = claim(&queue).await.pop().unwrap();
     let exhausted_result = service
         .execute_and_settle(
-            &mut handler(Err(TaskHandlerError::Retry {
+            &mut dispatcher(adapter(Err(TaskHandlerError::Retry {
                 reason: "still unavailable".into(),
                 retry_after: Some(Duration::ZERO),
-            })),
+            }))),
             claimed,
             Duration::from_secs(1),
         )
@@ -104,9 +104,9 @@ async fn worker_test_aggregate_covers_success_retry_exhaustion_and_permanent_fai
     let claimed = claim(&queue).await.pop().unwrap();
     let permanent_result = service
         .execute_and_settle(
-            &mut handler(Err(TaskHandlerError::Permanent {
+            &mut dispatcher(adapter(Err(TaskHandlerError::Permanent {
                 reason: "invalid address".into(),
-            })),
+            }))),
             claimed,
             Duration::from_secs(1),
         )
@@ -123,7 +123,7 @@ async fn worker_test_aggregate_covers_success_retry_exhaustion_and_permanent_fai
 #[tokio::test]
 async fn worker_test_aggregate_covers_lease_recovery_and_fenced_settlement() {
     let db = Database::new().await;
-    let queue = PostgresOutboxQueue::new(db.pool.clone());
+    let queue = PostgresTaskQueue::new(db.pool.clone());
     let mut task = new_task();
     task = task.with_max_attempts(2).unwrap();
     enqueue(&db.pool, vec![task.clone()]).await;
@@ -140,7 +140,7 @@ async fn worker_test_aggregate_covers_lease_recovery_and_fenced_settlement() {
 
     make_ready(&db.pool, task.id()).await;
     let second = claim(&queue).await.pop().unwrap();
-    assert_eq!(second.delivery().attempt(), 2);
+    assert_eq!(second.attempt().number(), 2);
     assert_ne!(first.lease().lock_token(), second.lease().lock_token());
     assert!(!queue.settle(&first, SettlementRequest::Completed).await.unwrap().is_applied());
     assert_worker_state(&db.pool, task.id(), "processing", 2, Some("worker lease expired")).await;
@@ -168,8 +168,8 @@ async fn worker_test_aggregate_covers_lease_recovery_and_fenced_settlement() {
 #[tokio::test]
 async fn worker_test_aggregate_retries_timeouts_then_fails_at_attempt_limit() {
     let db = Database::new().await;
-    let queue = Arc::new(PostgresOutboxQueue::new(db.pool.clone()));
-    let service = outbox_task_coordinator(queue.clone(), vec![format()]);
+    let queue = Arc::new(PostgresTaskQueue::new(db.pool.clone()));
+    let service = task_executor(queue.clone());
     let mut task = new_task();
     task = task.with_max_attempts(2).unwrap();
     enqueue(&db.pool, vec![task.clone()]).await;
@@ -177,7 +177,7 @@ async fn worker_test_aggregate_retries_timeouts_then_fails_at_attempt_limit() {
     let first = claim(&queue).await.pop().unwrap();
     assert!(
         service
-            .execute_and_settle(&mut HangingHandler, first, Duration::from_millis(5))
+            .execute_and_settle(&mut dispatcher(HangingAdapter), first, Duration::from_millis(5))
             .await
             .unwrap()
             .is_applied()
@@ -190,7 +190,7 @@ async fn worker_test_aggregate_retries_timeouts_then_fails_at_attempt_limit() {
     let second = claim(&queue).await.pop().unwrap();
     assert!(
         service
-            .execute_and_settle(&mut HangingHandler, second, Duration::from_millis(5))
+            .execute_and_settle(&mut dispatcher(HangingAdapter), second, Duration::from_millis(5))
             .await
             .unwrap()
             .is_applied()
@@ -203,15 +203,16 @@ async fn worker_test_aggregate_retries_timeouts_then_fails_at_attempt_limit() {
 #[tokio::test]
 async fn worker_test_aggregate_redelivers_after_success_without_acknowledgement() {
     let db = Database::new().await;
-    let queue = Arc::new(PostgresOutboxQueue::new(db.pool.clone()));
-    let service = outbox_task_coordinator(queue.clone(), vec![format()]);
+    let queue = Arc::new(PostgresTaskQueue::new(db.pool.clone()));
+    let service = task_executor(queue.clone());
     let task = new_task();
     enqueue(&db.pool, vec![task.clone()]).await;
     let deliveries = Arc::new(AtomicUsize::new(0));
-    let mut handler = CountingHandler(deliveries.clone());
+    let mut handler = CountingAdapter(deliveries.clone());
 
     let first = claim(&queue).await.pop().unwrap();
-    handler.handle(first.delivery()).await.unwrap();
+    handler.invoke(first.attempt()).await.unwrap();
+    let mut handler = dispatcher(handler);
     // The process stops after the side effect, before acknowledging ownership.
     assert_worker_state(&db.pool, task.id(), "processing", 1, None).await;
     expire(&db.pool, task.id()).await;

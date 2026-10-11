@@ -17,18 +17,20 @@ use cqrs_es::{
     persist::{PersistedEventRepository, PersistenceError, SerializedEvent},
 };
 #[cfg(feature = "worker")]
+use cqrs_runtime::runtime::{self, dispatcher_factory::TaskDispatcherFactory, worker_pool_config::TaskWorkerPoolConfig};
 use cqrs_runtime::{
-    outbox::TaskHandlerRegistry,
-    worker::{self as outbox_worker_pool, HandlerRegistryFactory, OutboxWorkerPoolConfig},
-};
-use cqrs_runtime::{
-    outbox::{
-        ClaimedTask, NewOutboxTask, OutboxError, OutboxQueue, SettlementRequest, TaskFormat, TaskHandler, TaskHandlerError,
-        TaskPayload, TaskSchedule, outbox_task_coordinator,
-    },
     postgres::{
-        EVENT_STORE_SCHEMA, PostgresEventRepositoryWithOutbox, PostgresOutboxQueue, REQUEUE_FAILED_OUTBOX_TASK,
-        TRANSACTIONAL_OUTBOX_SCHEMA,
+        EVENT_STORE_SCHEMA, REQUEUE_FAILED_OUTBOX_TASK, TRANSACTIONAL_OUTBOX_SCHEMA,
+        event_repository_with_outbox::repository::PostgresEventRepositoryWithOutbox, task_queue::queue::PostgresTaskQueue,
+    },
+    task::{
+        data::{
+            format::{TaskFormat, TaskPayload},
+            new_task::{NewTask, TaskSchedule},
+        },
+        executor::default_executor::task_executor,
+        handling::{adapter::TaskAdapter, dispatcher::TaskDispatcher, handler::TaskHandlerError},
+        queue::{error::TaskProcessingError, lease::LeasedTask, port::TaskQueue, settlement::SettlementRequest},
     },
 };
 use serde::{Deserialize, Serialize};
@@ -45,6 +47,8 @@ use uuid::Uuid;
 
 #[path = "postgres/command_factory.rs"]
 mod command_factory;
+#[path = "postgres/failures.rs"]
+mod failures;
 #[path = "postgres/persistence.rs"]
 mod persistence;
 #[path = "postgres/pool.rs"]
@@ -53,6 +57,8 @@ mod pool;
 mod processing;
 #[path = "postgres/queue.rs"]
 mod queue;
+#[path = "postgres/schema.rs"]
+mod schema;
 #[path = "postgres/support.rs"]
 mod support;
 #[path = "postgres/timeouts.rs"]

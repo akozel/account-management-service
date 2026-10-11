@@ -4,6 +4,7 @@ This is the runtime contract for integrating task handlers, queues, and workers
 in another application. The engine owns delivery and lease management;
 application aggregates own business transitions.
 
+For the component tree and naming conventions, see [Components](components.md).
 For component boundaries, relationships, and the order of calls, see
 [Architecture and call flow](architecture.md).
 
@@ -13,7 +14,9 @@ For component boundaries, relationships, and the order of calls, see
 | --- | --- |
 | Domain/application | Check aggregate phases, publish dependent work with the event that establishes its prerequisite, and define completion of the operation. |
 | Business handler/sender | Perform one operation, classify its result, and make repeated or concurrent execution safe. |
-| Runtime adapter/coordinator/worker | Check and decode typed task formats, route supported formats, bound execution and storage waits, settle outcomes, and recover expired ownership. |
+| Adapter/dispatcher | Check and decode formats, route attempts, invoke business handlers. |
+| Executor | Bound one attempt by its execution/lease budgets and settle its outcome. |
+| Poller/worker/supervisor | Acquire/recover work, bound local admission, supervise consumers and drain started work. |
 | Queue adapter | Atomically claim tasks, count attempts, provide a conservative local lease deadline, and fence settlement in storage. |
 
 An accepted event, its optional snapshot, and explicit tasks are committed
@@ -75,34 +78,34 @@ and manual requeue. Attempts and lock tokens are not operation identities.
 The receiver must provide the promised deduplication, including concurrent
 requests and the allowed replay period; storing a key alone does not do so.
 
-Business handlers receive `&TaskDelivery`: immutable ID, format, payload,
+Business handlers receive `&TaskAttempt`: immutable ID, format, payload,
 metadata, and positive attempt number through getters. They do not receive
-`ClaimedTask` or `ClaimLease`. The latter holds the runtime's ownership token
-and conservative monotonic deadline; only queue/coordinator code uses it.
+`LeasedTask` or `TaskLease`. The latter holds the runtime's ownership token
+and conservative monotonic deadline; only queue/executor code uses it.
 Domain events do not contain delivery controls.
 
-`TaskFormat`, `NewOutboxTask`, and `TaskDelivery` have checked constructors and
+`TaskFormat`, `NewTask`, and `TaskAttempt` have checked constructors and
 private fields. Format names are nonempty, versions/attempt limits are positive,
 and payload/metadata must be JSON objects. This structural validation does not
 validate a version's business schema: the typed adapter decodes it, and the
 business handler validates and classifies its operation.
-`NewOutboxTask::scheduled`, `with_metadata`, and `with_max_attempts` are fallible
+`NewTask::scheduled`, `with_metadata`, and `with_max_attempts` are fallible
 builders that preserve the generated task ID. Defaults remain now/empty metadata/
 ten total claims. Invalid DTOs fail before SQL; database constraints still fence
 direct writers and enforce durable lifecycle invariants.
 
 ### Typed task operations
 
-Implement `#[async_trait] TypedTaskHandler<P>` for one DTO version. Its method is
-`handle(&mut self, payload: P, delivery: &TaskDelivery) -> Result<(), TaskHandlerError>`.
+Implement `#[async_trait] TaskHandler<P>` for one DTO version. Its method is
+`handle(&mut self, payload: P, delivery: &TaskAttempt) -> Result<(), TaskHandlerError>`.
 `P` implements `TaskPayload + DeserializeOwned + Send + 'static`; the handler is
 `Send`. Neither requires `Clone` or `Sync`. The base helper
-`typed_task_handler::<P, H>(handler)` accepts an owned `'static` handler and returns
-`Result<Box<dyn TaskHandler>, TaskFormatError>` for the existing registry.
+`task_adapter::<P, H>(handler)` accepts an owned `'static` handler and returns
+`Result<Box<dyn TaskAdapter>, TaskFormatError>` for the existing dispatcher.
 
 Construction validates `TaskFormat::of::<P>()` before registration and exposes
 only that format. Handling compares the complete format before decoding an owned
-DTO directly from borrowed JSON; the original `&TaskDelivery` reaches the business
+DTO directly from borrowed JSON; the original `&TaskAttempt` reaches the business
 operation unchanged. Mutable handler state survives between deliveries. Serde
 settings remain on the DTO: extra fields are accepted by the current v1 DTOs,
 and a DTO with `deny_unknown_fields` retains that restriction.
@@ -119,15 +122,15 @@ unchanged; the adapter adds no retries, settlement or successor task publication
 Business handlers keep semantic validation, DTO-to-current-input conversion,
 and exact-redelivery classification. The verification handler still enforces a
 seven-digit code and converts v1 into `VerificationCodeDelivery`. Its sender now
-borrows the same `&TaskDelivery` throughout `send`; ID, attempt and metadata come
+borrows the same `&TaskAttempt` throughout `send`; ID, attempt and metadata come
 from getters without an owned `DeliveryContext` or a metadata clone. Sender ports
 remain application-owned. A sender retaining data beyond the invocation must
 explicitly own the fields it needs.
 
-Register one adapter per supported DTO version. The registry rejects duplicate
-formats as before. Custom multi-version handlers can still implement `TaskHandler`;
+Register one adapter per supported DTO version. The dispatcher rejects duplicate
+formats as before. Custom multi-version handlers can still implement `TaskAdapter`;
 unsupported durable formats remain pending until a compatible worker claims them.
-See [typed adapter](../src/outbox/typed_handler.rs) and the
+See [typed adapter](../src/task/handling/json_adapter.rs) and the
 [implementation plan](../../doc/backlog/cqrs_runtime_typed_task_adapter.md).
 
 ## Retry and task lifecycle
@@ -166,7 +169,7 @@ Completed tasks are not requeued by this statement.
 
 ## Requested and confirmed transitions
 
-`SettlementRequest::{Completed, Retry, Failed}` is the coordinator's request,
+`SettlementRequest::{Completed, Retry, Failed}` is the executor's request,
 not a statement that storage accepted it. `SettlementResult` reports only
 post-commit `Completed`, `RetryScheduled`, or `Failed(TaskFailure)`;
 `OwnershipLost` confirms no owned transition. `is_applied()` includes retry.
@@ -190,9 +193,9 @@ includes both rescheduled work and confirmed terminal failures; use
 | `OUTBOX_STORAGE_TIMEOUT_MS` | `6000` | Coordinator deadline for the whole multi-format claim batch, or one recovery/settlement call. |
 | `OUTBOX_POSTGRES_STATEMENT_TIMEOUT_MS` | `4000` | PostgreSQL deadline for each statement in queue transactions, including lock waiting. |
 
-Use `worker::OutboxRuntimeConfig::from_env` to load and validate coordinator/worker
+Use `runtime::config::TaskRuntimeConfig::from_env` to load and validate storage/worker
 settings together, before connecting the database. PostgreSQL statement timeout
-is loaded separately with `PostgresOutboxQueueConfig::from_env`. Existing low-level
+is loaded separately with `PostgresTaskQueueConfig::from_env`. Existing low-level
 config loaders remain available.
 Constructors without explicit configuration use defaults; they do not read
 environment variables automatically. Positive values are required. Queue capacity must fit the runtime's validated range;
@@ -201,17 +204,17 @@ capacity are independent, even when only one environment variable is overridden.
 PostgreSQL setting must fit `1..=2147483647` milliseconds; the other types
 validate their supported duration ranges.
 
-Each config validates its local values at construction. Building a coordinator
+Each config validates its local values at construction. Building a executor
 or PostgreSQL queue from these checked configs is infallible. The combined config
-checks the lease budget; low-level `worker::run` still checks against its custom
-coordinator's actual storage budget. Defaults and env fallback values share the
+checks the lease budget; the poller uses the executor's shared storage budget. Low-level `runtime::supervisor::run` still checks against its custom
+executor's actual storage budget. Defaults and env fallback values share the
 same constants. Runtime `from_env` loaders currently treat non-Unicode values as
 absent; the executable's `ServiceConfig` rejects them before delegating to loaders.
 
 The runtime storage deadline includes connection acquisition, SQL, commit,
 and response waiting. All formats in a claim batch share one deadline;
 a later timeout preserves tasks confirmed by earlier claims.
-`OutboxError::TimedOut` means an unknown storage result. The runtime releases
+`TaskProcessingError::TimedOut` means an unknown storage result. The runtime releases
 its waiting capacity; a claim or settlement may nevertheless have committed.
 
 PostgreSQL uses `set_config('statement_timeout', value, true)` in each queue
@@ -221,7 +224,14 @@ server budget shorter than the runtime budget, while accounting for different
 clock start points and multi-statement recovery. The server setting does not
 bound pool acquisition or network waiting.
 
-Worker startup validates the complete budget against the coordinator's
+Settlement locks the matching processing row before checking lease expiry with
+PostgreSQL's clock. A lease can expire while SQL waits for another transaction's
+row lock, even if that transaction changes no data. The materialized ownership
+CTE ensures the expiry check follows lock acquisition; expired ownership cannot
+complete, fail, or reschedule the task. See the
+[queue regression suite](../tests/postgres/queue.rs).
+
+Worker startup validates the complete budget against the executor's
 effective storage timeout:
 
 ```text
@@ -246,8 +256,8 @@ optional dotenv (missing file is allowed, other errors returned), snapshots its
 supported env keys, rejects non-Unicode values and validates PostgreSQL URI,
 numeric IPv4/IPv6 bind address, logging level and all budgets before DB connection.
 It installs `logging::LoggingConfig` only after config validation, connects with
-`postgres::connect_pool` (ten connections, other SQLx defaults), prepares all
-registries and binds HTTP before starting host. Constructors with no `from_env`
+`postgres::pool::connect_pool` (ten connections, other SQLx defaults), prepares all
+dispatchers and binds HTTP before starting host. Constructors with no `from_env`
 read no environment. The private shared integer parser preserves per-config units,
 validation, defaults and error variants; it adds no public utility API.
 
@@ -271,7 +281,7 @@ Command technical failures are logged once before being mapped to Unavailable,
 with operation execute, sanitized aggregate type, framework category and available
 SQLx classification. Domain/conflict behavior and retries are unchanged. Queue
 errors log category and operation claim/settle/recover_expired before losing their
-SQLx source in OutboxError::Unavailable; connect errors also get safe diagnostics.
+SQLx source in TaskProcessingError::Unavailable; connect errors also get safe diagnostics.
 Only valid five-character uppercase/digit SQLSTATE is emitted. Fixed categories
 are io/tls/database/pool_timeout/pool_closed/decode/configuration/other. Never
 format commands, payload/metadata, aggregate ID/email, URL, raw errors or database
@@ -280,7 +290,7 @@ See the [startup plan](../../doc/backlog/cqrs_runtime_configuration_logging.md).
 
 ## Worker lifecycle and bounded admission
 
-Every permanent Tokio worker owns one mutable handler registry and performs one
+Every permanent Tokio worker owns one mutable handler dispatcher and performs one
 delivery at a time, through handler and settlement. Registry/sender state survives
 between deliveries until the worker exits. Concurrency is a process-wide setting,
 independent of CPU count or runtime OS threads; HTTP I/O can overlap on one thread.
@@ -307,43 +317,43 @@ are started concurrently by the poller, and completion notifications do not canc
 a storage await already in progress.
 
 JoinSet observes worker exits and panics without waiting for a polling tick. Each
-exit removes one Tokio task ID and recreates one checked registry/task for that
+exit removes one Tokio task ID and recreates one checked dispatcher/task for that
 worker index. An in-progress bounded storage await may delay this observation.
 Panic payloads are not logged by supervision; panic=abort ends the process.
 
 Prepare startup handlers before opening inbound listeners with
-`worker::prepare(queue, factory, OutboxRuntimeConfig)` or, for PostgreSQL,
-`postgres::prepare_outbox_runtime(pool, factory, queue_config, runtime_config)`.
+`runtime::preparation::prepare(queue, factory, TaskRuntimeConfig)` or, for PostgreSQL,
+`postgres::task_runtime_factory::prepare_task_runtime(pool, factory, queue_config, runtime_config)`.
 Both functions are synchronous and perform no storage work or background spawn.
-The first registry defines ordered formats and is retained for worker zero;
-all remaining C−1 registries must match before preparation succeeds. There is
-no extra disposable registry. Preparation errors free already built handlers.
+The first dispatcher defines ordered formats and is retained for worker zero;
+all remaining C−1 dispatchers must match before preparation succeeds. There is
+no extra disposable dispatcher. Preparation errors free already built handlers.
 
-Both preparation functions return `WorkerRegistryError` directly. `Build` reports
-the worker index and retains its `TaskHandlerRegistryError` source;
+Both preparation functions return `WorkerSetupError` directly. `Build` reports
+the worker index and retains its `TaskDispatcherError` source;
 `FormatsMismatch` reports a differing ordered format list at that index.
-`TaskHandlerRegistry::formats()` borrows the stored list, while the handler and
-coordinator trait methods continue to return owned lists.
+`TaskDispatcher::formats()` borrows the stored list;
+`TaskAdapter::formats()` returns an owned list. `TaskExecutor` has no format list.
 
-`PreparedOutboxRuntime` owns the coordinator, restart factory, worker config and
-C registries. It cannot be cloned and is consumed by `run(shutdown)`. Before run,
+`TaskRuntime` owns the queue, executor, restart factory, worker config and
+C dispatchers. It cannot be cloned and is consumed by `run(shutdown)`. Before run,
 Drop just releases its handlers; there is no owned cancellation token or work to
 drain. A run future binds the supplied token and installs a DropGuard at first
 poll. A pre-cancelled token releases prepared handlers without spawning workers,
 calling the factory again, or accessing storage. Each worker receives its same
-prepared mutable registry; only replacement workers invoke the factory anew.
+prepared mutable dispatcher; only replacement workers invoke the factory anew.
 
-Both run entry points return `OutboxWorkerPoolError`, whose `Registry` variant
+Both run entry points return `TaskRuntimeError`, whose `WorkerSetup` variant
 wraps startup/restart construction failures and format mismatches. Its
 `Configuration` variant applies to low-level startup's actual-budget check.
 There are no PostgreSQL-specific preparation error wrappers.
 
-The retained low-level `worker::run(coordinator, factory, config, shutdown)`
-validates against the actual coordinator budget and builds registries when polled.
+The retained low-level `runtime::supervisor::run(queue, executor, factory, config, shutdown)`
+validates against the actual executor budget and builds dispatchers when polled.
 Both APIs share the same supervisor engine. In the low-level path, a pre-cancelled
-token skips registry creation; startup errors or panics cancel it through DropGuard.
+token skips dispatcher creation; startup errors or panics cancel it through DropGuard.
 
-`PreparedOutboxRuntime::run` and `worker::run` take a
+`TaskRuntime::run` and `runtime::supervisor::run` take a
 `tokio_util::sync::CancellationToken`. Its clones share
 one cancellation request between the host, supervisor, and permanent workers.
 Cancellation stops claims and dequeue, including while the supervisor awaits
@@ -352,10 +362,10 @@ execution. A ready claim batch is discarded if cancellation has been observed;
 its already-committed ownership remains for lease recovery.
 
 Pure preparation has no supplied token and returns indexed startup errors before
-any runtime is started. Low-level startup configuration/registry errors cancel
+any runtime is started. Low-level startup configuration/dispatcher errors cancel
 the supplied token before returning.
 Restart-factory errors and format mismatches cancel it **before** draining healthy
-workers, notifying the host immediately, and return the original `OutboxWorkerPoolError`
+workers, notifying the host immediately, and return the original `TaskRuntimeError`
 after drain. A worker panic alone does not cancel it: the supervisor restarts that
 worker. A host that needs to isolate a pool passes `parent.child_token()`; cancelling
 that child does not cancel the parent. Factories are synchronous and must return
@@ -377,32 +387,32 @@ hold a drop guard and explicitly cancel/await components for normal shutdown.
 This replaces the former watch receiver API, including its sender-closure and
 false-update semantics; no compatibility adapter is provided.
 
-The optional `cqrs_runtime::host` facade coordinates inbound and outbox with the
+The optional `cqrs_runtime::host` facade coordinates inbound and task runtime with the
 shared token supplied by the composition root.
 The service constructs its Axum adapter, then calls
-`host::run(inbound, outbox.run(shutdown.clone()), shutdown, host::shutdown_signal())`.
+`host::lifecycle::run(inbound, tasks.run(shutdown.clone()), shutdown, host::signal::shutdown_signal())`.
 The runtime has no Axum dependency. Host observes process signals,
 token cancellation, and critical component exits in that priority order (inbound
-before outbox when neither stop request is ready), then awaits both components.
+before task runtime when neither stop request is ready), then awaits both components.
 An unexpected component exit remains the primary failure. With a signal/token
-request, failure priority is signal-observation error, outbox failure, then inbound
+request, failure priority is signal-observation error, task runtime failure, then inbound
 failure; other observed failures are logged separately. Supervisor task diagnostics
 use task ID and panic/cancellation flags, not JoinError's payload-bearing formatting.
 The ordinary panic hook is independent of these structured diagnostics.
 
-Host installs its cancellation DropGuard before spawning outbox on first poll;
+Host installs its cancellation DropGuard before spawning task runtime on first poll;
 creating an unpolled host starts nothing. Inbound and signal futures execute
-inside host and can borrow non-Send state; outbox is `Send + 'static`. Normal
+inside host and can borrow non-Send state; task runtime is `Send + 'static`. Normal
 return waits for both components before caller-owned cleanup. Dropping/aborting
-a polled host cancels the token and detaches outbox without aborting it, preserving
+a polled host cancels the token and detaches task runtime without aborting it, preserving
 independent drain on a live Tokio runtime. Host drops inbound and cannot await
 components or guarantee database cleanup in that case. SIGINT/SIGTERM observation
-is portable through `host::shutdown_signal` (Ctrl-C only outside Unix); a closed
+is portable through `host::signal::shutdown_signal` (Ctrl-C only outside Unix); a closed
 SIGTERM stream remains an I/O error. Lifecycle and signal multiplexing tests use
 controlled futures; the real Axum shutdown check lives in the service suite.
 
-HTTP and outbox drain concurrently. An in-flight HTTP request or handler may commit
-new durable tasks after outbox admission stops; they are processed by a subsequent
+HTTP and task runtime drain concurrently. An in-flight HTTP request or handler may commit
+new durable tasks after task runtime admission stops; they are processed by a subsequent
 healthy pool. Shutdown does not promise completion of the whole business workflow.
 The database pool closes after both components finish. Standard Axum graceful
 shutdown stops accepting new TCP connections and waits for current requests.
@@ -411,13 +421,13 @@ HTTP shutdown and pool cleanup have no process-wide deadline
 console sender performs synchronous stdout writes, which cannot be preempted by
 async timers or abort; this remains backlog task #11.
 
-The queue anchors `ClaimedTask::lease().deadline()` to a monotonic instant before
+The queue anchors `LeasedTask::lease().deadline()` to a monotonic instant before
 requesting ownership. It is a conservative, process-local budget that includes
 connection waits, transport, commit, collection, dispatch, and local queue delay.
 Preserve it through clones/dispatch; never restart its clock or derive it by
 comparing database UTC with the worker's wall clock.
 
-The coordinator starts the handler only if its full budget, settlement time,
+The executor starts the handler only if its full budget, settlement time,
 and margin still fit. Otherwise it requests retry without running the effect.
 If safe settlement time is exhausted, `LeaseBudgetExhausted` leaves the task
 for recovery. Skipped execution still consumes the claim attempt.
@@ -429,7 +439,7 @@ checks remain authoritative. Timers require cooperative async code and cannot
 preempt blocking work. Cancellation does not retract a remote request already
 accepted by a receiver. There is no heartbeat/renewal or exactly-once guarantee.
 
-Invalid queue request parameters are `OutboxError::InvalidRequest`; invalid
+Invalid queue request parameters are `TaskProcessingError::InvalidRequest`; invalid
 returned delivery data and invocation budgets are separately `InvalidDelivery`
 and `InvalidExecutionBudget`. Neither is an expired-lease recovery signal.
 Host diagnostics retain I/O sources but render only their error kind. Registry
@@ -448,7 +458,7 @@ errors render sanitized type/version, preserving the original format for inspect
 3. Apply [001-event-store.sql](../sql/001-event-store.sql) and
    [002-transactional-outbox.sql](../sql/002-transactional-outbox.sql) to the
    adapter's database. In the host's composition root, build
-   `postgres::command_executor::<A>(pool, PostgresCommandConfig)` and inject the
+   `postgres::command_factory::command_executor::<A>(pool, PostgresCommandConfig)` and inject the
    returned `Arc<dyn command::CommandExecutor<A>>` into the aggregate gateway.
    The gateway selects the aggregate ID. The factory uses unit services, no
    queries, and a checked positive snapshot interval (default 25); it performs
@@ -456,21 +466,21 @@ errors render sanitized type/version, preserving the original format for inspect
    framework factories. Current upstream snapshots require repeat-tolerant
    event application; see the [snapshot issue](../../doc/known_issues/cqrs_snapshot_event_reapplication.md).
 4. Implement typed handlers and application sender ports, adapting each DTO
-   version with `typed_task_handler` (or use `TaskHandler` for custom routing).
+   version with `task_adapter` (or use `TaskAdapter` for custom routing).
    Supply a synchronous fallible
-   `HandlerRegistryFactory` returning fresh mutable registries. `TaskHandlerRegistry`
+   `TaskDispatcherFactory` returning fresh mutable dispatchers. `TaskDispatcher`
    rejects empty/duplicate formats; every factory invocation must expose the same
-   ordered format list. Preparation uses the first registry and builds the other
+   ordered format list. Preparation uses the first dispatcher and builds the other
    C−1 before admission; factories only construct handlers and must return promptly.
    Use `#[async_trait::async_trait]` for handler/queue implementations.
-5. Load `OutboxRuntimeConfig::from_env` and the separate PostgreSQL queue config
+5. Load `TaskRuntimeConfig::from_env` and the separate PostgreSQL queue config
    before connecting the database. The combined config checks independent C/Q and
    the full queued-wave lease budget. After business dependencies and handler
-   factory are ready, call `prepare_outbox_runtime` (or `worker::prepare` for another
+   factory are ready, call `prepare_task_runtime` (or `runtime::preparation::prepare` for another
    queue) before binding listeners. Start `prepared.run(token)` and share its token
    with critical inbound adapters. Observe configuration, preparation and runtime
-   errors at their respective boundaries. Custom coordinators can retain low-level
-   `worker::run`; lifecycle and restart behavior use the same execution engine.
+   errors at their respective boundaries. Custom executors can retain low-level
+   `runtime::supervisor::run`; lifecycle and restart behavior use the same execution engine.
 6. For another queue adapter, enforce atomic claims, attempt limits, durable
    schedules, conditional token/expiry settlement, and expired ownership
    recovery. Supply a conservative monotonic deadline for every claim and
@@ -484,7 +494,7 @@ errors render sanitized type/version, preserving the original format for inspect
    Retain failed work required for recovery.
 
 The APIs and their implementer contracts are documented beside
-[TaskHandler](../src/outbox/handler.rs), [TypedTaskHandler](../src/outbox/typed_handler.rs),
-[OutboxQueue](../src/outbox/queue.rs),
-[delivery/lease](../src/outbox/delivery.rs),
-[coordinator](../src/outbox/coordinator.rs), and [worker](../src/worker.rs).
+[TaskAdapter](../src/task/handling/adapter.rs), [TaskHandler](../src/task/handling/handler.rs),
+[TaskQueue](../src/task/queue/port.rs),
+[attempt](../src/task/data/attempt.rs), [lease](../src/task/queue/lease.rs),
+[executor](../src/task/executor/default_executor.rs), and [worker](../src/runtime.rs).

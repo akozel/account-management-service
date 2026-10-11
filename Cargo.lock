@@ -448,6 +448,7 @@ dependencies = [
  "async-trait",
  "chrono",
  "cqrs-es",
+ "log",
  "postgres-es",
  "rand 0.10.2",
  "serde",

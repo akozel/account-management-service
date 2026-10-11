@@ -32,6 +32,30 @@ mod tests {
     use super::*;
     use std::future::{pending, ready};
 
+    #[test]
+    fn registering_signal_observation_waits_without_sending_os_signals() {
+        use crate::env::test_support;
+        if test_support::scenario().is_some() {
+            let runtime = tokio::runtime::Builder::new_current_thread().enable_all().build().unwrap();
+            runtime.block_on(async {
+                assert!(
+                    tokio::time::timeout(std::time::Duration::ZERO, shutdown_signal())
+                        .await
+                        .is_err()
+                );
+            });
+            return;
+        }
+        test_support::isolated(
+            concat!(
+                module_path!(),
+                "::registering_signal_observation_waits_without_sending_os_signals"
+            ),
+            "signal_registration",
+            |_| {},
+        );
+    }
+
     #[tokio::test]
     async fn interrupt_success() {
         assert!(wait_for_signal(ready(Ok(())), pending()).await.is_ok());

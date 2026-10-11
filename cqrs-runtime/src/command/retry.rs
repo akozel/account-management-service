@@ -93,3 +93,100 @@ where
     }
     unreachable!("aggregate conflict retry policy always has at least one attempt")
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[tokio::test(start_paused = true)]
+    async fn conflicts_wait_for_the_configured_backoff_and_stop_after_the_last_attempt() {
+        let policy = AggregateConflictRetryPolicy::new(4, Duration::from_millis(5), Duration::from_millis(12), 0.0).unwrap();
+        let started = tokio::time::Instant::now();
+        let mut calls = Vec::new();
+        let result = retry_on_aggregate_conflict::<(), std::io::Error, _, _>(policy, || {
+            calls.push(started.elapsed());
+            std::future::ready(Err(AggregateError::AggregateConflict))
+        })
+        .await;
+        assert!(matches!(result, Err(AggregateError::AggregateConflict)));
+        assert_eq!(calls, [0, 5, 15, 27].map(Duration::from_millis));
+        assert_eq!(started.elapsed(), Duration::from_millis(27));
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn a_reloaded_domain_or_unknown_commit_outcome_stops_conflict_retries_immediately() {
+        let policy = AggregateConflictRetryPolicy::new(5, Duration::from_secs(1), Duration::from_secs(1), 0.0).unwrap();
+        for terminal in [
+            Ok(42),
+            Err(AggregateError::UserError(std::io::Error::other("reloaded domain rejection"))),
+            Err(AggregateError::DatabaseConnectionError(Box::new(std::io::Error::other(
+                "lost reply",
+            )))),
+            Err(AggregateError::DeserializationError(Box::new(std::io::Error::other(
+                "invalid state",
+            )))),
+            Err(AggregateError::UnexpectedError(Box::new(std::io::Error::other(
+                "unknown commit",
+            )))),
+        ] {
+            let started = tokio::time::Instant::now();
+            let mut calls = 0;
+            let mut terminal = Some(terminal);
+            let result = retry_on_aggregate_conflict(policy, || {
+                calls += 1;
+                std::future::ready(if calls == 1 {
+                    Err(AggregateError::AggregateConflict)
+                } else {
+                    terminal.take().expect("terminal outcome must never be retried")
+                })
+            })
+            .await;
+            assert_eq!(calls, 2);
+            assert_eq!(started.elapsed(), Duration::from_secs(1));
+            assert!(!matches!(result, Err(AggregateError::AggregateConflict)));
+        }
+    }
+
+    #[test]
+    fn default_policy_has_bounded_exponential_jitter() {
+        let policy = AggregateConflictRetryPolicy::default();
+
+        assert_eq!(policy.max_attempts, 3);
+        assert_eq!(policy.backoff_bounds(1), (Duration::from_millis(4), Duration::from_millis(6)));
+        assert_eq!(
+            policy.backoff_bounds(2),
+            (Duration::from_millis(8), Duration::from_millis(12))
+        );
+        assert_eq!(
+            policy.backoff_bounds(5),
+            (Duration::from_millis(40), Duration::from_millis(50))
+        );
+        for retry in 1..=5 {
+            let bounds = policy.backoff_bounds(retry);
+            for _ in 0..100 {
+                assert!((bounds.0..=bounds.1).contains(&policy.backoff(retry)));
+            }
+        }
+    }
+
+    #[test]
+    fn retry_policy_rejects_zero_attempts() {
+        assert!(AggregateConflictRetryPolicy::new(0, Duration::ZERO, Duration::ZERO, 0.0).is_err());
+        assert!(AggregateConflictRetryPolicy::new(1, Duration::MAX, Duration::MAX, 0.2).is_err());
+        assert!(AggregateConflictRetryPolicy::new(1, Duration::ZERO, Duration::ZERO, f64::NAN).is_err());
+        assert!(AggregateConflictRetryPolicy::new(1, Duration::from_secs(2), Duration::from_secs(1), 0.2).is_err());
+    }
+
+    #[test]
+    fn large_representable_backoff_and_tiny_jitter_remain_bounded() {
+        let cap = Duration::from_millis(i64::MAX as u64);
+        for jitter in [0.0, 1e-20, 0.2, 1.0] {
+            let policy = AggregateConflictRetryPolicy::new(2, cap, cap, jitter).unwrap();
+            let (lower, upper) = policy.backoff_bounds(usize::MAX);
+            assert!(lower <= upper && upper <= cap);
+            for _ in 0..100 {
+                assert!((lower..=upper).contains(&policy.backoff(usize::MAX)));
+            }
+        }
+    }
+}

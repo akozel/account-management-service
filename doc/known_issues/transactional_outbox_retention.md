@@ -12,5 +12,5 @@ purge либо archive по `finished_at`. Сохранение failed tasks д�
 Pending/processing tasks не должны удаляться такой процедурой.
 
 Область: [схема outbox](../../cqrs-runtime/sql/002-transactional-outbox.sql),
-[queue](../../cqrs-runtime/src/postgres/outbox_queue.rs) и
+[queue](../../cqrs-runtime/src/postgres/task_queue.rs) и
 [контракт эксплуатации](../../cqrs-runtime/doc/task_processing.md#integrating-another-application).

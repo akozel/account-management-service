@@ -4,8 +4,8 @@ use cqrs_es::{Aggregate, CqrsFramework, persist::PersistedEventStore};
 use sqlx::PgPool;
 use thiserror::Error;
 
-use super::PostgresEventRepositoryWithOutbox;
-use crate::command::{AggregateConflictRetryPolicy, CommandExecutor, CqrsCommandExecutor};
+use crate::command::{CommandExecutor, executor::CqrsCommandExecutor, retry::AggregateConflictRetryPolicy};
+use crate::postgres::event_repository_with_outbox::repository::PostgresEventRepositoryWithOutbox;
 
 /// Checked snapshot interval and optimistic-conflict policy. Does not read env.
 #[derive(Clone, Debug, PartialEq)]

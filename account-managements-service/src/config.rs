@@ -9,8 +9,8 @@ use std::{
 
 use cqrs_runtime::{
     logging::LoggingConfig,
-    postgres::{PostgresOutboxQueueConfig, PostgresOutboxQueueConfigError},
-    worker::{OutboxRuntimeConfig, OutboxRuntimeConfigError},
+    postgres::task_queue::config::{PostgresTaskQueueConfig, PostgresTaskQueueConfigError},
+    runtime::config::{TaskRuntimeConfig, TaskRuntimeConfigError},
 };
 use sqlx::postgres::PgConnectOptions;
 use thiserror::Error;
@@ -33,8 +33,8 @@ pub(crate) struct ServiceConfig {
     database: PgConnectOptions,
     bind_address: SocketAddr,
     logging: LoggingConfig,
-    outbox: OutboxRuntimeConfig,
-    postgres_queue: PostgresOutboxQueueConfig,
+    task_runtime: TaskRuntimeConfig,
+    task_queue: PostgresTaskQueueConfig,
 }
 
 #[derive(Error)]
@@ -55,10 +55,10 @@ pub(crate) enum ServiceConfigError {
     Bind(#[source] AddrParseError),
     #[error("invalid RUST_LOG level")]
     Logging(#[source] ParseLevelFilterError),
-    #[error("invalid outbox configuration: {0}")]
-    Outbox(#[source] OutboxRuntimeConfigError),
-    #[error("invalid PostgreSQL outbox configuration: {0}")]
-    PostgresQueue(#[source] PostgresOutboxQueueConfigError),
+    #[error("invalid task_runtime configuration: {0}")]
+    Tasks(#[source] TaskRuntimeConfigError),
+    #[error("invalid PostgreSQL task_runtime configuration: {0}")]
+    PostgresQueue(#[source] PostgresTaskQueueConfigError),
 }
 
 impl fmt::Debug for ServiceConfigError {
@@ -74,8 +74,8 @@ impl fmt::Debug for ServiceConfig {
             .field("database", &"[redacted]")
             .field("bind_address", &self.bind_address)
             .field("logging", &self.logging)
-            .field("outbox", &self.outbox)
-            .field("postgres_queue", &self.postgres_queue)
+            .field("task_runtime", &self.task_runtime)
+            .field("task_queue", &self.task_queue)
             .finish()
     }
 }
@@ -111,14 +111,14 @@ impl ServiceConfig {
             .parse()
             .map_err(ServiceConfigError::Bind)?;
         let logging = LoggingConfig::from_lookup(&mut lookup).map_err(ServiceConfigError::Logging)?;
-        let outbox = OutboxRuntimeConfig::from_lookup(&mut lookup).map_err(ServiceConfigError::Outbox)?;
-        let postgres_queue = PostgresOutboxQueueConfig::from_lookup(&mut lookup).map_err(ServiceConfigError::PostgresQueue)?;
+        let task_runtime = TaskRuntimeConfig::from_lookup(&mut lookup).map_err(ServiceConfigError::Tasks)?;
+        let task_queue = PostgresTaskQueueConfig::from_lookup(&mut lookup).map_err(ServiceConfigError::PostgresQueue)?;
         Ok(Self {
             database,
             bind_address,
             logging,
-            outbox,
-            postgres_queue,
+            task_runtime,
+            task_queue,
         })
     }
 
@@ -131,11 +131,11 @@ impl ServiceConfig {
     pub(crate) fn logging(&self) -> &LoggingConfig {
         &self.logging
     }
-    pub(crate) fn outbox(&self) -> &OutboxRuntimeConfig {
-        &self.outbox
+    pub(crate) fn task_runtime(&self) -> &TaskRuntimeConfig {
+        &self.task_runtime
     }
-    pub(crate) fn postgres_queue(&self) -> &PostgresOutboxQueueConfig {
-        &self.postgres_queue
+    pub(crate) fn task_queue(&self) -> &PostgresTaskQueueConfig {
+        &self.task_queue
     }
 }
 
@@ -174,9 +174,9 @@ mod tests {
             assert_eq!(config.database().get_host(), "localhost");
             assert_eq!(config.database().get_database(), Some("service"));
             assert_eq!(config.logging().level_filter(), tracing::level_filters::LevelFilter::INFO);
-            assert_eq!(config.outbox().worker().concurrency(), 128);
-            assert_eq!(config.outbox().worker().queue_capacity(), 128);
-            assert_eq!(config.postgres_queue().statement_timeout(), std::time::Duration::from_secs(4));
+            assert_eq!(config.task_runtime().worker_pool().concurrency(), 128);
+            assert_eq!(config.task_runtime().worker_pool().queue_capacity(), 128);
+            assert_eq!(config.task_queue().statement_timeout(), std::time::Duration::from_secs(4));
             assert!(!format!("{config:?}").contains("private_password"));
         }
         for address in ["localhost:3000", "", "127.0.0.1", "127.0.0.1:65536"] {
@@ -228,13 +228,13 @@ mod tests {
             ("OUTBOX_POSTGRES_STATEMENT_TIMEOUT_MS", "5000"),
         ])
         .unwrap();
-        assert_eq!(value.outbox().worker().concurrency(), 2);
-        assert_eq!(value.outbox().worker().queue_capacity(), 3);
+        assert_eq!(value.task_runtime().worker_pool().concurrency(), 2);
+        assert_eq!(value.task_runtime().worker_pool().queue_capacity(), 3);
         assert_eq!(
-            value.outbox().coordinator().storage_timeout(),
+            value.task_runtime().storage().storage_timeout(),
             std::time::Duration::from_secs(7)
         );
-        assert_eq!(value.postgres_queue().statement_timeout(), std::time::Duration::from_secs(5));
+        assert_eq!(value.task_queue().statement_timeout(), std::time::Duration::from_secs(5));
         for (key, bad) in [
             ("OUTBOX_WORKER_CONCURRENCY", "0"),
             ("OUTBOX_QUEUE_CAPACITY", "129"),
@@ -246,7 +246,7 @@ mod tests {
             let error = config(&[(key, bad)]).unwrap_err();
             assert!(matches!(
                 error,
-                ServiceConfigError::Outbox(_) | ServiceConfigError::PostgresQueue(_)
+                ServiceConfigError::Tasks(_) | ServiceConfigError::PostgresQueue(_)
             ));
             assert!(error.source().is_some());
         }

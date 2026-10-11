@@ -73,8 +73,8 @@ host logging и обёртки `ServiceError`.
 
 ## P1. Registry errors обходят sanitization task type
 
-Место: [`outbox/registry.rs`](../../cqrs-runtime/src/outbox/registry.rs),
-строки 8–15; [`worker/supervisor.rs`](../../cqrs-runtime/src/worker/supervisor.rs),
+Место: [`outbox/registry.rs`](../../cqrs-runtime/src/task/dispatcher.rs),
+строки 8–15; [`worker/supervisor.rs`](../../cqrs-runtime/src/runtime/supervisor.rs),
 строки 26–35; [`host/error.rs`](../../cqrs-runtime/src/host/error.rs), строка 35.
 
 `TaskFormat::new` разрешает любое непустое имя, включая переводы строк и
@@ -96,13 +96,13 @@ log на дублирующемся формате с sentinel и перевод
 
 Места:
 
-- [`coordinator/config.rs`](../../cqrs-runtime/src/outbox/coordinator/config.rs), строки 23–45;
-- [`coordinator.rs`](../../cqrs-runtime/src/outbox/coordinator.rs), строки 57–64;
-- [`worker/runtime_config.rs`](../../cqrs-runtime/src/worker/runtime_config.rs), строки 22–28;
-- [`outbox_queue/config.rs`](../../cqrs-runtime/src/postgres/outbox_queue/config.rs), строки 23–45;
-- [`outbox_queue.rs`](../../cqrs-runtime/src/postgres/outbox_queue.rs), строки 35–41;
-- [`preparation.rs`](../../cqrs-runtime/src/worker/preparation.rs), строки 14–20;
-- [`worker_factory.rs` (теперь `outbox_runtime_factory.rs`)](../../cqrs-runtime/src/postgres/outbox_runtime_factory.rs), исходные строки 7–13.
+- [`coordinator/config.rs`](../../cqrs-runtime/src/task/storage_config.rs), строки 23–45;
+- [`coordinator.rs`](../../cqrs-runtime/src/task/executor.rs), строки 57–64;
+- [`worker/runtime_config.rs`](../../cqrs-runtime/src/runtime/config.rs), строки 22–28;
+- [`outbox_queue/config.rs`](../../cqrs-runtime/src/postgres/task_queue/config.rs), строки 23–45;
+- [`outbox_queue.rs`](../../cqrs-runtime/src/postgres/task_queue.rs), строки 35–41;
+- [`preparation.rs`](../../cqrs-runtime/src/runtime/preparation.rs), строки 14–20;
+- [`worker_factory.rs` (теперь `outbox_runtime_factory.rs`)](../../cqrs-runtime/src/postgres/task_runtime_factory.rs), исходные строки 7–13.
 
 У `OutboxTaskCoordinatorConfig` и `PostgresOutboxQueueConfig` приватные поля.
 Их `new` уже проверяет все локальные ограничения, а defaults допустимы.
@@ -141,9 +141,9 @@ budget неизвестен при создании worker config. Это нео
 
 ## P2. InvalidRequest смешивает запрос, исполнение и ответ хранилища
 
-Место: [`outbox/error.rs`](../../cqrs-runtime/src/outbox/error.rs), строки 2–18;
-[`lease_budget.rs`](../../cqrs-runtime/src/outbox/coordinator/lease_budget.rs),
-строки 20–40; [`outbox_queue.rs`](../../cqrs-runtime/src/postgres/outbox_queue.rs),
+Место: [`outbox/error.rs`](../../cqrs-runtime/src/task/error.rs), строки 2–18;
+[`lease_budget.rs`](../../cqrs-runtime/src/task/executor/lease_budget.rs),
+строки 20–40; [`outbox_queue.rs`](../../cqrs-runtime/src/postgres/task_queue.rs),
 строки 119, 168–170, 223.
 
 `QueueRequestError::InvalidDelivery` означает некорректные данные, пришедшие из
@@ -197,14 +197,14 @@ serde fields, env names или SQL schema.
 
 ## P2. Выделить преобразования в чистые функции
 
-Первый кандидат — [`coordinator.rs`](../../cqrs-runtime/src/outbox/coordinator.rs),
+Первый кандидат — [`coordinator.rs`](../../cqrs-runtime/src/task/executor.rs),
 строки 169–181. Отделить `Result<(), TaskHandlerError>` → `SettlementRequest`
 от `select!`. Функция получает outcome и лениво вычисляемый fallback delay;
 явный `retry_after` сохраняется, случайный backoff вычисляется только при
 необходимости. Timeout остаётся явной веткой выбора, использующей то же
 преобразование в retry request.
 
-Второй кандидат — [`outbox_queue.rs`](../../cqrs-runtime/src/postgres/outbox_queue.rs),
+Второй кандидат — [`outbox_queue.rs`](../../cqrs-runtime/src/postgres/task_queue.rs),
 строки 133–171. Сейчас один request дважды разбирается на `failure_cause` и
 tuple `(status, delay, error)`. Чистая функция может одним match строить
 небольшую приватную структуру параметров settlement с именованными полями.

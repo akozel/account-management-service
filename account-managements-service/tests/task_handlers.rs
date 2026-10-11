@@ -6,13 +6,13 @@ use std::{
 use account_managements_service::{
     application::{
         email_reservation::tasks::send_verification_code::{
-            VerificationCodeDelivery, VerificationCodeSender, send_verification_code_task_handler, v1::SendVerificationCodeTaskV1,
+            VerificationCodeDelivery, VerificationCodeSender, send_verification_code_task_adapter, v1::SendVerificationCodeTaskV1,
         },
         user_account::{
             service::{AcceptedSubmission, ContinuationError, ProfileSubmission, RegistrationService, SubmissionError},
             tasks::{
-                CreateAccountTaskV1, RecordAccountCreatedTaskV1, create_account::create_account_task_handler,
-                record_account_created::record_account_created_task_handler,
+                CreateAccountTaskV1, RecordAccountCreatedTaskV1, create_account::create_account_task_adapter,
+                record_account_created::record_account_created_task_adapter,
             },
         },
     },
@@ -20,14 +20,20 @@ use account_managements_service::{
 };
 use async_trait::async_trait;
 use chrono::NaiveDate;
-use cqrs_runtime::outbox::{TaskDelivery, TaskFormat, TaskHandlerError, TaskPayload};
+use cqrs_runtime::task::{
+    data::{
+        attempt::TaskAttempt,
+        format::{TaskFormat, TaskPayload},
+    },
+    handling::handler::TaskHandlerError,
+};
 use serde_json::json;
 use uuid::Uuid;
 
-fn delivery<P: TaskPayload>(payload: &P) -> TaskDelivery {
+fn delivery<P: TaskPayload>(payload: &P) -> TaskAttempt {
     let mut payload = serde_json::to_value(payload).unwrap();
     payload["future_optional_field"] = json!({"locale":"en"});
-    TaskDelivery::new(
+    TaskAttempt::new(
         Uuid::new_v4(),
         TaskFormat::of::<P>().unwrap(),
         payload,
@@ -47,7 +53,7 @@ fn verification(code: u32) -> SendVerificationCodeTaskV1 {
 
 struct SendRecord {
     message: VerificationCodeDelivery,
-    delivery: TaskDelivery,
+    delivery: TaskAttempt,
     delivery_address: usize,
 }
 
@@ -58,7 +64,7 @@ struct RecordingSender {
 
 #[async_trait]
 impl VerificationCodeSender for RecordingSender {
-    async fn send(&mut self, message: VerificationCodeDelivery, delivery: &TaskDelivery) -> Result<(), TaskHandlerError> {
+    async fn send(&mut self, message: VerificationCodeDelivery, delivery: &TaskAttempt) -> Result<(), TaskHandlerError> {
         // Borrow the original delivery throughout async work; snapshots are test-only.
         tokio::task::yield_now().await;
         self.records.lock().unwrap().push(SendRecord {
@@ -93,7 +99,7 @@ fn assert_result(actual: Result<(), TaskHandlerError>, expected: Result<(), Task
 #[tokio::test]
 async fn verification_v1_accepts_extra_fields_and_passes_original_delivery_across_await() {
     let records = Arc::new(Mutex::new(Vec::new()));
-    let mut handler = send_verification_code_task_handler(Box::new(RecordingSender {
+    let mut handler = send_verification_code_task_adapter(Box::new(RecordingSender {
         records: records.clone(),
         result: Ok(()),
     }))
@@ -105,13 +111,13 @@ async fn verification_v1_accepts_extra_fields_and_passes_original_delivery_acros
     for code in [1_000_000, 1_234_567, 9_999_999] {
         let payload = verification(code);
         let task = delivery(&payload);
-        handler.handle(&task).await.unwrap();
+        handler.invoke(&task).await.unwrap();
         let records = records.lock().unwrap();
         let record = records.last().unwrap();
         assert_eq!(record.message, VerificationCodeDelivery::from(payload));
         assert_eq!(record.delivery_address, std::ptr::from_ref(&task) as usize);
         assert_eq!(record.delivery.id(), task.id());
-        assert_eq!(record.delivery.attempt(), task.attempt());
+        assert_eq!(record.delivery.number(), task.number());
         assert_eq!(record.delivery.format(), task.format());
         assert_eq!(record.delivery.payload(), task.payload());
         assert_eq!(record.delivery.metadata(), task.metadata());
@@ -122,14 +128,14 @@ async fn verification_v1_accepts_extra_fields_and_passes_original_delivery_acros
 #[tokio::test]
 async fn verification_rejects_invalid_business_codes_without_sending() {
     let records = Arc::new(Mutex::new(Vec::new()));
-    let mut handler = send_verification_code_task_handler(Box::new(RecordingSender {
+    let mut handler = send_verification_code_task_adapter(Box::new(RecordingSender {
         records: records.clone(),
         result: Ok(()),
     }))
     .unwrap();
     for code in [0, 999_999, 10_000_000, u32::MAX] {
         assert_result(
-            handler.handle(&delivery(&verification(code))).await,
+            handler.invoke(&delivery(&verification(code))).await,
             Err(TaskHandlerError::Permanent {
                 reason: "invalid verification code".into(),
             }),
@@ -141,7 +147,7 @@ async fn verification_rejects_invalid_business_codes_without_sending() {
 #[tokio::test]
 async fn verification_invalid_dtos_and_versions_never_reach_sender() {
     let records = Arc::new(Mutex::new(Vec::new()));
-    let mut handler = send_verification_code_task_handler(Box::new(RecordingSender {
+    let mut handler = send_verification_code_task_adapter(Box::new(RecordingSender {
         records: records.clone(),
         result: Ok(()),
     }))
@@ -154,8 +160,8 @@ async fn verification_invalid_dtos_and_versions_never_reach_sender() {
         (base.format().clone(), invalid_email),
         (TaskFormat::new(base.format().task_type(), 3).unwrap(), base.payload().clone()),
     ] {
-        let task = TaskDelivery::new(base.id(), format, payload, base.metadata().clone(), base.attempt()).unwrap();
-        assert!(matches!(handler.handle(&task).await, Err(TaskHandlerError::Permanent { .. })));
+        let task = TaskAttempt::new(base.id(), format, payload, base.metadata().clone(), base.number()).unwrap();
+        assert!(matches!(handler.invoke(&task).await, Err(TaskHandlerError::Permanent { .. })));
     }
     assert!(records.lock().unwrap().is_empty());
 }
@@ -173,12 +179,12 @@ async fn verification_preserves_sender_failures_and_backoff() {
         }),
     ] {
         let records = Arc::new(Mutex::new(Vec::new()));
-        let mut handler = send_verification_code_task_handler(Box::new(RecordingSender {
+        let mut handler = send_verification_code_task_adapter(Box::new(RecordingSender {
             records: records.clone(),
             result: result.clone(),
         }))
         .unwrap();
-        assert_result(handler.handle(&task).await, result);
+        assert_result(handler.invoke(&task).await, result);
         assert_eq!(records.lock().unwrap().len(), 1);
     }
 }
@@ -257,8 +263,8 @@ async fn continuations_forward_decoded_inputs_and_preserve_business_classificati
         });
         let create = create_payload();
         let record = record_payload();
-        let mut create_handler = create_account_task_handler(service.clone()).unwrap();
-        let mut record_handler = record_account_created_task_handler(service.clone()).unwrap();
+        let mut create_handler = create_account_task_adapter(service.clone()).unwrap();
+        let mut record_handler = record_account_created_task_adapter(service.clone()).unwrap();
         assert_eq!(
             create_handler.formats(),
             vec![TaskFormat::of::<CreateAccountTaskV1>().unwrap()]
@@ -267,8 +273,8 @@ async fn continuations_forward_decoded_inputs_and_preserve_business_classificati
             record_handler.formats(),
             vec![TaskFormat::of::<RecordAccountCreatedTaskV1>().unwrap()]
         );
-        assert_result(create_handler.handle(&delivery(&create)).await, expected.clone());
-        assert_result(record_handler.handle(&delivery(&record)).await, expected);
+        assert_result(create_handler.invoke(&delivery(&create)).await, expected.clone());
+        assert_result(record_handler.invoke(&delivery(&record)).await, expected);
         assert_eq!(
             *service.calls.lock().unwrap(),
             vec![Operation::Create(create), Operation::Record(record)]

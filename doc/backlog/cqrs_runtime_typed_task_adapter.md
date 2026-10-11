@@ -20,7 +20,7 @@ retry/settlement и lifecycle не меняются. Тексты format/decode 
 
 ## Runtime API и поведение
 
-Приватный модуль: cqrs-runtime/src/outbox/typed_handler.rs. Facade outbox экспортирует:
+Приватный модуль: cqrs-runtime/src/task/json_adapter.rs. Facade outbox экспортирует:
 
 ```rust
 #[async_trait]

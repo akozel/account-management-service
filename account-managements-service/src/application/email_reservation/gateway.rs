@@ -1,6 +1,6 @@
 use crate::domain::{EmailReservationCommand, EmailReservationError};
 use async_trait::async_trait;
-use cqrs_runtime::{command::CommandGatewayError, outbox::NewOutboxTask};
+use cqrs_runtime::{command::CommandGatewayError, task::data::new_task::NewTask};
 
 #[async_trait]
 pub trait EmailReservationGateway: Send + Sync {
@@ -8,6 +8,6 @@ pub trait EmailReservationGateway: Send + Sync {
     async fn execute_with_outbox(
         &self,
         command: EmailReservationCommand,
-        tasks: Vec<NewOutboxTask>,
+        tasks: Vec<NewTask>,
     ) -> Result<(), CommandGatewayError<EmailReservationError>>;
 }

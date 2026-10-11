@@ -2,7 +2,7 @@ use std::sync::Arc;
 
 use async_trait::async_trait;
 use chrono::{DateTime, NaiveDate, Utc};
-use cqrs_runtime::{command::CommandGatewayError, outbox::NewOutboxTask};
+use cqrs_runtime::{command::CommandGatewayError, task::data::new_task::NewTask};
 use sha2::{Digest, Sha256};
 use thiserror::Error;
 
@@ -102,7 +102,7 @@ impl RegistrationService for DefaultRegistrationService {
             token_digest: digest(&submission.account_creation_token),
             profile: profile.clone(),
         };
-        let task = NewOutboxTask::new(CreateAccountTaskV1 {
+        let task = NewTask::new(CreateAccountTaskV1 {
             email: submission.email.clone(),
             account_id: submission.account_id,
             profile,
@@ -122,7 +122,7 @@ impl RegistrationService for DefaultRegistrationService {
     async fn create_account(&self, task: CreateAccountTaskV1) -> Result<(), ContinuationError> {
         // Select the creation time once; both the command and follow-up Task use it.
         let created_at = self.clock.now();
-        let completion = NewOutboxTask::new(RecordAccountCreatedTaskV1 {
+        let completion = NewTask::new(RecordAccountCreatedTaskV1 {
             email: task.email.clone(),
             account_id: task.account_id,
             profile: task.profile.clone(),
@@ -180,7 +180,7 @@ mod tests {
         async fn execute_with_outbox(
             &self,
             _: EmailReservationCommand,
-            tasks: Vec<NewOutboxTask>,
+            tasks: Vec<NewTask>,
         ) -> Result<(), CommandGatewayError<EmailReservationError>> {
             self.calls.fetch_add(1, Ordering::SeqCst);
             assert_eq!(tasks.len(), 1);
@@ -195,7 +195,7 @@ mod tests {
         async fn execute_with_outbox(
             &self,
             _: UserAccountCommand,
-            _: Vec<NewOutboxTask>,
+            _: Vec<NewTask>,
         ) -> Result<(), CommandGatewayError<UserAccountError>> {
             Err(CommandGatewayError::Conflict)
         }

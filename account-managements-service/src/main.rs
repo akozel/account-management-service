@@ -6,10 +6,10 @@ use std::sync::Arc;
 use account_managements_service::{
     application::{
         email_reservation::service::email_reservation_service,
-        email_reservation::tasks::send_verification_code::send_verification_code_task_handler,
+        email_reservation::tasks::send_verification_code::send_verification_code_task_adapter,
         user_account::{
             service::registration_service,
-            tasks::{create_account::create_account_task_handler, record_account_created::record_account_created_task_handler},
+            tasks::{create_account::create_account_task_adapter, record_account_created::record_account_created_task_adapter},
         },
     },
     domain::{EmailReservation, UserAccount},
@@ -24,9 +24,13 @@ use account_managements_service::{
 use config::ServiceConfig;
 use cqrs_runtime::{
     host,
-    outbox::TaskHandlerRegistry,
-    postgres::{PostgresCommandConfig, command_executor, connect_pool, prepare_outbox_runtime},
-    worker,
+    postgres::{
+        command_factory::{PostgresCommandConfig, command_executor},
+        pool::connect_pool,
+        task_runtime_factory::prepare_task_runtime,
+    },
+    runtime,
+    task::handling::dispatcher::TaskDispatcher,
 };
 use startup::{ServiceError, load_dotenv, with_pool_cleanup};
 use tokio::net::TcpListener;
@@ -52,18 +56,18 @@ async fn main() -> Result<(), ServiceError> {
             )));
             let registration = registration_service(gateway.clone(), account_gateway, Arc::new(SystemRegistrationClock));
             let http_registration = registration.clone();
-            let handler_factory: worker::HandlerRegistryFactory = Arc::new(move || {
-                TaskHandlerRegistry::try_new(vec![
-                    send_verification_code_task_handler(Box::new(ConsoleVerificationCodeSender::new(std::io::stdout())))?,
-                    create_account_task_handler(registration.clone())?,
-                    record_account_created_task_handler(registration.clone())?,
+            let dispatcher_factory: runtime::dispatcher_factory::TaskDispatcherFactory = Arc::new(move || {
+                TaskDispatcher::try_new(vec![
+                    send_verification_code_task_adapter(Box::new(ConsoleVerificationCodeSender::new(std::io::stdout())))?,
+                    create_account_task_adapter(registration.clone())?,
+                    record_account_created_task_adapter(registration.clone())?,
                 ])
             });
-            let outbox = prepare_outbox_runtime(
+            let task_runtime = prepare_task_runtime(
                 pool.clone(),
-                handler_factory,
-                config.postgres_queue().clone(),
-                config.outbox().clone(),
+                dispatcher_factory,
+                config.task_queue().clone(),
+                config.task_runtime().clone(),
             )?;
             let email_reservation = email_reservation_service(gateway, Arc::new(RandomRegistrationMaterialGenerator));
             let app = presentation::http::router(email_reservation, http_registration);
@@ -77,7 +81,13 @@ async fn main() -> Result<(), ServiceError> {
                     .with_graceful_shutdown(http_shutdown.cancelled_owned())
                     .await
             };
-            host::run(serve, outbox.run(shutdown.clone()), shutdown, host::shutdown_signal()).await?;
+            host::lifecycle::run(
+                serve,
+                task_runtime.run(shutdown.clone()),
+                shutdown,
+                host::signal::shutdown_signal(),
+            )
+            .await?;
             Ok(())
         })
         .await

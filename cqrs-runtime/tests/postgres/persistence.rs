@@ -1,5 +1,117 @@
 use super::*;
 
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn competing_writes_keep_the_winning_event_snapshot_and_tasks_consistent() {
+    let db = Database::new().await;
+    for (id, sequence, snapshot_version) in [
+        ("events-only", 1, None),
+        ("insert-snapshot", 1, Some(1)),
+        ("update-snapshot", 2, Some(2)),
+    ] {
+        let reader = PostgresEventRepositoryWithOutbox::new(db.pool.clone());
+        if sequence == 2 {
+            reader
+                .persist::<TestAggregate>(&[event(id, 1)], Some((id.into(), json!({"winner": "initial"}), 1)))
+                .await
+                .unwrap();
+        }
+        let mut gate = db.pool.begin().await.unwrap();
+        sqlx::query("LOCK TABLE events IN SHARE MODE")
+            .execute(&mut *gate)
+            .await
+            .unwrap();
+        let mut writes = tokio::task::JoinSet::new();
+        let mut candidates = Vec::new();
+        for name in ["left", "right"] {
+            let task = NewTask::new(DummyTaskV1 { value: name.into() }).unwrap();
+            let mut candidate = event(id, sequence);
+            candidate.payload = json!({"Recorded": {"value": name}});
+            let snapshot = snapshot_version.map(|version| (id.into(), json!({"winner": name}), version));
+            let repository = PostgresEventRepositoryWithOutbox::new(db.pool.clone()).with_outbox(vec![task.clone()]);
+            candidates.push((name, task, candidate.clone()));
+            writes.spawn(async move { (name, repository.persist::<TestAggregate>(&[candidate], snapshot).await) });
+        }
+        wait_for_blocked_queries(&db.pool, "written_events", 2).await;
+        gate.commit().await.unwrap();
+        let mut winner = None;
+        let mut conflicts = 0;
+        while let Some(result) = writes.join_next().await {
+            let (name, result) = result.unwrap();
+            match result {
+                Ok(()) => assert!(winner.replace(name).is_none()),
+                Err(PersistenceError::OptimisticLockError) => conflicts += 1,
+                other => panic!("unexpected competing write result: {other:?}"),
+            }
+        }
+        assert_eq!(conflicts, 1);
+        let winner = winner.unwrap();
+        let events = reader.get_events::<TestAggregate>(id).await.unwrap();
+        assert_eq!(events.len(), sequence);
+        let (_, winning_task, winning_event) = candidates.iter().find(|(name, _, _)| *name == winner).unwrap();
+        assert_eq!(events.last().unwrap(), winning_event);
+        let saved = row(&db.pool, winning_task.id()).await;
+        assert_eq!(saved.get::<String, _>("aggregate_id"), id);
+        assert_eq!(saved.get::<i64, _>("aggregate_sequence"), sequence as i64);
+        assert_eq!(&saved.get::<Value, _>("payload"), winning_task.payload());
+        let published: Vec<Uuid> = sqlx::query_scalar("SELECT id FROM transactional_outbox WHERE aggregate_id = $1")
+            .bind(id)
+            .fetch_all(&db.pool)
+            .await
+            .unwrap();
+        assert_eq!(published, vec![winning_task.id()], "the losing write must publish no tasks");
+        let snapshot = reader.get_snapshot::<TestAggregate>(id).await.unwrap();
+        if let Some(version) = snapshot_version {
+            let snapshot = snapshot.unwrap();
+            assert_eq!(snapshot.current_sequence, sequence);
+            assert_eq!(snapshot.current_snapshot, version);
+            assert_eq!(snapshot.aggregate, json!({"winner": winner}));
+        } else {
+            assert!(snapshot.is_none());
+        }
+    }
+    db.close().await;
+}
+
+#[tokio::test]
+async fn an_event_conflict_rolls_back_an_otherwise_valid_snapshot_update_and_tasks() {
+    let db = Database::new().await;
+    let reader = PostgresEventRepositoryWithOutbox::new(db.pool.clone());
+    reader
+        .persist::<TestAggregate>(
+            &[event("rollback-snapshot", 1)],
+            Some(("rollback-snapshot".into(), json!({"state": "initial"}), 1)),
+        )
+        .await
+        .unwrap();
+    reader
+        .persist::<TestAggregate>(&[event("rollback-snapshot", 2)], None)
+        .await
+        .unwrap();
+    let before = reader.get_snapshot::<TestAggregate>("rollback-snapshot").await.unwrap();
+    let repository = PostgresEventRepositoryWithOutbox::new(db.pool.clone()).with_outbox(vec![new_task()]);
+    let result = repository
+        .persist::<TestAggregate>(
+            &[event("rollback-snapshot", 2)],
+            Some(("rollback-snapshot".into(), json!({"state": "uncommitted"}), 2)),
+        )
+        .await;
+    assert!(matches!(result, Err(PersistenceError::OptimisticLockError)));
+    assert_eq!(
+        reader.get_snapshot::<TestAggregate>("rollback-snapshot").await.unwrap(),
+        before
+    );
+    assert_eq!(
+        reader.get_events::<TestAggregate>("rollback-snapshot").await.unwrap().len(),
+        2
+    );
+    let task_count: i64 = sqlx::query_scalar("SELECT count(*) FROM transactional_outbox")
+        .fetch_one(&db.pool)
+        .await
+        .unwrap();
+    assert_eq!(task_count, 0);
+    db.close().await;
+}
+
 #[tokio::test]
 async fn explicit_batches_commit_once_and_rollback_with_events_and_snapshots() {
     let db = Database::new().await;
@@ -251,6 +363,15 @@ async fn persists_events_and_snapshot_without_implicit_outbox() {
     );
 
     database.close().await;
+}
+
+#[tokio::test]
+async fn an_empty_write_requires_no_live_connection() {
+    let db = Database::new().await;
+    let repository = PostgresEventRepositoryWithOutbox::new(db.pool.clone());
+    db.pool.close().await;
+    repository.persist::<StreamAggregate>(&[], None).await.unwrap();
+    db.close().await;
 }
 
 #[tokio::test]

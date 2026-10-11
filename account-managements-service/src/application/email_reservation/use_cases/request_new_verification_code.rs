@@ -1,4 +1,4 @@
-use cqrs_runtime::{command::CommandGatewayError, outbox::NewOutboxTask};
+use cqrs_runtime::{command::CommandGatewayError, task::data::new_task::NewTask};
 
 use crate::{
     application::email_reservation::{
@@ -16,7 +16,7 @@ pub(crate) async fn execute(
 ) -> Result<(), EmailReservationServiceError> {
     let account_id = generator.account_id();
     let verification_code = generator.verification_code();
-    let task = NewOutboxTask::new(SendVerificationCodeTaskV1 {
+    let task = NewTask::new(SendVerificationCodeTaskV1 {
         email: email.clone(),
         account_id,
         verification_code,

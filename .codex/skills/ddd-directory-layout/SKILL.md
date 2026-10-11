@@ -147,8 +147,8 @@ execute concurrently and in any order. Do not use queue settlement or a
 delivery-order flag as the aggregate's workflow state. See
 [`cqrs-runtime/doc/task_processing.md`](../../../cqrs-runtime/doc/task_processing.md).
 An already-applied command may return a distinct exact-repeat domain rejection;
-the TaskHandler interprets it for its own Task. Handlers receive immutable
-`TaskDelivery`; claim tokens and deadlines never enter aggregate state. The aggregate must distinguish
+the TaskAdapter interprets it for its own Task. Handlers receive immutable
+`TaskAttempt`; claim tokens and deadlines never enter aggregate state. The aggregate must distinguish
 that case from an existing record with different identity-defining data.
 
 Do not introduce placeholder domain types or modules solely to fill the layout.

@@ -2,7 +2,7 @@ use chrono::{DateTime, Utc};
 use serde::{Deserialize, Serialize};
 
 use crate::domain::{Email, RegistrationProfile, UserAccountId};
-use cqrs_runtime::outbox::TaskPayload;
+use cqrs_runtime::task::data::format::TaskPayload;
 
 #[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
 pub struct RecordAccountCreatedTaskV1 {

@@ -4,7 +4,7 @@ use std::io::{self, Write};
 
 use crate::application::email_reservation::tasks::send_verification_code::{VerificationCodeDelivery, VerificationCodeSender};
 use async_trait::async_trait;
-use cqrs_runtime::outbox::{TaskDelivery, TaskHandlerError};
+use cqrs_runtime::task::{data::attempt::TaskAttempt, handling::handler::TaskHandlerError};
 
 /// Development adapter: the only delivery side effect is a line on stdout.
 pub struct ConsoleVerificationCodeSender<W = io::Stdout> {
@@ -19,7 +19,7 @@ impl<W> ConsoleVerificationCodeSender<W> {
 
 #[async_trait]
 impl<W: Write + Send> VerificationCodeSender for ConsoleVerificationCodeSender<W> {
-    async fn send(&mut self, message: VerificationCodeDelivery, delivery: &TaskDelivery) -> Result<(), TaskHandlerError> {
+    async fn send(&mut self, message: VerificationCodeDelivery, delivery: &TaskAttempt) -> Result<(), TaskHandlerError> {
         writeln!(
             self.writer,
             "Verification code {} for account_id {} sent to {}; task_id={}; attempt={}",
@@ -27,7 +27,7 @@ impl<W: Write + Send> VerificationCodeSender for ConsoleVerificationCodeSender<W
             message.account_id,
             message.email,
             delivery.id(),
-            delivery.attempt()
+            delivery.number()
         )
         .and_then(|()| self.writer.flush())
         .map_err(|_| TaskHandlerError::Retry {
@@ -41,21 +41,21 @@ impl<W: Write + Send> VerificationCodeSender for ConsoleVerificationCodeSender<W
 mod tests {
     use super::*;
     use crate::application::email_reservation::tasks::send_verification_code::{
-        send_verification_code_task_handler, v1::SendVerificationCodeTaskV1,
+        send_verification_code_task_adapter, v1::SendVerificationCodeTaskV1,
     };
     use crate::domain::{Email, UserAccountId};
-    use cqrs_runtime::outbox::TaskFormat;
+    use cqrs_runtime::task::data::format::TaskFormat;
     use serde_json::json;
     use uuid::Uuid;
 
-    fn delivery() -> TaskDelivery {
-        TaskDelivery::new(
+    fn delivery() -> TaskAttempt {
+        TaskAttempt::new(
             Uuid::from_u128(41), TaskFormat::of::<SendVerificationCodeTaskV1>().unwrap(),
             json!({"email":"alice@example.com", "account_id":"26e91668-f9fc-4be4-bd9d-321fba42e18b", "verification_code":1234567}),
             json!({}), 2,
         ).unwrap()
     }
-    use cqrs_runtime::outbox::TaskHandlerError;
+    use cqrs_runtime::task::handling::handler::TaskHandlerError;
     use std::io::{self, Write};
 
     #[tokio::test]
@@ -77,10 +77,10 @@ mod tests {
         }
         for flush_only in [false, true] {
             let mut handler =
-                send_verification_code_task_handler(Box::new(ConsoleVerificationCodeSender::new(BrokenWriter { flush_only })))
+                send_verification_code_task_adapter(Box::new(ConsoleVerificationCodeSender::new(BrokenWriter { flush_only })))
                     .unwrap();
             assert!(matches!(
-                handler.handle(&delivery()).await,
+                handler.invoke(&delivery()).await,
                 Err(TaskHandlerError::Retry { .. })
             ));
         }

@@ -28,19 +28,19 @@ configuration in this repository.
   worker supervisor and optional transport-independent process host. It must
   never depend on `account-managements-service` or Axum.
 - `main` composes business dependencies and HTTP adapters, passes inbound and
-  outbox futures to `cqrs_runtime::host::run`, then closes the database pool
+  task runtime futures to `cqrs_runtime::host::lifecycle::run`, then closes the database pool
   regardless of preparation/bind/host results before logging/returning the
   binary ServiceError. Private config/startup modules own process configuration,
   safe error reporting and pool cleanup; host retains component lifecycle.
-- The optional `host` feature enables `worker` and `tokio/signal`. Its facade
-  exports `run`, `shutdown_signal`, and `HostError`; private `lifecycle`, `error`,
-  and `signal` modules own transport-independent coordination. No service-local
+- The optional `host` feature enables `worker` and `tokio/signal`. Its public
+  `lifecycle`, `error`, and `signal` modules define `run`, `HostError` and
+  `shutdown_signal` directly and own transport-independent coordination. No service-local
   runtime wrapper or Axum dependency belongs in runtime.
 
 ## Startup configuration and diagnostics
 
 Private binary ServiceConfig owns PostgreSQL options, numeric SocketAddr, logger,
-outbox and queue configs. from_env snapshots supported keys, rejects non-Unicode
+task runtime and queue configs. from_env snapshots supported keys, rejects non-Unicode
 values and delegates to injected lookup. Update its key list and .env.example when
 adding settings. Required DATABASE_URL uses postgres/postgresql URI; BIND_ADDRESS
 requires numeric IPv4/IPv6 plus port. Executable dotenv loading allows only missing
@@ -50,7 +50,7 @@ Runtime must never load dotenv or install a subscriber implicitly.
 Runtime logging is optional and independent; telemetry is deferred. LoggingConfig
 has private fields, LevelFilter new/default/getter/from_lookup/from_env and try_init.
 Preserve formatter defaults (target false, thread names true) and log bridge.
-Caller-provided PgConnectOptions feed postgres::connect_pool (max 10, other SQLx
+Caller-provided PgConnectOptions feed postgres::pool::connect_pool (max 10, other SQLx
 defaults). Service SQLx dependency is production; no direct postgres-es adapter
 construction or connection helper belongs in service code.
 
@@ -104,9 +104,9 @@ account-managements-service/src/
   issuing the command; events carry the accepted values so replay never
   samples randomness again.
 - Versioned durable task DTOs live under `{capability}/tasks/{task}/v1.rs` and
-  implement `cqrs_runtime::outbox::TaskPayload`; `{task}.rs` owns the current
-  `TypedTaskHandler<P>` implementation and any business sender port. Wrap it
-  with `outbox::typed_task_handler` in the feature factory. Keep persisted
+  implement `cqrs_runtime::task::data::format::TaskPayload`; `{task}.rs` owns the current
+  `TaskHandler<P>` implementation and any business sender port. Wrap it
+  with `task::handling::json_adapter::task_adapter` in the feature factory. Keep persisted
   DTOs readable while queued work can still be retried.
 - Presentation imports only `application::{capability}::service::{FeatureService,
   FeatureServiceError}`. Infrastructure implements the feature's
@@ -151,7 +151,7 @@ cross-layer enum.
 
 ## Retry ownership
 
-- `cqrs_runtime::command::CqrsCommandExecutor` owns the short optimistic-conflict retry.
+- `cqrs_runtime::command::executor::CqrsCommandExecutor` owns the short optimistic-conflict retry.
   An aggregate-specific gateway computes the aggregate ID and delegates the
   unchanged command and prebuilt tasks. The executor builds one framework per
   command and reloads aggregate state for each attempt. `max_attempts` counts
@@ -167,7 +167,7 @@ cross-layer enum.
   but the application layer must not repeat that same conflict first.
 - A task handler may own bounded local retries of its one operation. The
   outbox separately owns durable redelivery of the whole task, including
-  recovery after a crash or expired lease; the coordinator also retries a
+  recovery after a crash or expired lease; the executor also retries a
   timed-out handler. Local retry exhaustion does not prevent redelivery until
   a terminal task outcome is durably settled. Every invocation must be safe
   to repeat from the beginning.
@@ -240,7 +240,7 @@ its own invariants. An in-progress aggregate phase blocks conflicting commands
 until a later Task's command records completion; it is not a database lock held
 while a worker runs.
 
-A TaskHandler performs one target-aggregate command, or one external effect
+A TaskAdapter performs one target-aggregate command, or one external effect
 such as sending an email. It must not issue several aggregate commands as a
 single Task's workflow. If a process needs another command, the first command
 commits the next Task with its event. Mark the original Task `Completed` only
@@ -256,12 +256,12 @@ worker commands `EmailReservation::RecordAccountCreated`, which commits
 Task execution is at least once: the aggregate command can commit before
 the separate `Completed` settlement succeeds. A redelivered Task must be safe:
 the target aggregate may reject an already-applied command with a distinct
-domain outcome for an exact match, without a new event or Task. The TaskHandler
+domain outcome for an exact match, without a new event or Task. The TaskAdapter
 for that Task decides whether each domain outcome means `Completed`, retry, or
 permanent failure. Map an exact already-applied outcome to `Completed`; reject
 different existing data. Do not treat a generic `AlreadyExists` rejection as
 success unless the aggregate checked all identity-defining fields. Keep this
-business classification out of the generic queue/coordinator. When retries
+business classification out of the generic queue/executor. When retries
 are exhausted, persist `Failed` and emit an error-level `tracing` event for the
 confirmed transition, including failures found during lease recovery. Log task
 identity, attempt, and reason, not secrets or payload. `Failed` does not prove
@@ -269,7 +269,7 @@ the aggregate command never committed.
 
 For `CreateAccountTask` specifically, `UserAccount::CreateAccount` rejects an
 exact repeat as `AlreadyCreated` after checking the account ID, email, and
-canonical profile. Its TaskHandler treats that rejection as `Completed`; a
+canonical profile. Its TaskAdapter treats that rejection as `Completed`; a
 different existing account is a separate permanent failure.
 
 Use cases choose between `FeatureGateway::execute(command)` (events only) and
@@ -292,7 +292,7 @@ then committed by one atomic statement. Supporting multi-event commands
 requires a separate snapshot-contract change.
 
 `main` injects a ready `CommandExecutor<A>` into each CQRS gateway. The standard
-`postgres::command_executor` factory uses unit services and no queries. Its
+`postgres::command_factory::command_executor` factory uses unit services and no queries. Its
 checked `PostgresCommandConfig` has a positive snapshot interval (default 25)
 and the existing conflict retry policy. For each command, the factory creates
 a repository carrying that call's immutable tasks, then the snapshot store and
@@ -302,8 +302,8 @@ stores/services/queries in tests or nonstandard integrations; gateways themselve
 do not own factory or retry configuration.
 
 ```rust
-let executor = cqrs_runtime::postgres::command_executor::<Invoice>(
-    pool.clone(), cqrs_runtime::postgres::PostgresCommandConfig::default(),
+let executor = cqrs_runtime::postgres::command_factory::command_executor::<Invoice>(
+    pool.clone(), cqrs_runtime::postgres::command_factory::PostgresCommandConfig::default(),
 );
 let gateway = CqrsInvoiceGateway::new(executor);
 ```
@@ -315,15 +315,15 @@ state); increment/append models require a separate snapshot-contract fix. See
 
 Application owns versioned business task DTOs, handler implementations, and
 sender ports. `cqrs-runtime` owns the generic task, queue and handler traits,
-the checked `typed_task_handler` adapter, `OutboxTaskCoordinator`, and
-`TaskHandlerRegistry`. The registry
+the checked `task_adapter` adapter, `TaskExecutor`, and
+`TaskDispatcher`. The dispatcher
 rejects empty and duplicate registrations and routes each type/version to one
 handler. The composition root supplies a business handler factory; runtime
-preparation creates all C registries before binding HTTP. The first registry
-supplies the coordinator's ordered claim formats and becomes worker zero's
-registry; the remaining C−1 must match. Unknown formats stay pending.
-Typed handlers receive an owned versioned DTO and the original `&TaskDelivery`.
-The base runtime adapter returns `Result<Box<dyn TaskHandler>, TaskFormatError>`,
+preparation creates all C dispatchers before binding HTTP. The first dispatcher
+supplies the poller's ordered claim formats and becomes worker zero's
+dispatcher; the remaining C−1 must match. Unknown formats stay pending.
+Typed handlers receive an owned versioned DTO and the original `&TaskAttempt`.
+The base runtime adapter returns `Result<Box<dyn TaskAdapter>, TaskFormatError>`,
 checks format on construction and delivery, and decodes borrowed JSON before
 calling business code. Payload/handler need Send, without Clone/Sync requirements.
 Format/decode failures are Permanent with safe expected type/version; type names
@@ -331,9 +331,9 @@ outside ASCII letters/digits/underscore become `unknown` only in diagnostics.
 Never include payload, metadata, actual arbitrary type or serde error text.
 Business results and retry_after pass unchanged. Application keeps semantic
 validation, wire-to-current-input conversion and exact-repeat classification.
-One adapter handles one DTO version; raw TaskHandler supports custom multi-version
-handlers. Registry duplicate checks and claim formats remain unchanged.
-Application sender ports borrow the same TaskDelivery for ID/attempt/metadata;
+One adapter handles one DTO version; TaskAdapter supports custom multi-version
+adaptation to business handlers. Dispatcher duplicate checks and claim formats remain unchanged.
+Application sender ports borrow the same TaskAttempt for ID/attempt/metadata;
 do not recreate an owned DeliveryContext or clone metadata just to pass context.
 Handler boundary tests and their fakes belong in the service integration suite;
 runtime adapter tests use local dummy DTOs and handlers in its private module.
@@ -351,17 +351,17 @@ claimed.
 
 Background polling comes from `cqrs-runtime`'s `worker` feature. Its Tokio
 supervisor owns one bounded async-channel queue and a JoinSet of permanent
-Tokio workers. Each worker exclusively owns its mutable registry and a cloned
+Tokio workers. Each worker exclusively owns its mutable dispatcher and a cloned
 receiver; await recv directly without an external mutex. Configure process-wide
 concurrency and queue capacity independently of CPU threads (defaults 128/128).
 Only the poller owns a sender. Before claim, snapshot Q - sender.len(); consumers
 only free space during that await, so the batch fits through try_send. No hidden
 buffer or per-send Tokio tasks. Multiple producers would require a new admission
-protocol. Never format TrySendError<ClaimedTask> into logs or panic messages.
+protocol. Never format TrySendError<LeasedTask> into logs or panic messages.
 Defaults use H=15s/S=6s/SQL=4s and a 60-second lease (C=Q=128 requires lease >53s).
 Validate queued waves with checked arithmetic:
 lease > 2*S + H + 5s + ceil(Q/C)*(H+S). Original deadlines remain authoritative.
-Observe exits through JoinSet and rebuild one checked registry per replacement;
+Observe exits through JoinSet and rebuild one checked dispatcher per replacement;
 never log panic payloads. Normal shutdown and restart-factory errors share bounded
 H+S draining of started work only; cancel the shared CancellationToken before
 closing the channel, as closure alone permits buffered receives. Queued claims
@@ -373,20 +373,20 @@ can pass a child token to isolate a pool. Ordinary token-handle Drop does not
 cancel; lifecycle owners hold DropGuard. Supervisor panic/abort requests host
 cancellation through its guard and aborts JoinSet workers without async drain.
 Never race token cancellation against an active handler/settlement invocation.
-The runtime host awaits inbound and outbox before caller-owned DB cleanup; preserve the first
-unexpected component failure, or signal/outbox/inbound error priority for requested
+The runtime host awaits inbound and task runtime before caller-owned DB cleanup; preserve the first
+unexpected component failure, or signal/runtime/inbound error priority for requested
 shutdown, and log secondary failures. Format JoinError only as task ID and
 panic/cancellation flags, including HostError Debug used by termination.
-Host installs its cancellation DropGuard before spawning the outbox future on
+Host installs its cancellation DropGuard before spawning the task runtime future on
 first poll; constructing an unpolled host starts nothing. Inbound/signal futures
-need neither Send nor 'static; only outbox does. Dropping/aborting a polled host
-cancels its token and detaches outbox for independent drain on a live Tokio
+need neither Send nor 'static; only the task runtime does. Dropping/aborting a polled host
+cancels its token and detaches task runtime for independent drain on a live Tokio
 runtime, without awaiting components or guaranteeing DB cleanup. Preserve H+S
-outbox drain and no host timeout for inbound/pool closure; force/watchdog policy
+task runtime drain and no host timeout for inbound/pool closure; force/watchdog policy
 remains [known issue #10](../../../doc/known_issues/http_shutdown.md).
 Recovery batches are capped at min(C, 32). `main` loads checked
-`OutboxRuntimeConfig` before DB connection, builds the business handler factory,
-and calls `postgres::prepare_outbox_runtime` before binding HTTP. Queue/coordinator
+`TaskRuntimeConfig` before DB connection, builds the business handler factory,
+and calls `postgres::task_runtime_factory::prepare_task_runtime` before binding HTTP. Queue/executor/poller
 assembly and combined budget validation belong to runtime, with PostgreSQL statement
 cap kept separate. The helper is gated on both postgres and worker; neither feature
 implicitly enables the other. Configuration parsing/validation remains covered.
@@ -399,46 +399,47 @@ It is the canonical portable contract; keep it with the runtime when moving
 the engine to another project.
 
 Preserve this project's aggregate-owned business sequence and one-operation
-Task invariant. Import runtime APIs through its public `command`, `outbox`,
-`postgres`, `worker`, and `host` facades; child modules are private. Task DTOs and
+Task invariant. Import runtime APIs through its public `command`, `task`,
+`postgres`, `runtime`, and `host` namespaces, using each API's defining module.
+Do not retain flattened import paths through re-exports. Task DTOs and
 configs are created through checked constructors/builders, not public-field
 mutation. `SettlementRequest` is intent; `SettlementResult` is a confirmed
-transition. Do not equate scheduled retry with completed work. Registry factories
-are fallible; supervisor errors are distinct from config validation errors.
+transition. Do not equate scheduled retry with completed work. Dispatcher factories
+are fallible; runtime errors are distinct from config validation errors.
 Keep alternate lifecycle states in enums, and keep deadline/SQL loops explicit
 where cancellation or partial results matter.
 
 Sender ports and business outcome classification belong to
 application; delivery, storage deadlines, lease budgets, lock tokens, and
-monotonic claim deadlines belong to the runtime/queue adapter. Business handlers receive only immutable `TaskDelivery`, not queue ownership.
-`ClaimedTask` and `ClaimLease` remain platform context. Configuration parsing/validation
+monotonic claim deadlines belong to the runtime/queue adapter. Business handlers receive only immutable `TaskAttempt`, not queue ownership.
+`LeasedTask` and `TaskLease` remain platform context. Configuration parsing/validation
 stays in `cqrs-runtime`; `main` loads the combined config before DB connection.
-Preparation builds/validates all registries before opening listeners, without
-storage operations or background tasks. `PreparedOutboxRuntime` owns the same
-registries that workers receive and is consumed by run, without startup rebuild.
+Preparation builds/validates all dispatchers before opening listeners, without
+storage operations or background tasks. `TaskRuntime` owns the same
+dispatchers that workers receive and is consumed by run, without startup rebuild.
 Preparation owns no CancellationToken; Drop releases handlers. A polled run owns
 DropGuard, skips spawn/storage on pre-cancelled token, and retains restart/drain
-semantics. Low-level `worker::run` remains available for custom coordinators and
+semantics. Low-level `runtime::supervisor::run` remains available for custom executors and
 shares the same engine, including actual-budget validation and startup cancellation. Update the runtime guide and API rustdoc
 together when changing this lasting contract.
 
-Checked coordinator and PostgreSQL queue configs validate local values only in
+Checked executor and PostgreSQL queue configs validate local values only in
 their constructors; assembling adapters from them is infallible. Combined runtime
-config owns cross-budget validation, while low-level worker::run retains its
-actual-coordinator check. Both preparation APIs return worker::WorkerRegistryError
+config owns cross-budget validation, while low-level runtime::supervisor::run retains its
+actual-executor check. Both preparation APIs return runtime::dispatcher_factory::WorkerSetupError
 directly (Build with source/index, FormatsMismatch with index), without generic or
-PostgreSQL preparation wrappers. Run returns OutboxWorkerPoolError with
-Configuration/Registry variants. Preserve InvalidFormat conversion for typed
-handler factories. QueueRequestError covers queue parameters only; invalid queue
-data and invocation budgets are OutboxError::InvalidDelivery/InvalidExecutionBudget.
+PostgreSQL preparation wrappers. Run returns TaskRuntimeError with
+Configuration/WorkerSetup variants. Preserve InvalidFormat conversion for typed
+adapter factories. QueueRequestError covers queue parameters only; invalid queue
+data and invocation budgets are TaskProcessingError::InvalidDelivery/InvalidExecutionBudget.
 
-Use registry/registries for handler registries, delivery for TaskDelivery, worker
-for permanent consumers and supervisor for pool lifecycle. PreparedOutboxRuntime
-owns the full pool assembly. TaskHandlerRegistry::formats borrows its stored slice; trait
+Use dispatcher/dispatchers for routers, attempt for TaskAttempt, worker
+for permanent consumers and supervisor for pool lifecycle. TaskRuntime
+owns the full pool assembly. TaskDispatcher::formats borrows its stored slice; trait
 methods still return owned lists. Keep result-to-settlement and confirmed-status
 mapping pure; random backoff, clocks, logging and SQL remain in effectful code.
 Host I/O Debug/logging includes only ErrorKind, never arbitrary source text;
-registry error Display/Debug uses the shared safe_type function and preserves raw
+dispatcher error Display/Debug uses the shared safe_type function and preserves raw
 formats only as data. Defaults and env fallbacks share private unit-specific
 constants. Non-Unicode runtime env behavior is unchanged; binary validation rejects it.
 
@@ -489,11 +490,16 @@ account-managements-service/src/
   construct an application service or gateway.
 - Runtime unit tests use local dummy aggregate, task, error, and handler types;
   they must not import the service. Test executor retry/error behavior, payload
-  construction, coordinator timeout/retry, registry routing, and worker
-  supervision in inline `#[cfg(test)] mod tests { ... }` blocks in the module
+  construction, executor timeout/retry, dispatcher routing, worker receive loops,
+  and private worker-pool behavior in inline `#[cfg(test)] mod tests { ... }` blocks in the module
   file they exercise. Do not create separate `tests.rs` child files for unit
   tests. A shared private `test_support` module may hold reusable runtime fakes;
   integration suites remain under the crate's `tests/` directory.
+- Public task-runtime scenarios live under `cqrs-runtime/tests/runtime/`, rooted
+  by `tests/runtime.rs`: preparation, bounded admission, supervision and shutdown
+  each have a module. They compose public queue, executor and runtime contracts
+  and own their fixtures in `runtime/support.rs`; never expose library unit-test
+  helpers or import private implementation modules into integration tests.
 - `cqrs-runtime/tests/postgres.rs` roots the PostgreSQL suite. Its
   `postgres/support.rs` owns the shared database fixture; persistence, queue,
   processing and worker modules own persisted behavior. Service gateway tests
@@ -520,3 +526,66 @@ values, call an application service, and return
 Cover the success path and every `ResourceError` mapping with transport-level
 tests: malformed input, domain validation failure, expected conflict, and an
 unavailable dependency whose details must remain hidden.
+
+## Runtime source layout
+
+Use the `command`, `task`, `postgres`, `runtime`, `host`, and `logging`
+namespaces with direct imports from the modules defining each type or function.
+Do not introduce flattening `pub use` declarations or compatibility aliases in
+`cqrs-runtime`. Public contracts expose their defining module; polling,
+worker-pool internals and SQL implementation details remain private.
+Use file modules (`name.rs` plus `name/`), without `mod.rs`.
+
+- `task/{data,handling,queue,executor}.rs` are thin module roots: documentation,
+  declarations only. Put components in their corresponding directory.
+- `data` owns formats/payload contracts, NewTask and its schedule, TaskAttempt,
+  and shared structural validation. `queue/lease.rs` owns TaskLease and
+  LeasedTask; platform ownership must not enter handler-visible data.
+- `handling` separates the handler port, adapter port, JSON implementation and
+  dispatcher. `executor` separates its port, default executor and lease-budget
+  decision. `queue` separates its port, ownership, confirmed transitions,
+  technical errors, storage config and durable backoff.
+- Keep one component's struct and implementation together. Keep its small
+  related errors and data types beside it. Separate an independent operation,
+  algorithm or I/O boundary rather than creating global model/implementation
+  buckets.
+- `postgres/task_queue.rs` is a namespace root. Its `queue.rs` owns construction, shared
+  transaction settings and delegation; claim, settlement and recovery each own
+  their SQL, row decoding and complete transaction. Preserve await/lock/commit
+  order when moving code.
+- `postgres/event_repository_with_outbox.rs` is a namespace root. Its children separate
+  the repository adapter, checked write/snapshot plan and atomic SQL compiler.
+- Runtime dispatcher_factory owns indexed construction errors and format
+  checks. WorkerPool owns JoinSet, task/index mapping, exit observations and
+  bounded drain. Supervisor coordinates admission, polling, restart and stop.
+- Aim for roughly 150–250 production lines per implementation file; approaching
+  300 prompts a responsibility review, not an automatic split. Also review
+  total file size including tests. Keep private unit tests inline; put long
+  public multi-component scenarios in the integration suites.
+
+See `cqrs-runtime/doc/components.md#source-layout` for the concrete source map.
+
+## Runtime terminology and polling ownership
+
+Use the `task` namespace for durable data, TaskHandler<P>, TaskAdapter, TaskDispatcher,
+TaskExecutor, TaskQueue and TaskStorageConfig. Use `runtime` (enabled by the
+unchanged worker Cargo feature) for TaskRuntime, TaskRuntimeConfig,
+TaskWorkerPoolConfig, TaskDispatcherFactory, WorkerSetupError and TaskRuntimeError.
+Business factories return Box<dyn TaskAdapter> and use *_task_adapter names.
+LeasedTask::attempt() returns TaskAttempt; TaskAttempt::number() is its positive
+claim number. Handler ports borrow that same attempt, without lease access.
+
+Private runtime Poller owns rotating, bounded multi-format claims and recovery.
+TaskExecutor only exposes storage_timeout and execute_and_settle on a mutable
+TaskDispatcher. Standard preparation wires the same queue to both. Low-level
+runtime::supervisor::run takes queue, executor, dispatcher factory, worker pool config and
+shutdown; custom executors must settle against that queue. Poller derives S from
+the executor's actual storage_timeout, preserving cross-budget validation and
+H+S drain. Supported formats come from the first retained dispatcher, not the
+executor. Preserve partial confirmed claims and one original batch deadline.
+
+Runtime owns one producer and DispatchBuffer of leased tasks, plus supervised
+TaskWorkers with exclusive mutable dispatchers. UnitOfWork is not this lifecycle:
+handler effects and settlement have separate commits. Outbox names are reserved
+for atomic event/task publication and its SQL/schema contracts. See
+cqrs-runtime/doc/components.md for the full component tree.

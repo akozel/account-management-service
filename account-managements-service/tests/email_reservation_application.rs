@@ -8,7 +8,7 @@ use account_managements_service::{
     domain::{Email, EmailReservationCommand, EmailReservationError, UserAccountId},
 };
 use async_trait::async_trait;
-use cqrs_runtime::{command::CommandGatewayError, outbox::NewOutboxTask};
+use cqrs_runtime::{command::CommandGatewayError, task::data::new_task::NewTask};
 
 struct FixedGenerator;
 
@@ -28,7 +28,7 @@ impl RegistrationMaterialGenerator for FixedGenerator {
 
 struct FakeGateway {
     result: Mutex<Option<Result<(), CommandGatewayError<EmailReservationError>>>>,
-    calls: Mutex<Vec<(EmailReservationCommand, Vec<NewOutboxTask>)>>,
+    calls: Mutex<Vec<(EmailReservationCommand, Vec<NewTask>)>>,
 }
 
 impl FakeGateway {
@@ -39,7 +39,7 @@ impl FakeGateway {
         }
     }
 
-    fn calls(&self) -> Vec<(EmailReservationCommand, Vec<NewOutboxTask>)> {
+    fn calls(&self) -> Vec<(EmailReservationCommand, Vec<NewTask>)> {
         self.calls.lock().unwrap().clone()
     }
 }
@@ -53,7 +53,7 @@ impl EmailReservationGateway for FakeGateway {
     async fn execute_with_outbox(
         &self,
         command: EmailReservationCommand,
-        tasks: Vec<NewOutboxTask>,
+        tasks: Vec<NewTask>,
     ) -> Result<(), CommandGatewayError<EmailReservationError>> {
         self.calls.lock().unwrap().push((command, tasks));
         self.result

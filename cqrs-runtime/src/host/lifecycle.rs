@@ -1,80 +1,80 @@
 #[cfg(test)]
-use crate::worker::WorkerRegistryError;
+use crate::runtime::dispatcher_factory::WorkerSetupError;
 use std::{future::Future, io};
 
-use crate::worker::OutboxWorkerPoolError;
+use crate::runtime::supervisor::TaskRuntimeError;
 use tokio::task::JoinError;
 use tokio_util::sync::CancellationToken;
 
-use super::HostError;
+use crate::host::error::HostError;
 
-type OutboxSupervisorExit = Result<Result<(), OutboxWorkerPoolError>, JoinError>;
+type TaskRuntimeExit = Result<Result<(), TaskRuntimeError>, JoinError>;
 
 enum StopReason {
     Signal(io::Result<()>),
     Requested,
     Inbound(io::Result<()>),
-    OutboxSupervisor(OutboxSupervisorExit),
+    TaskRuntime(TaskRuntimeExit),
 }
 
 /// Coordinate signal, shared-token cancellation, or unexpected component exit.
 ///
 /// Creating this future starts nothing. Its first poll installs a cancellation
-/// guard before spawning `outbox` on Tokio. Inbound and signal futures run in
+/// guard before spawning `tasks` on Tokio. Inbound and signal futures run in
 /// this future and need neither `Send` nor `'static`.
 ///
-/// Observation priority is signal, token cancellation, inbound, then outbox.
+/// Observation priority is signal, token cancellation, inbound, then tasks.
 /// An unexpected exit remains the primary error; requested shutdown prefers
-/// signal-observation errors, then outbox errors, then inbound errors.
+/// signal-observation errors, then tasks errors, then inbound errors.
 /// Secondary failures are logged separately.
-/// Fatal outbox errors cancel the shared token before draining, allowing inbound
+/// Fatal tasks errors cancel the shared token before draining, allowing inbound
 /// to stop admission immediately. Both components finish before resource cleanup;
 /// Inbound and resource cleanup currently have no process-wide shutdown deadline.
 /// Dropping or aborting a polled host requests cancellation and detaches the
-/// outbox task, allowing its own drain to continue on a live Tokio runtime.
+/// tasks task, allowing its own drain to continue on a live Tokio runtime.
 /// The inbound future is dropped; the host cannot await components or guarantee
 /// resource cleanup in that case. Normal return waits for both components.
-pub async fn run<Inbound, Outbox, Signal>(
+pub async fn run<Inbound, Tasks, Signal>(
     inbound: Inbound,
-    outbox: Outbox,
+    tasks: Tasks,
     shutdown: CancellationToken,
     signal: Signal,
 ) -> Result<(), HostError>
 where
     Inbound: Future<Output = io::Result<()>>,
-    Outbox: Future<Output = Result<(), OutboxWorkerPoolError>> + Send + 'static,
+    Tasks: Future<Output = Result<(), TaskRuntimeError>> + Send + 'static,
     Signal: Future<Output = io::Result<()>>,
 {
     let _cancel_on_exit = shutdown.clone().drop_guard();
-    let outbox_supervisor = tokio::spawn(outbox);
+    let task_runtime = tokio::spawn(tasks);
     tokio::pin!(inbound);
     tokio::pin!(signal);
-    tokio::pin!(outbox_supervisor);
+    tokio::pin!(task_runtime);
 
     let reason = tokio::select! {
         biased;
         result = &mut signal => StopReason::Signal(result),
         _ = shutdown.cancelled() => StopReason::Requested,
         result = &mut inbound => StopReason::Inbound(result),
-        result = &mut outbox_supervisor => StopReason::OutboxSupervisor(result),
+        result = &mut task_runtime => StopReason::TaskRuntime(result),
     };
     shutdown.cancel();
 
     match reason {
         StopReason::Signal(signal_result) => {
-            let (inbound_result, supervisor_result) = tokio::join!(&mut inbound, &mut outbox_supervisor);
+            let (inbound_result, supervisor_result) = tokio::join!(&mut inbound, &mut task_runtime);
             preserve_primary_failure(
                 signal_result.map_err(HostError::ShutdownSignal),
                 preserve_primary_failure(
-                    expected_supervisor_exit(supervisor_result),
+                    expected_runtime_exit(supervisor_result),
                     expected_inbound_exit(inbound_result),
                 ),
             )
         }
         StopReason::Requested => {
-            let (inbound_result, supervisor_result) = tokio::join!(&mut inbound, &mut outbox_supervisor);
+            let (inbound_result, supervisor_result) = tokio::join!(&mut inbound, &mut task_runtime);
             preserve_primary_failure(
-                expected_supervisor_exit(supervisor_result),
+                expected_runtime_exit(supervisor_result),
                 expected_inbound_exit(inbound_result),
             )
         }
@@ -83,10 +83,10 @@ where
                 Ok(()) => HostError::InboundStopped,
                 Err(error) => HostError::Inbound(error),
             };
-            preserve_primary_failure(Err(primary), expected_supervisor_exit((&mut outbox_supervisor).await))
+            preserve_primary_failure(Err(primary), expected_runtime_exit((&mut task_runtime).await))
         }
-        StopReason::OutboxSupervisor(supervisor_result) => preserve_primary_failure(
-            unexpected_supervisor_exit(supervisor_result),
+        StopReason::TaskRuntime(supervisor_result) => preserve_primary_failure(
+            unexpected_runtime_exit(supervisor_result),
             expected_inbound_exit((&mut inbound).await),
         ),
     }
@@ -108,18 +108,18 @@ fn expected_inbound_exit(result: io::Result<()>) -> Result<(), HostError> {
     result.map_err(HostError::Inbound)
 }
 
-fn expected_supervisor_exit(result: OutboxSupervisorExit) -> Result<(), HostError> {
+fn expected_runtime_exit(result: TaskRuntimeExit) -> Result<(), HostError> {
     match result {
         Ok(Ok(())) => Ok(()),
-        Ok(Err(error)) => Err(HostError::OutboxSupervisor(error)),
-        Err(error) => Err(HostError::OutboxSupervisorTask(error)),
+        Ok(Err(error)) => Err(HostError::TaskRuntime(error)),
+        Err(error) => Err(HostError::TaskRuntimeJoin(error)),
     }
 }
 
-fn unexpected_supervisor_exit(result: OutboxSupervisorExit) -> Result<(), HostError> {
+fn unexpected_runtime_exit(result: TaskRuntimeExit) -> Result<(), HostError> {
     match result {
-        Ok(Ok(())) => Err(HostError::OutboxSupervisorStopped),
-        other => expected_supervisor_exit(other),
+        Ok(Ok(())) => Err(HostError::TaskRuntimeStopped),
+        other => expected_runtime_exit(other),
     }
 }
 
@@ -154,7 +154,7 @@ mod tests {
                 Ok(())
             }
         };
-        let outbox_supervisor = {
+        let task_runtime = {
             let stopped = worker_stopped.clone();
             async move {
                 wait_for_shutdown(worker_shutdown, stopped).await;
@@ -162,7 +162,7 @@ mod tests {
             }
         };
 
-        let result = run(inbound, outbox_supervisor, shutdown, async { Ok(()) }).await;
+        let result = run(inbound, task_runtime, shutdown, async { Ok(()) }).await;
 
         assert!(result.is_ok());
         assert!(inbound_stopped.load(Ordering::SeqCst));
@@ -183,7 +183,7 @@ mod tests {
                 Ok(())
             }
         };
-        let outbox_supervisor = {
+        let task_runtime = {
             let stopped = worker_stopped.clone();
             async move {
                 wait_for_shutdown(worker_shutdown, stopped).await;
@@ -192,7 +192,7 @@ mod tests {
         };
         let signal = async { Err(io::Error::other("signal handler failed")) };
 
-        let result = run(inbound, outbox_supervisor, shutdown, signal).await;
+        let result = run(inbound, task_runtime, shutdown, signal).await;
 
         assert!(matches!(result, Err(HostError::ShutdownSignal(_))));
         assert!(inbound_stopped.load(Ordering::SeqCst));
@@ -204,7 +204,7 @@ mod tests {
         let shutdown = CancellationToken::new();
         let worker_shutdown = shutdown.clone();
         let worker_stopped = Arc::new(AtomicBool::new(false));
-        let outbox_supervisor = {
+        let task_runtime = {
             let stopped = worker_stopped.clone();
             async move {
                 wait_for_shutdown(worker_shutdown, stopped).await;
@@ -214,7 +214,7 @@ mod tests {
         let inbound = async { Err(io::Error::other("Inbound failed")) };
         let signal = std::future::pending();
 
-        let result = run(inbound, outbox_supervisor, shutdown, signal).await;
+        let result = run(inbound, task_runtime, shutdown, signal).await;
 
         assert!(matches!(result, Err(HostError::Inbound(_))));
         assert!(worker_stopped.load(Ordering::SeqCst));
@@ -232,12 +232,12 @@ mod tests {
                 Ok(())
             }
         };
-        let outbox_supervisor = async { Ok(()) };
+        let task_runtime = async { Ok(()) };
         let signal = std::future::pending();
 
-        let result = run(inbound, outbox_supervisor, shutdown, signal).await;
+        let result = run(inbound, task_runtime, shutdown, signal).await;
 
-        assert!(matches!(result, Err(HostError::OutboxSupervisorStopped)));
+        assert!(matches!(result, Err(HostError::TaskRuntimeStopped)));
         assert!(inbound_stopped.load(Ordering::SeqCst));
     }
 
@@ -253,20 +253,20 @@ mod tests {
                 Ok(())
             }
         };
-        let outbox_supervisor = async {
-            panic!("outbox panic");
+        let task_runtime = async {
+            panic!("tasks panic");
             #[allow(unreachable_code)]
             Ok(())
         };
         let signal = std::future::pending();
 
-        let result = run(inbound, outbox_supervisor, shutdown, signal).await;
+        let result = run(inbound, task_runtime, shutdown, signal).await;
 
-        assert!(matches!(result, Err(HostError::OutboxSupervisorTask(_))));
+        assert!(matches!(result, Err(HostError::TaskRuntimeJoin(_))));
         assert!(inbound_stopped.load(Ordering::SeqCst));
     }
-    fn outbox_error() -> OutboxWorkerPoolError {
-        OutboxWorkerPoolError::Registry(WorkerRegistryError::FormatsMismatch { worker_index: 7 })
+    fn outbox_error() -> TaskRuntimeError {
+        TaskRuntimeError::WorkerSetup(WorkerSetupError::FormatsMismatch { worker_index: 7 })
     }
 
     #[tokio::test]
@@ -276,7 +276,7 @@ mod tests {
         let (release, drain) = tokio::sync::oneshot::channel::<()>();
         let (inbound_started, inbound_shutdown_started) = tokio::sync::oneshot::channel();
         let worker_shutdown = shutdown.clone();
-        let outbox_supervisor = async move {
+        let task_runtime = async move {
             failure.await.unwrap();
             worker_shutdown.cancel();
             drain.await.unwrap();
@@ -288,7 +288,7 @@ mod tests {
             inbound_started.send(()).unwrap();
             Ok(())
         };
-        let runtime = tokio::spawn(run(inbound, outbox_supervisor, shutdown, std::future::pending()));
+        let runtime = tokio::spawn(run(inbound, task_runtime, shutdown, std::future::pending()));
         fail.send(()).unwrap();
         tokio::time::timeout(std::time::Duration::from_secs(1), inbound_shutdown_started)
             .await
@@ -296,13 +296,13 @@ mod tests {
             .unwrap();
         assert!(
             !runtime.is_finished(),
-            "Inbound must observe cancellation while outbox still drains"
+            "Inbound must observe cancellation while tasks still drains"
         );
         release.send(()).unwrap();
         assert!(matches!(
             runtime.await.unwrap(),
-            Err(HostError::OutboxSupervisor(OutboxWorkerPoolError::Registry(
-                WorkerRegistryError::FormatsMismatch { worker_index: 7 }
+            Err(HostError::TaskRuntime(TaskRuntimeError::WorkerSetup(
+                WorkerSetupError::FormatsMismatch { worker_index: 7 }
             )))
         ));
     }
@@ -314,9 +314,9 @@ mod tests {
             if !signal_ready {
                 shutdown.cancel();
             }
-            let outbox_supervisor = async { Ok(()) };
+            let task_runtime = async { Ok(()) };
             let signal = async move { if signal_ready { Ok(()) } else { std::future::pending().await } };
-            assert!(run(async { Ok(()) }, outbox_supervisor, shutdown, signal).await.is_ok());
+            assert!(run(async { Ok(()) }, task_runtime, shutdown, signal).await.is_ok());
         }
     }
 
@@ -324,12 +324,12 @@ mod tests {
     async fn clean_inbound_exit_without_cancellation_is_unexpected() {
         let shutdown = CancellationToken::new();
         let worker_shutdown = shutdown.clone();
-        let outbox_supervisor = async move {
+        let task_runtime = async move {
             worker_shutdown.cancelled().await;
             Ok(())
         };
         assert!(matches!(
-            run(async { Ok(()) }, outbox_supervisor, shutdown, std::future::pending()).await,
+            run(async { Ok(()) }, task_runtime, shutdown, std::future::pending()).await,
             Err(HostError::InboundStopped)
         ));
     }
@@ -343,14 +343,14 @@ mod tests {
         let shutdown = CancellationToken::new();
         let worker_shutdown = shutdown.clone();
         let (stopped, worker_stopped) = tokio::sync::oneshot::channel();
-        let outbox_supervisor = async move {
+        let task_runtime = async move {
             worker_shutdown.cancelled().await;
             stopped.send(()).unwrap();
             Ok(())
         };
         let mut runtime = Box::pin(run(
             std::future::pending(),
-            outbox_supervisor,
+            task_runtime,
             shutdown.clone(),
             std::future::pending(),
         ));
@@ -387,7 +387,7 @@ mod tests {
     #[tokio::test]
     async fn primary_failures_survive_shutdown_and_secondary_failures_are_logged() {
         use tracing::instrument::WithSubscriber;
-        for initiator in ["signal_failure", "signal", "token", "inbound", "outbox_supervisor"] {
+        for initiator in ["signal_failure", "signal", "token", "inbound", "task_runtime"] {
             let writer = RecordingWriter::default();
             let subscriber = tracing_subscriber::fmt()
                 .with_writer(writer.clone())
@@ -415,7 +415,7 @@ mod tests {
                 Err(io::Error::other("private_inbound_source"))
             };
             let worker_shutdown = shutdown.clone();
-            let outbox_supervisor = async move {
+            let task_runtime = async move {
                 if initiator == "inbound" {
                     worker_shutdown.cancelled().await;
                 }
@@ -428,13 +428,11 @@ mod tests {
                     _ => std::future::pending().await,
                 }
             };
-            let result = run(inbound, outbox_supervisor, shutdown, signal)
-                .with_subscriber(dispatch)
-                .await;
+            let result = run(inbound, task_runtime, shutdown, signal).with_subscriber(dispatch).await;
             match initiator {
                 "signal_failure" => assert!(matches!(result, Err(HostError::ShutdownSignal(_)))),
                 "inbound" => assert!(matches!(result, Err(HostError::Inbound(_)))),
-                _ => assert!(matches!(result, Err(HostError::OutboxSupervisor(_)))),
+                _ => assert!(matches!(result, Err(HostError::TaskRuntime(_)))),
             }
             let log = String::from_utf8(writer.0.lock().unwrap().clone()).unwrap();
             assert!(!log.contains("private_"));
@@ -443,7 +441,7 @@ mod tests {
                 if initiator == "signal_failure" { 2 } else { 1 }
             );
             if initiator == "inbound" || initiator == "signal_failure" {
-                assert!(log.contains("OutboxSupervisor"));
+                assert!(log.contains("TaskRuntime"));
             }
             if initiator != "inbound" {
                 assert!(log.contains("Inbound"));
@@ -493,7 +491,7 @@ mod tests {
             let (cancelled, cancellation_observed) = oneshot::channel();
             let (release, drain) = oneshot::channel();
             let (finished, work_finished) = oneshot::channel();
-            let outbox = async move {
+            let tasks = async move {
                 started.send(()).unwrap();
                 token.cancelled().await;
                 cancelled.send(()).unwrap();
@@ -501,7 +499,7 @@ mod tests {
                 finished.send(()).unwrap();
                 Ok(())
             };
-            let mut host = Box::pin(run(std::future::pending(), outbox, shutdown.clone(), std::future::pending()));
+            let mut host = Box::pin(run(std::future::pending(), tasks, shutdown.clone(), std::future::pending()));
             assert!(matches!(
                 host.as_mut().poll(&mut Context::from_waker(Waker::noop())),
                 Poll::Pending
@@ -522,7 +520,7 @@ mod tests {
                 .await
                 .unwrap()
                 .unwrap();
-            assert!(!release.is_closed(), "host must leave outbox's active work alive");
+            assert!(!release.is_closed(), "host must leave tasks's active work alive");
             release.send(()).unwrap();
             tokio::time::timeout(Duration::from_secs(1), work_finished)
                 .await
@@ -650,16 +648,16 @@ mod tests {
                 Poll::Pending
             }
         });
-        let outbox = async move {
+        let tasks = async move {
             outbox_ready.store(true, Ordering::SeqCst);
             Ok(())
         };
-        let mut host = Box::pin(run(inbound, outbox, CancellationToken::new(), std::future::pending()));
+        let mut host = Box::pin(run(inbound, tasks, CancellationToken::new(), std::future::pending()));
         assert!(matches!(
             host.as_mut().poll(&mut Context::from_waker(Waker::noop())),
             Poll::Pending
         ));
-        // The outbox task completes before the host gets its next poll.
+        // The tasks task completes before the host gets its next poll.
         tokio::task::yield_now().await;
         assert!(ready.load(Ordering::SeqCst));
         assert!(matches!(host.await, Err(HostError::InboundStopped)));

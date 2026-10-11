@@ -1,5 +1,5 @@
 use crate::domain::{Email, UserAccountId};
-use cqrs_runtime::outbox::TaskPayload;
+use cqrs_runtime::task::data::format::TaskPayload;
 use serde::{Deserialize, Serialize};
 
 #[derive(Clone, Debug, Serialize, Deserialize, PartialEq, Eq)]

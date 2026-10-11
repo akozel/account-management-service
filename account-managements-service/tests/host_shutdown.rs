@@ -46,7 +46,7 @@ async fn standard_axum_shutdown_stops_tcp_admission_and_preserves_active_request
                 .with_graceful_shutdown(token.cancelled_owned())
                 .await
         };
-        let result = cqrs_runtime::host::run(server, worker, host_shutdown, std::future::pending()).await;
+        let result = cqrs_runtime::host::lifecycle::run(server, worker, host_shutdown, std::future::pending()).await;
         cleanup.store(true, Ordering::SeqCst);
         result
     });

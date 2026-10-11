@@ -1,5 +1,5 @@
 use super::*;
-use cqrs_runtime::outbox::TaskDelivery;
+use cqrs_runtime::task::data::attempt::TaskAttempt;
 
 pub(super) struct Database {
     pub(super) pool: PgPool,
@@ -23,7 +23,7 @@ impl Database {
         let options = format!("postgresql://outbox_test:outbox_test@{host}:{port}/outbox_test")
             .parse()
             .unwrap();
-        let pool = cqrs_runtime::postgres::connect_pool(options).await.unwrap();
+        let pool = cqrs_runtime::postgres::pool::connect_pool(options).await.unwrap();
         sqlx::raw_sql(EVENT_STORE_SCHEMA).execute(&pool).await.unwrap();
         sqlx::raw_sql(TRANSACTIONAL_OUTBOX_SCHEMA).execute(&pool).await.unwrap();
         Self { pool, container }
@@ -34,8 +34,8 @@ impl Database {
     }
 }
 
-pub(super) fn new_task() -> NewOutboxTask {
-    NewOutboxTask::new(DummyTaskV1 {
+pub(super) fn new_task() -> NewTask {
+    NewTask::new(DummyTaskV1 {
         value: "runtime".to_owned(),
     })
     .unwrap()
@@ -105,7 +105,7 @@ pub(super) fn worker_event(id: &str) -> SerializedEvent {
     event(id, 1)
 }
 
-pub(super) async fn enqueue(pool: &PgPool, tasks: Vec<NewOutboxTask>) {
+pub(super) async fn enqueue(pool: &PgPool, tasks: Vec<NewTask>) {
     let id = Uuid::new_v4().to_string();
     PostgresEventRepositoryWithOutbox::new(pool.clone())
         .with_outbox(tasks)
@@ -114,47 +114,47 @@ pub(super) async fn enqueue(pool: &PgPool, tasks: Vec<NewOutboxTask>) {
         .unwrap();
 }
 
-pub(super) struct TestHandler {
+pub(super) struct TestAdapter {
     pub(super) outcome: Result<(), TaskHandlerError>,
 }
 
 #[async_trait]
-impl TaskHandler for TestHandler {
+impl TaskAdapter for TestAdapter {
     fn formats(&self) -> Vec<TaskFormat> {
         vec![format()]
     }
 
-    async fn handle(&mut self, _: &TaskDelivery) -> Result<(), TaskHandlerError> {
+    async fn invoke(&mut self, _: &TaskAttempt) -> Result<(), TaskHandlerError> {
         self.outcome.clone()
     }
 }
 
-pub(super) fn handler(outcome: Result<(), TaskHandlerError>) -> TestHandler {
-    TestHandler { outcome }
+pub(super) fn adapter(outcome: Result<(), TaskHandlerError>) -> TestAdapter {
+    TestAdapter { outcome }
 }
 
-pub(super) struct HangingHandler;
+pub(super) struct HangingAdapter;
 
 #[async_trait]
-impl TaskHandler for HangingHandler {
+impl TaskAdapter for HangingAdapter {
     fn formats(&self) -> Vec<TaskFormat> {
         vec![format()]
     }
 
-    async fn handle(&mut self, _: &TaskDelivery) -> Result<(), TaskHandlerError> {
+    async fn invoke(&mut self, _: &TaskAttempt) -> Result<(), TaskHandlerError> {
         std::future::pending().await
     }
 }
 
-pub(super) struct CountingHandler(pub(super) Arc<AtomicUsize>);
+pub(super) struct CountingAdapter(pub(super) Arc<AtomicUsize>);
 
 #[async_trait]
-impl TaskHandler for CountingHandler {
+impl TaskAdapter for CountingAdapter {
     fn formats(&self) -> Vec<TaskFormat> {
         vec![format()]
     }
 
-    async fn handle(&mut self, _: &TaskDelivery) -> Result<(), TaskHandlerError> {
+    async fn invoke(&mut self, _: &TaskAttempt) -> Result<(), TaskHandlerError> {
         self.0.fetch_add(1, Ordering::SeqCst);
         Ok(())
     }
@@ -180,8 +180,32 @@ pub(super) async fn expire(pool: &PgPool, id: Uuid) {
         .await
         .unwrap();
 }
-pub(super) async fn claim(queue: &PostgresOutboxQueue) -> Vec<ClaimedTask> {
+pub(super) async fn claim(queue: &PostgresTaskQueue) -> Vec<LeasedTask> {
     queue.claim(&format(), "test", 100, Duration::from_secs(60)).await.unwrap()
+}
+
+// Observe server-side contention before releasing the test's lock. A barrier
+// alone cannot ensure that both SQL statements have reached PostgreSQL.
+pub(super) async fn wait_for_blocked_queries(pool: &PgPool, query_fragment: &str, count: i64) {
+    tokio::time::timeout(Duration::from_secs(10), async {
+        loop {
+            let blocked: i64 = sqlx::query_scalar(
+                "SELECT count(*) FROM pg_stat_activity WHERE datname = current_database() \
+                 AND pid <> pg_backend_pid() AND state = 'active' AND wait_event_type = 'Lock' \
+                 AND strpos(query, $1) > 0",
+            )
+            .bind(query_fragment)
+            .fetch_one(pool)
+            .await
+            .unwrap();
+            if blocked >= count {
+                break;
+            }
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+    })
+    .await
+    .expect("competing SQL statements must reach the held lock");
 }
 
 pub(super) async fn assert_worker_state(pool: &PgPool, id: Uuid, status: &str, attempts: i32, error: Option<&str>) {
@@ -195,4 +219,8 @@ pub(super) async fn assert_worker_state(pool: &PgPool, id: Uuid, status: &str, a
     assert_eq!(saved.get::<Option<Uuid>, _>("lock_token").is_some(), processing);
     assert_eq!(saved.get::<Option<DateTime<Utc>>, _>("locked_until").is_some(), processing);
     assert_eq!(saved.get::<Option<DateTime<Utc>>, _>("finished_at").is_some(), finished);
+}
+
+pub(super) fn dispatcher(adapter: impl TaskAdapter + 'static) -> TaskDispatcher {
+    TaskDispatcher::try_new(vec![Box::new(adapter)]).unwrap()
 }

@@ -1,7 +1,14 @@
 use crate::domain::Email;
 use crate::domain::UserAccountId;
 use async_trait::async_trait;
-use cqrs_runtime::outbox::{TaskDelivery, TaskFormatError, TaskHandler, TaskHandlerError, TypedTaskHandler, typed_task_handler};
+use cqrs_runtime::task::{
+    data::{attempt::TaskAttempt, format::TaskFormatError},
+    handling::{
+        adapter::TaskAdapter,
+        handler::{TaskHandler, TaskHandlerError},
+        json_adapter::task_adapter,
+    },
+};
 pub mod v1;
 use v1::SendVerificationCodeTaskV1;
 
@@ -27,13 +34,13 @@ impl From<SendVerificationCodeTaskV1> for VerificationCodeDelivery {
 /// ID, attempt and metadata are available throughout the async invocation.
 #[async_trait]
 pub trait VerificationCodeSender: Send {
-    async fn send(&mut self, message: VerificationCodeDelivery, delivery: &TaskDelivery) -> Result<(), TaskHandlerError>;
+    async fn send(&mut self, message: VerificationCodeDelivery, delivery: &TaskAttempt) -> Result<(), TaskHandlerError>;
 }
 
-pub fn send_verification_code_task_handler(
+pub fn send_verification_code_task_adapter(
     sender: Box<dyn VerificationCodeSender>,
-) -> Result<Box<dyn TaskHandler>, TaskFormatError> {
-    typed_task_handler::<SendVerificationCodeTaskV1, _>(SendVerificationCodeTaskHandler { sender })
+) -> Result<Box<dyn TaskAdapter>, TaskFormatError> {
+    task_adapter::<SendVerificationCodeTaskV1, _>(SendVerificationCodeTaskHandler { sender })
 }
 
 struct SendVerificationCodeTaskHandler {
@@ -41,8 +48,8 @@ struct SendVerificationCodeTaskHandler {
 }
 
 #[async_trait]
-impl TypedTaskHandler<SendVerificationCodeTaskV1> for SendVerificationCodeTaskHandler {
-    async fn handle(&mut self, payload: SendVerificationCodeTaskV1, delivery: &TaskDelivery) -> Result<(), TaskHandlerError> {
+impl TaskHandler<SendVerificationCodeTaskV1> for SendVerificationCodeTaskHandler {
+    async fn handle(&mut self, payload: SendVerificationCodeTaskV1, delivery: &TaskAttempt) -> Result<(), TaskHandlerError> {
         if !(1_000_000..=9_999_999).contains(&payload.verification_code) {
             return Err(TaskHandlerError::Permanent {
                 reason: "invalid verification code".to_owned(),

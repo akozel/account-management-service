@@ -1,23 +1,23 @@
-use cqrs_runtime::outbox::TaskDelivery;
-use cqrs_runtime::worker::WorkerRegistryError;
+use cqrs_runtime::runtime::dispatcher_factory::WorkerSetupError;
+use cqrs_runtime::task::data::attempt::TaskAttempt;
 use std::sync::Mutex;
 
 use super::*;
 use cqrs_runtime::{
-    outbox::{OutboxTaskCoordinatorConfig, TaskHandlerRegistryError},
-    postgres::{PostgresOutboxQueueConfig, prepare_outbox_runtime},
-    worker::OutboxRuntimeConfig,
+    postgres::{task_queue::config::PostgresTaskQueueConfig, task_runtime_factory::prepare_task_runtime},
+    runtime::config::TaskRuntimeConfig,
+    task::{handling::dispatcher::TaskDispatcherError, queue::storage_config::TaskStorageConfig},
 };
 
 struct DummyHandler(Arc<Mutex<Vec<(Uuid, String)>>>);
 
 #[async_trait]
-impl TaskHandler for DummyHandler {
+impl TaskAdapter for DummyHandler {
     fn formats(&self) -> Vec<TaskFormat> {
         vec![format()]
     }
 
-    async fn handle(&mut self, delivery: &TaskDelivery) -> Result<(), TaskHandlerError> {
+    async fn invoke(&mut self, delivery: &TaskAttempt) -> Result<(), TaskHandlerError> {
         let payload =
             serde_json::from_value::<DummyTaskV1>(delivery.payload().clone()).map_err(|_| TaskHandlerError::Permanent {
                 reason: "invalid dummy task payload".to_owned(),
@@ -30,48 +30,48 @@ impl TaskHandler for DummyHandler {
 #[tokio::test]
 async fn two_live_workers_complete_every_supported_task_and_quarantine_bad_payloads() {
     let db = Database::new().await;
-    let first = NewOutboxTask::new(DummyTaskV1 { value: "first".into() }).unwrap();
-    let second = NewOutboxTask::new(DummyTaskV1 { value: "second".into() }).unwrap();
-    let bad = NewOutboxTask::from_payload(format(), json!({})).unwrap();
+    let first = NewTask::new(DummyTaskV1 { value: "first".into() }).unwrap();
+    let second = NewTask::new(DummyTaskV1 { value: "second".into() }).unwrap();
+    let bad = NewTask::from_payload(format(), json!({})).unwrap();
     enqueue(&db.pool, vec![first.clone(), second.clone(), bad.clone()]).await;
     let handled = Arc::new(Mutex::new(Vec::new()));
-    let factory: HandlerRegistryFactory = Arc::new({
+    let factory: TaskDispatcherFactory = Arc::new({
         let handled = handled.clone();
-        move || TaskHandlerRegistry::try_new(vec![Box::new(DummyHandler(handled.clone()))])
+        move || TaskDispatcher::try_new(vec![Box::new(DummyHandler(handled.clone()))])
     });
     let shutdown = CancellationToken::new();
     let stop = shutdown.clone();
-    let config = OutboxWorkerPoolConfig::new(
+    let config = TaskWorkerPoolConfig::new(
         2,
         2,
         Duration::from_millis(10),
-        OutboxWorkerPoolConfig::default().handler_timeout(),
-        OutboxWorkerPoolConfig::default().lease_duration(),
+        TaskWorkerPoolConfig::default().handler_timeout(),
+        TaskWorkerPoolConfig::default().lease_duration(),
     )
     .unwrap();
-    let config = OutboxRuntimeConfig::new(OutboxTaskCoordinatorConfig::default(), config).unwrap();
+    let config = TaskRuntimeConfig::new(TaskStorageConfig::default(), config).unwrap();
     // A startup failure must leave existing durable work unclaimed.
-    let failed = prepare_outbox_runtime(
+    let failed = prepare_task_runtime(
         db.pool.clone(),
-        Arc::new(|| Err(TaskHandlerRegistryError::Empty)),
-        PostgresOutboxQueueConfig::default(),
+        Arc::new(|| Err(TaskDispatcherError::Empty)),
+        PostgresTaskQueueConfig::default(),
         config.clone(),
     );
     assert!(matches!(
         failed,
-        Err(WorkerRegistryError::Build {
+        Err(WorkerSetupError::Build {
             worker_index: 0,
-            source: TaskHandlerRegistryError::Empty,
+            source: TaskDispatcherError::Empty,
         })
     ));
-    let left = prepare_outbox_runtime(
+    let left = prepare_task_runtime(
         db.pool.clone(),
         factory.clone(),
-        PostgresOutboxQueueConfig::default(),
+        PostgresTaskQueueConfig::default(),
         config.clone(),
     )
     .unwrap();
-    let right = prepare_outbox_runtime(db.pool.clone(), factory, PostgresOutboxQueueConfig::default(), config).unwrap();
+    let right = prepare_task_runtime(db.pool.clone(), factory, PostgresTaskQueueConfig::default(), config).unwrap();
     for task in [&first, &second, &bad] {
         assert_worker_state(&db.pool, task.id(), "pending", 0, None).await;
     }
@@ -111,12 +111,12 @@ async fn one_worker_pool_routes_two_registered_task_types() {
     struct AuditHandler(Arc<AtomicUsize>);
 
     #[async_trait]
-    impl TaskHandler for AuditHandler {
+    impl TaskAdapter for AuditHandler {
         fn formats(&self) -> Vec<TaskFormat> {
             vec![TaskFormat::new("audit", 1).unwrap()]
         }
 
-        async fn handle(&mut self, _: &TaskDelivery) -> Result<(), TaskHandlerError> {
+        async fn invoke(&mut self, _: &TaskAttempt) -> Result<(), TaskHandlerError> {
             self.0.fetch_add(1, Ordering::SeqCst);
             Ok(())
         }
@@ -124,17 +124,17 @@ async fn one_worker_pool_routes_two_registered_task_types() {
 
     let db = Database::new().await;
     let dummy = new_task();
-    let audit = NewOutboxTask::from_payload(TaskFormat::new("audit", 1).unwrap(), json!({"kind":"runtime"})).unwrap();
-    let unknown = NewOutboxTask::from_payload(TaskFormat::new("future", 1).unwrap(), json!({"value":"runtime"})).unwrap();
+    let audit = NewTask::from_payload(TaskFormat::new("audit", 1).unwrap(), json!({"kind":"runtime"})).unwrap();
+    let unknown = NewTask::from_payload(TaskFormat::new("future", 1).unwrap(), json!({"value":"runtime"})).unwrap();
     enqueue(&db.pool, vec![dummy.clone(), audit.clone(), unknown.clone()]).await;
 
     let handled = Arc::new(Mutex::new(Vec::new()));
     let audited = Arc::new(AtomicUsize::new(0));
-    let factory: HandlerRegistryFactory = Arc::new({
+    let factory: TaskDispatcherFactory = Arc::new({
         let handled = handled.clone();
         let audited = audited.clone();
         move || {
-            TaskHandlerRegistry::try_new(vec![
+            TaskDispatcher::try_new(vec![
                 Box::new(DummyHandler(handled.clone())),
                 Box::new(AuditHandler(audited.clone())),
             ])
@@ -142,18 +142,18 @@ async fn one_worker_pool_routes_two_registered_task_types() {
     });
     let shutdown = CancellationToken::new();
     let stop = shutdown.clone();
-    let prepared = prepare_outbox_runtime(
+    let prepared = prepare_task_runtime(
         db.pool.clone(),
         factory,
-        PostgresOutboxQueueConfig::default(),
-        OutboxRuntimeConfig::new(
-            OutboxTaskCoordinatorConfig::default(),
-            OutboxWorkerPoolConfig::new(
+        PostgresTaskQueueConfig::default(),
+        TaskRuntimeConfig::new(
+            TaskStorageConfig::default(),
+            TaskWorkerPoolConfig::new(
                 2,
                 2,
                 Duration::from_millis(10),
-                OutboxWorkerPoolConfig::default().handler_timeout(),
-                OutboxWorkerPoolConfig::default().lease_duration(),
+                TaskWorkerPoolConfig::default().handler_timeout(),
+                TaskWorkerPoolConfig::default().lease_duration(),
             )
             .unwrap(),
         )

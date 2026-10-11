@@ -2,7 +2,7 @@
 
 use std::{fmt, future::Future, io, path::PathBuf};
 
-use cqrs_runtime::{host::HostError, logging::LoggingInitError, worker::WorkerRegistryError};
+use cqrs_runtime::{host::error::HostError, logging::LoggingInitError, runtime::dispatcher_factory::WorkerSetupError};
 use sqlx::PgPool;
 use thiserror::Error;
 
@@ -18,8 +18,8 @@ pub(crate) enum ServiceError {
     Logging(#[from] LoggingInitError),
     #[error("unable to connect to PostgreSQL")]
     Database(#[from] sqlx::Error),
-    #[error("unable to prepare outbox workers")]
-    OutboxPreparation(#[from] WorkerRegistryError),
+    #[error("unable to prepare task runtime")]
+    TaskPreparation(#[from] WorkerSetupError),
     #[error("unable to bind HTTP listener")]
     Bind(#[from] io::Error),
     #[error("{0}")]
@@ -46,7 +46,7 @@ impl ServiceError {
             Self::Configuration(_) => "configuration",
             Self::Logging(_) => "logging",
             Self::Database(_) => "database",
-            Self::OutboxPreparation(_) => "outbox_preparation",
+            Self::TaskPreparation(_) => "task_preparation",
             Self::Bind(_) => "http_bind",
             Self::Host(_) => "host",
         }
@@ -84,16 +84,16 @@ pub(crate) async fn with_pool_cleanup(
 #[cfg(test)]
 mod tests {
     use super::*;
-    use cqrs_runtime::{outbox::TaskHandlerRegistryError, worker::OutboxWorkerPoolError};
+    use cqrs_runtime::{runtime::supervisor::TaskRuntimeError, task::handling::dispatcher::TaskDispatcherError};
     use std::{
         error::Error,
         sync::{Arc, Mutex},
     };
 
     fn preparation_error() -> ServiceError {
-        WorkerRegistryError::Build {
+        WorkerSetupError::Build {
             worker_index: 0,
-            source: TaskHandlerRegistryError::Empty,
+            source: TaskDispatcherError::Empty,
         }
         .into()
     }
@@ -177,11 +177,11 @@ mod tests {
                 ServiceError::Host(HostError::InboundStopped),
                 ServiceError::Host(HostError::Inbound(io::Error::other("private_inbound_source"))),
                 ServiceError::Host(HostError::ShutdownSignal(io::Error::other("private_signal_source"))),
-                ServiceError::Host(HostError::OutboxSupervisor(OutboxWorkerPoolError::Registry(
-                    WorkerRegistryError::Build {
+                ServiceError::Host(HostError::TaskRuntime(TaskRuntimeError::WorkerSetup(
+                    WorkerSetupError::Build {
                         worker_index: 2,
-                        source: TaskHandlerRegistryError::DuplicateFormat(
-                            cqrs_runtime::outbox::TaskFormat::new("private_format\nmail@example.com", 1).unwrap(),
+                        source: TaskDispatcherError::DuplicateFormat(
+                            cqrs_runtime::task::data::format::TaskFormat::new("private_format\nmail@example.com", 1).unwrap(),
                         ),
                     },
                 ))),
@@ -192,7 +192,7 @@ mod tests {
             }
         });
         let log = String::from_utf8(writer.0.lock().unwrap().clone()).unwrap();
-        for stage in ["database", "http_bind", "outbox_preparation", "dotenv", "configuration"] {
+        for stage in ["database", "http_bind", "task_preparation", "dotenv", "configuration"] {
             assert!(log.contains(stage));
         }
         assert!(log.contains("service stopped with an error"));

@@ -8,7 +8,9 @@ use cqrs_es::{
     AggregateError, CqrsFramework, EventEnvelope, EventStore,
     persist::{EventStoreAggregateContext, PersistedEventRepository, PersistedEventStore},
 };
-use cqrs_runtime::postgres::{EVENT_STORE_SCHEMA, PostgresEventRepositoryWithOutbox, TRANSACTIONAL_OUTBOX_SCHEMA};
+use cqrs_runtime::postgres::{
+    EVENT_STORE_SCHEMA, TRANSACTIONAL_OUTBOX_SCHEMA, event_repository_with_outbox::repository::PostgresEventRepositoryWithOutbox,
+};
 use sqlx::{PgPool, postgres::PgPoolOptions};
 use testcontainers::{
     ContainerAsync, GenericImage, ImageExt,

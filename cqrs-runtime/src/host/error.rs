@@ -1,8 +1,8 @@
 #[cfg(test)]
-use crate::worker::WorkerRegistryError;
+use crate::runtime::dispatcher_factory::WorkerSetupError;
 use std::{fmt, io};
 
-use crate::worker::OutboxWorkerPoolError;
+use crate::runtime::supervisor::TaskRuntimeError;
 use thiserror::Error;
 use tokio::task::JoinError;
 use tracing::error;
@@ -16,12 +16,12 @@ pub enum HostError {
     Inbound(#[source] io::Error),
     #[error("inbound adapter terminated before shutdown")]
     InboundStopped,
-    #[error("outbox supervisor task failed")]
-    OutboxSupervisorTask(#[source] JoinError),
-    #[error("outbox supervisor failed")]
-    OutboxSupervisor(#[source] OutboxWorkerPoolError),
-    #[error("outbox supervisor terminated before shutdown")]
-    OutboxSupervisorStopped,
+    #[error("tasks supervisor task failed")]
+    TaskRuntimeJoin(#[source] JoinError),
+    #[error("tasks supervisor failed")]
+    TaskRuntime(#[source] TaskRuntimeError),
+    #[error("tasks supervisor terminated before shutdown")]
+    TaskRuntimeStopped,
 }
 
 // Debug is also used by Rust's Result termination report. Never format a
@@ -31,14 +31,14 @@ impl fmt::Debug for HostError {
         match self {
             Self::ShutdownSignal(error) => f.debug_struct("ShutdownSignal").field("kind", &error.kind()).finish(),
             Self::Inbound(error) => f.debug_struct("Inbound").field("kind", &error.kind()).finish(),
-            Self::OutboxSupervisor(error) => f.debug_tuple("OutboxSupervisor").field(error).finish(),
-            Self::OutboxSupervisorTask(error) => f
-                .debug_struct("OutboxSupervisorTask")
+            Self::TaskRuntime(error) => f.debug_tuple("TaskRuntime").field(error).finish(),
+            Self::TaskRuntimeJoin(error) => f
+                .debug_struct("TaskRuntimeJoin")
                 .field("task_id", &error.id())
                 .field("panicked", &error.is_panic())
                 .field("cancelled", &error.is_cancelled())
                 .finish(),
-            Self::InboundStopped | Self::OutboxSupervisorStopped => fmt::Display::fmt(self, f),
+            Self::InboundStopped | Self::TaskRuntimeStopped => fmt::Display::fmt(self, f),
         }
     }
 }
@@ -47,7 +47,7 @@ impl HostError {
     /// Log the failure without formatting a supervisor task's panic payload.
     pub fn log(&self, message: &'static str) {
         match self {
-            Self::OutboxSupervisorTask(source) => error!(
+            Self::TaskRuntimeJoin(source) => error!(
                 error = %self, task_id = %source.id(), panicked = source.is_panic(),
                 cancelled = source.is_cancelled(), "{message}"
             ),
@@ -62,18 +62,42 @@ mod tests {
     use std::sync::Arc;
 
     #[tokio::test]
+    async fn secondary_task_panics_and_cancellations_log_only_safe_join_context() {
+        let panic = tokio::spawn(async {
+            panic!("private_join_payload");
+        })
+        .await
+        .unwrap_err();
+        let cancelled = tokio::spawn(std::future::pending::<()>());
+        cancelled.abort();
+        let cancelled = cancelled.await.unwrap_err();
+        let ids = [panic.id().to_string(), cancelled.id().to_string()];
+        let (_, log) = crate::diagnostics::test_support::capture(async {
+            for source in [panic, cancelled] {
+                HostError::TaskRuntimeJoin(source).log("additional failure during host shutdown");
+            }
+        })
+        .await;
+        assert_eq!(log.matches("additional failure during host shutdown").count(), 2);
+        for id in ids {
+            assert!(log.contains(&id));
+        }
+        assert!(log.contains("panicked=true cancelled=false"));
+        assert!(log.contains("panicked=false cancelled=true"));
+        assert!(!log.contains("private_join_payload"));
+    }
+
+    #[tokio::test]
     async fn io_and_registry_diagnostics_preserve_sources_without_rendering_private_text() {
-        use crate::outbox::{TaskFormat, TaskHandlerRegistryError};
+        use crate::task::{data::format::TaskFormat, handling::dispatcher::TaskDispatcherError};
 
         let (_, log) = crate::diagnostics::test_support::capture(async {
             for error in [
                 HostError::Inbound(io::Error::new(io::ErrorKind::PermissionDenied, "private_io_source")),
                 HostError::ShutdownSignal(io::Error::other("private_signal_source")),
-                HostError::OutboxSupervisor(OutboxWorkerPoolError::Registry(WorkerRegistryError::Build {
+                HostError::TaskRuntime(TaskRuntimeError::WorkerSetup(WorkerSetupError::Build {
                     worker_index: 3,
-                    source: TaskHandlerRegistryError::DuplicateFormat(
-                        TaskFormat::new("private_format\nmail@example.com", 2).unwrap(),
-                    ),
+                    source: TaskDispatcherError::DuplicateFormat(TaskFormat::new("private_format\nmail@example.com", 2).unwrap()),
                 })),
             ] {
                 assert!(std::error::Error::source(&error).is_some());
@@ -122,7 +146,7 @@ mod tests {
         .await
         .unwrap_err();
         let task_id = panic.id().to_string();
-        let error = HostError::OutboxSupervisorTask(panic);
+        let error = HostError::TaskRuntimeJoin(panic);
         tracing::subscriber::with_default(subscriber, || error.log("service stopped with an error"));
         let log = String::from_utf8(writer.0.lock().unwrap().clone()).unwrap();
         assert!(log.contains(&task_id));
@@ -135,7 +159,7 @@ mod tests {
         assert!(std::error::Error::source(&error).is_some());
         let task = tokio::spawn(std::future::pending::<()>());
         task.abort();
-        let error = HostError::OutboxSupervisorTask(task.await.unwrap_err());
+        let error = HostError::TaskRuntimeJoin(task.await.unwrap_err());
         assert!(format!("{error:?}").contains("cancelled: true"));
     }
 }

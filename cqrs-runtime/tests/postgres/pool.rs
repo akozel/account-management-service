@@ -1,5 +1,5 @@
 use super::*;
-use cqrs_runtime::postgres::connect_pool;
+use cqrs_runtime::postgres::pool::connect_pool;
 
 #[tokio::test]
 async fn connection_helper_preserves_ten_connection_limit_and_returns_authentication_error() {

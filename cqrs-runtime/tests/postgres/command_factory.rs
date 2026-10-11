@@ -1,8 +1,8 @@
 use super::*;
 use cqrs_es::{EventStore, persist::PersistedEventStore};
 use cqrs_runtime::{
-    command::{AggregateConflictRetryPolicy, CommandGatewayError},
-    postgres::{PostgresCommandConfig, command_executor},
+    command::{CommandGatewayError, retry::AggregateConflictRetryPolicy},
+    postgres::command_factory::{PostgresCommandConfig, command_executor},
 };
 use thiserror::Error;
 
@@ -70,6 +70,61 @@ fn record(value: &str, expected_count: usize) -> Command {
         value: value.to_owned(),
         expected_count,
     }
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_conflicting_command_reloads_the_winner_before_deciding_and_publishes_no_losing_tasks() {
+    let db = Database::new().await;
+    let executor = command_executor::<CommandAggregate>(db.pool.clone(), config(1));
+    let mut gate = db.pool.begin().await.unwrap();
+    sqlx::query("LOCK TABLE events IN SHARE MODE")
+        .execute(&mut *gate)
+        .await
+        .unwrap();
+    let mut calls = tokio::task::JoinSet::new();
+    let mut tasks = Vec::new();
+    for value in ["left", "right"] {
+        let executor = executor.clone();
+        let task = NewTask::new(DummyTaskV1 { value: value.into() }).unwrap();
+        tasks.push((value, task.clone()));
+        calls.spawn(async move { (value, executor.execute("contended", record(value, 0), vec![task]).await) });
+    }
+    wait_for_blocked_queries(&db.pool, "written_events", 2).await;
+    gate.commit().await.unwrap();
+    let mut winner = None;
+    let mut rejected = 0;
+    while let Some(result) = calls.join_next().await {
+        let (value, result) = result.unwrap();
+        match result {
+            Ok(()) => assert!(winner.replace(value).is_none()),
+            Err(CommandGatewayError::Domain(Rejected)) => rejected += 1,
+            other => panic!("unexpected command result: {other:?}"),
+        }
+    }
+    assert_eq!(rejected, 1, "the retry must decide against the committed aggregate state");
+    let winner = winner.unwrap();
+    let repository = PostgresEventRepositoryWithOutbox::new(db.pool.clone());
+    let events = repository.get_events::<CommandAggregate>("contended").await.unwrap();
+    assert_eq!(events.len(), 1);
+    assert_eq!(events[0].payload, json!({"Recorded": {"values": [winner]}}));
+    let snapshot = repository
+        .get_snapshot::<CommandAggregate>("contended")
+        .await
+        .unwrap()
+        .unwrap();
+    assert_eq!(snapshot.current_sequence, 1);
+    assert_eq!(snapshot.aggregate, json!({"values": [winner]}));
+    let published: Vec<Uuid> = sqlx::query_scalar("SELECT id FROM transactional_outbox")
+        .fetch_all(&db.pool)
+        .await
+        .unwrap();
+    let (_, winning_task) = tasks.iter().find(|(value, _)| *value == winner).unwrap();
+    assert_eq!(published, vec![winning_task.id()]);
+    assert_eq!(
+        &row(&db.pool, winning_task.id()).await.get::<Value, _>("payload"),
+        winning_task.payload()
+    );
+    db.close().await;
 }
 
 #[tokio::test]
@@ -164,7 +219,7 @@ async fn shared_executor_isolates_parallel_command_task_lists() {
         let executor = executor.clone();
         commands.spawn(async move {
             let id = format!("parallel-{index}");
-            let task = NewOutboxTask::new(DummyTaskV1 { value: id.clone() }).unwrap();
+            let task = NewTask::new(DummyTaskV1 { value: id.clone() }).unwrap();
             executor.execute(&id, record(&id, 0), vec![task.clone()]).await.unwrap();
             (id, task)
         });
