@@ -1,18 +1,33 @@
-use std::collections::HashMap;
+use std::{collections::HashMap, fmt};
 
 use async_trait::async_trait;
 use thiserror::Error;
 
 use super::{TaskDelivery, TaskFormat, TaskHandler, TaskHandlerError};
 
-#[derive(Debug, Error, PartialEq, Eq)]
+#[derive(Error, PartialEq, Eq)]
 pub enum TaskHandlerRegistryError {
     #[error("handler registry must contain at least one handler")]
     Empty,
-    #[error("duplicate outbox task format: {0}")]
+    #[error("duplicate outbox task format: {} v{}", crate::diagnostics::safe_type(.0.task_type()), .0.task_version())]
     DuplicateFormat(TaskFormat),
-    #[error(transparent)]
+    /// A typed handler factory rejected its payload format before registration.
+    #[error("{0}")]
     InvalidFormat(#[from] super::TaskFormatError),
+}
+
+impl fmt::Debug for TaskHandlerRegistryError {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            Self::Empty => f.write_str("Empty"),
+            Self::DuplicateFormat(format) => f
+                .debug_struct("DuplicateFormat")
+                .field("task_type", &crate::diagnostics::safe_type(format.task_type()))
+                .field("task_version", &format.task_version())
+                .finish(),
+            Self::InvalidFormat(error) => f.debug_tuple("InvalidFormat").field(error).finish(),
+        }
+    }
 }
 
 /// Routes each persisted task format to exactly one handler within a worker.
@@ -48,20 +63,21 @@ impl TaskHandlerRegistry {
         })
     }
 
-    pub fn formats(&self) -> Vec<TaskFormat> {
-        self.formats.clone()
+    /// Borrow the supported formats in routing and polling order.
+    pub fn formats(&self) -> &[TaskFormat] {
+        &self.formats
     }
 }
 
 #[async_trait]
 impl TaskHandler for TaskHandlerRegistry {
     fn formats(&self) -> Vec<TaskFormat> {
-        self.formats()
+        self.formats().to_vec()
     }
 
-    async fn handle(&mut self, task: &TaskDelivery) -> Result<(), TaskHandlerError> {
-        match self.routes.get(task.format()) {
-            Some(index) => self.handlers[*index].handle(task).await,
+    async fn handle(&mut self, delivery: &TaskDelivery) -> Result<(), TaskHandlerError> {
+        match self.routes.get(delivery.format()) {
+            Some(index) => self.handlers[*index].handle(delivery).await,
             None => Err(TaskHandlerError::Permanent {
                 reason: "unsupported task format".to_owned(),
             }),
@@ -76,6 +92,27 @@ mod tests {
     use async_trait::async_trait;
     use std::sync::{Arc, Mutex};
 
+    #[test]
+    fn registry_error_formatting_sanitizes_names_without_changing_the_format() {
+        for (name, safe_name) in [
+            ("create_account", "create_account"),
+            ("private_format\nmail@example.com", "unknown"),
+        ] {
+            let format = TaskFormat::new(name, 2).unwrap();
+            let error = TaskHandlerRegistryError::DuplicateFormat(format.clone());
+            let rendered = format!("{error} {error:?}");
+            assert!(rendered.contains(safe_name));
+            assert!(rendered.contains('2'));
+            assert!(!rendered.contains("private_"));
+            assert!(!rendered.contains("mail@example.com"));
+            assert!(matches!(error, TaskHandlerRegistryError::DuplicateFormat(actual) if actual == format));
+        }
+        assert_eq!(format!("{:?}", TaskHandlerRegistryError::Empty), "Empty");
+        let invalid = TaskHandlerRegistryError::from(super::super::TaskFormatError::EmptyType);
+        assert!(format!("{invalid:?}").contains("EmptyType"));
+        assert!(std::error::Error::source(&invalid).is_some());
+    }
+
     struct RecordingHandler {
         formats: Vec<TaskFormat>,
         calls: Arc<Mutex<Vec<String>>>,
@@ -85,8 +122,8 @@ mod tests {
         fn formats(&self) -> Vec<TaskFormat> {
             self.formats.clone()
         }
-        async fn handle(&mut self, task: &TaskDelivery) -> Result<(), TaskHandlerError> {
-            self.calls.lock().unwrap().push(task.format().task_type().into());
+        async fn handle(&mut self, delivery: &TaskDelivery) -> Result<(), TaskHandlerError> {
+            self.calls.lock().unwrap().push(delivery.format().task_type().into());
             Ok(())
         }
     }

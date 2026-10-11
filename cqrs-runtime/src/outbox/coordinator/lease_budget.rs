@@ -1,4 +1,4 @@
-use crate::outbox::{LEASE_SAFETY_MARGIN, QueueRequestError};
+use crate::outbox::{LEASE_SAFETY_MARGIN, OutboxError};
 use std::time::Duration;
 use tokio::time::Instant;
 
@@ -18,13 +18,13 @@ pub(super) fn execution_plan(
     lease_deadline: Instant,
     handler_timeout: Duration,
     storage_timeout: Duration,
-) -> Result<ExecutionPlan, QueueRequestError> {
+) -> Result<ExecutionPlan, OutboxError> {
     if handler_timeout.is_zero() {
-        return Err(QueueRequestError::InvalidExecutionBudget);
+        return Err(OutboxError::InvalidExecutionBudget);
     }
     let required = handler_timeout
         .checked_add(storage_timeout)
-        .ok_or(QueueRequestError::InvalidExecutionBudget)?;
+        .ok_or(OutboxError::InvalidExecutionBudget)?;
     let Some(settlement_deadline) = lease_deadline.checked_sub(LEASE_SAFETY_MARGIN) else {
         return Ok(ExecutionPlan::RecoverOnly);
     };
@@ -34,9 +34,7 @@ pub(super) fn execution_plan(
     if settlement_deadline.duration_since(now) < required {
         return Ok(ExecutionPlan::RetryOnly { settlement_deadline });
     }
-    let handler_deadline = now
-        .checked_add(handler_timeout)
-        .ok_or(QueueRequestError::InvalidExecutionBudget)?;
+    let handler_deadline = now.checked_add(handler_timeout).ok_or(OutboxError::InvalidExecutionBudget)?;
     Ok(ExecutionPlan::Run {
         handler_deadline,
         settlement_deadline,
@@ -69,11 +67,11 @@ mod tests {
         assert_eq!(execution_plan(now, now, handler, storage), Ok(ExecutionPlan::RecoverOnly));
         assert_eq!(
             execution_plan(now, deadline, Duration::MAX, storage),
-            Err(QueueRequestError::InvalidExecutionBudget)
+            Err(OutboxError::InvalidExecutionBudget)
         );
         assert_eq!(
             execution_plan(now, deadline, Duration::ZERO, storage),
-            Err(QueueRequestError::InvalidExecutionBudget)
+            Err(OutboxError::InvalidExecutionBudget)
         );
     }
 }

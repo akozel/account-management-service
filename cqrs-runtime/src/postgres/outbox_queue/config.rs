@@ -1,5 +1,6 @@
 use std::time::Duration;
 use thiserror::Error;
+const DEFAULT_STATEMENT_TIMEOUT_MS: u64 = 4_000;
 /// Transaction-local PostgreSQL statement cap, not an end-to-end I/O budget.
 #[derive(Clone, Debug)]
 pub struct PostgresOutboxQueueConfig {
@@ -14,16 +15,15 @@ pub enum PostgresOutboxQueueConfigError {
 }
 impl Default for PostgresOutboxQueueConfig {
     fn default() -> Self {
-        Self {
-            statement_timeout: Duration::from_secs(4),
-        }
+        Self::new(Duration::from_millis(DEFAULT_STATEMENT_TIMEOUT_MS)).expect("valid default statement timeout")
     }
 }
 impl PostgresOutboxQueueConfig {
     pub fn new(statement_timeout: Duration) -> Result<Self, PostgresOutboxQueueConfigError> {
-        let config = Self { statement_timeout };
-        config.validate()?;
-        Ok(config)
+        if statement_timeout.as_millis() == 0 || statement_timeout.as_millis() > i32::MAX as u128 {
+            return Err(PostgresOutboxQueueConfigError::InvalidStatementTimeout);
+        }
+        Ok(Self { statement_timeout })
     }
     pub fn statement_timeout(&self) -> Duration {
         self.statement_timeout
@@ -32,15 +32,12 @@ impl PostgresOutboxQueueConfig {
         Self::from_lookup(|name| std::env::var(name).ok())
     }
     pub fn from_lookup(mut lookup: impl FnMut(&str) -> Option<String>) -> Result<Self, PostgresOutboxQueueConfigError> {
-        let millis = crate::env::read_u64(&mut lookup, "OUTBOX_POSTGRES_STATEMENT_TIMEOUT_MS", 4_000)
-            .map_err(|_| PostgresOutboxQueueConfigError::InvalidEnvironmentValue)?;
+        let millis = crate::env::read_u64(
+            &mut lookup,
+            "OUTBOX_POSTGRES_STATEMENT_TIMEOUT_MS",
+            DEFAULT_STATEMENT_TIMEOUT_MS,
+        )
+        .map_err(|_| PostgresOutboxQueueConfigError::InvalidEnvironmentValue)?;
         Self::new(Duration::from_millis(millis))
-    }
-    pub fn validate(&self) -> Result<(), PostgresOutboxQueueConfigError> {
-        if self.statement_timeout.as_millis() == 0 || self.statement_timeout.as_millis() > i32::MAX as u128 {
-            Err(PostgresOutboxQueueConfigError::InvalidStatementTimeout)
-        } else {
-            Ok(())
-        }
     }
 }

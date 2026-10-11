@@ -1,66 +1,52 @@
 use super::{
-    HandlerRegistryFactory, OutboxRuntimeConfig, OutboxWorkerPoolConfig, WorkerPoolError,
-    supervisor::{checked_handler, run_prepared},
+    HandlerRegistryFactory, OutboxRuntimeConfig, OutboxWorkerPoolConfig, OutboxWorkerPoolError, WorkerRegistryError,
+    supervisor::{build_checked_registry, run_prepared},
 };
-use crate::outbox::{
-    OutboxQueue, OutboxTaskCoordinator, OutboxTaskCoordinatorConfigError, TaskHandlerRegistry,
-    outbox_task_coordinator_with_config,
-};
+use crate::outbox::{OutboxQueue, OutboxTaskCoordinator, TaskHandlerRegistry, outbox_task_coordinator_with_config};
 use std::sync::Arc;
-use thiserror::Error;
 use tokio_util::sync::CancellationToken;
-
-/// Preparation failures occur before background tasks or storage work start.
-#[derive(Debug, Error, PartialEq, Eq)]
-pub enum OutboxPreparationError {
-    #[error("{0}")]
-    CoordinatorConfiguration(#[from] OutboxTaskCoordinatorConfigError),
-    #[error("{0}")]
-    Worker(#[from] WorkerPoolError),
-}
 
 /// Owns exactly C checked startup registries and their restart factory.
 /// Preparation neither starts tasks nor owns a cancellation token. The run
 /// future binds a token; its DropGuard starts at first poll.
-/// Dropping this object simply releases its handlers. It cannot be cloned.
-pub struct PreparedOutboxWorker {
+/// Dropping this object simply releases its registries. It cannot be cloned.
+pub struct PreparedOutboxRuntime {
     coordinator: Arc<dyn OutboxTaskCoordinator>,
     factory: HandlerRegistryFactory,
     config: OutboxWorkerPoolConfig,
-    handlers: Vec<TaskHandlerRegistry>,
+    registries: Vec<TaskHandlerRegistry>,
 }
 
-impl PreparedOutboxWorker {
-    /// Consume the prepared handlers without rebuilding startup registries.
+impl PreparedOutboxRuntime {
+    /// Consume the prepared registries without rebuilding startup registries.
     /// At first poll a DropGuard owns cancellation; a pre-cancelled token skips
     /// spawn/claims/recovery. Active work retains the existing H+S drain contract.
-    pub async fn run(self, shutdown: CancellationToken) -> Result<(), WorkerPoolError> {
-        run_prepared(self.coordinator, self.factory, self.config, self.handlers, shutdown).await
+    pub async fn run(self, shutdown: CancellationToken) -> Result<(), OutboxWorkerPoolError> {
+        run_prepared(self.coordinator, self.factory, self.config, self.registries, shutdown).await
     }
 }
 
 /// Assemble all startup registries and the coordinator synchronously, before
 /// opening inbound listeners. Does not perform storage I/O or spawn Tokio tasks.
-/// Factories must return promptly and only construct handlers, not begin effects.
+/// Factories must return promptly and only construct registries, not begin effects.
 /// The first registry supplies ordered formats and becomes worker zero's registry.
 pub fn prepare(
     queue: Arc<dyn OutboxQueue>,
     factory: HandlerRegistryFactory,
     config: OutboxRuntimeConfig,
-) -> Result<PreparedOutboxWorker, OutboxPreparationError> {
-    let first = factory().map_err(|source| WorkerPoolError::RegistryBuild { worker_index: 0, source })?;
-    let formats = first.formats();
-    let coordinator = outbox_task_coordinator_with_config(queue, formats.clone(), config.coordinator().clone())?;
-    let mut handlers = Vec::with_capacity(config.worker().concurrency());
-    handlers.push(first);
-    for index in 1..config.worker().concurrency() {
-        handlers.push(checked_handler(&factory, &formats, index)?);
-    }
-    Ok(PreparedOutboxWorker {
+) -> Result<PreparedOutboxRuntime, WorkerRegistryError> {
+    let (coordinator_config, worker_config) = config.into_parts();
+    let first = factory().map_err(|source| WorkerRegistryError::Build { worker_index: 0, source })?;
+    let formats = first.formats().to_vec();
+    let registries = std::iter::once(Ok(first))
+        .chain((1..worker_config.concurrency()).map(|index| build_checked_registry(&factory, &formats, index)))
+        .collect::<Result<Vec<_>, _>>()?;
+    let coordinator = outbox_task_coordinator_with_config(queue, formats, coordinator_config);
+    Ok(PreparedOutboxRuntime {
         coordinator,
         factory,
-        config: config.worker().clone(),
-        handlers,
+        config: worker_config,
+        registries,
     })
 }
 
@@ -162,11 +148,8 @@ mod tests {
                 }
             });
             let error = prepare(queue.clone(), factory, config(3)).err().unwrap();
-            assert_eq!(
-                error,
-                OutboxPreparationError::Worker(WorkerPoolError::HandlerFormatsMismatch { worker_index: 1 })
-            );
-            assert!(std::error::Error::source(&error).is_some());
+            assert_eq!(error, WorkerRegistryError::FormatsMismatch { worker_index: 1 });
+            assert!(std::error::Error::source(&error).is_none());
             assert_eq!(built.load(Ordering::SeqCst), 2);
             assert_eq!(dropped.load(Ordering::SeqCst), 2);
             assert_no_storage(&queue);
@@ -205,10 +188,10 @@ mod tests {
             let error = prepare(queue.clone(), factory, config(4)).err().unwrap();
             assert_eq!(
                 error,
-                OutboxPreparationError::Worker(WorkerPoolError::RegistryBuild {
+                WorkerRegistryError::Build {
                     worker_index: fail_at,
                     source
-                })
+                }
             );
             assert_eq!(built.load(Ordering::SeqCst), fail_at + 1);
             assert_eq!(dropped.load(Ordering::SeqCst), dropped_count);

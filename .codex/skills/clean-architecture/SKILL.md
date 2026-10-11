@@ -386,7 +386,7 @@ outbox drain and no host timeout for inbound/pool closure; force/watchdog policy
 remains [known issue #10](../../../doc/known_issues/http_shutdown.md).
 Recovery batches are capped at min(C, 32). `main` loads checked
 `OutboxRuntimeConfig` before DB connection, builds the business handler factory,
-and calls `postgres::prepare_outbox_worker` before binding HTTP. Queue/coordinator
+and calls `postgres::prepare_outbox_runtime` before binding HTTP. Queue/coordinator
 assembly and combined budget validation belong to runtime, with PostgreSQL statement
 cap kept separate. The helper is gated on both postgres and worker; neither feature
 implicitly enables the other. Configuration parsing/validation remains covered.
@@ -414,13 +414,33 @@ monotonic claim deadlines belong to the runtime/queue adapter. Business handlers
 `ClaimedTask` and `ClaimLease` remain platform context. Configuration parsing/validation
 stays in `cqrs-runtime`; `main` loads the combined config before DB connection.
 Preparation builds/validates all registries before opening listeners, without
-storage operations or background tasks. `PreparedOutboxWorker` owns the same
+storage operations or background tasks. `PreparedOutboxRuntime` owns the same
 registries that workers receive and is consumed by run, without startup rebuild.
 Preparation owns no CancellationToken; Drop releases handlers. A polled run owns
 DropGuard, skips spawn/storage on pre-cancelled token, and retains restart/drain
 semantics. Low-level `worker::run` remains available for custom coordinators and
 shares the same engine, including actual-budget validation and startup cancellation. Update the runtime guide and API rustdoc
 together when changing this lasting contract.
+
+Checked coordinator and PostgreSQL queue configs validate local values only in
+their constructors; assembling adapters from them is infallible. Combined runtime
+config owns cross-budget validation, while low-level worker::run retains its
+actual-coordinator check. Both preparation APIs return worker::WorkerRegistryError
+directly (Build with source/index, FormatsMismatch with index), without generic or
+PostgreSQL preparation wrappers. Run returns OutboxWorkerPoolError with
+Configuration/Registry variants. Preserve InvalidFormat conversion for typed
+handler factories. QueueRequestError covers queue parameters only; invalid queue
+data and invocation budgets are OutboxError::InvalidDelivery/InvalidExecutionBudget.
+
+Use registry/registries for handler registries, delivery for TaskDelivery, worker
+for permanent consumers and supervisor for pool lifecycle. PreparedOutboxRuntime
+owns the full pool assembly. TaskHandlerRegistry::formats borrows its stored slice; trait
+methods still return owned lists. Keep result-to-settlement and confirmed-status
+mapping pure; random backoff, clocks, logging and SQL remain in effectful code.
+Host I/O Debug/logging includes only ErrorKind, never arbitrary source text;
+registry error Display/Debug uses the shared safe_type function and preserves raw
+formats only as data. Defaults and env fallbacks share private unit-specific
+constants. Non-Unicode runtime env behavior is unchanged; binary validation rejects it.
 
 ## Presentation layout
 

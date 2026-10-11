@@ -54,11 +54,7 @@ struct TypedHandlerAdapter<P, H> {
 impl<P, H> TypedHandlerAdapter<P, H> {
     fn safe_format(&self) -> String {
         let task_type = self.format.task_type();
-        let safe_type = if task_type.chars().all(|c| c.is_ascii_alphanumeric() || c == '_') {
-            task_type
-        } else {
-            "unknown"
-        };
+        let safe_type = crate::diagnostics::safe_type(task_type);
         format!("{safe_type} v{}", self.format.task_version())
     }
 }

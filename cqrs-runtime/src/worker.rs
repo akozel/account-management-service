@@ -2,7 +2,7 @@
 //!
 //! Prefer [`prepare`] before opening inbound listeners: checked [`OutboxRuntimeConfig`]
 //! and all C registries are assembled without storage work or background tasks.
-//! [`PreparedOutboxWorker::run`] consumes those same handlers. The low-level [`run`]
+//! [`PreparedOutboxRuntime::run`] consumes those same handlers. The low-level [`run`]
 //! accepts custom coordinators and shares the execution engine.
 //!
 //! Workers execute eligible tasks concurrently without serializing source
@@ -28,11 +28,11 @@
 //! aborts owned workers; graceful drain requires cancellation followed by await.
 
 mod config;
+mod delivery_worker;
 mod preparation;
 mod runtime_config;
 mod supervisor;
-mod worker_task;
 pub use config::{OutboxWorkerPoolConfig, OutboxWorkerPoolConfigError};
-pub use preparation::{OutboxPreparationError, PreparedOutboxWorker, prepare};
+pub use preparation::{PreparedOutboxRuntime, prepare};
 pub use runtime_config::{OutboxRuntimeConfig, OutboxRuntimeConfigError};
-pub use supervisor::{HandlerRegistryFactory, WorkerPoolError, run};
+pub use supervisor::{HandlerRegistryFactory, OutboxWorkerPoolError, WorkerRegistryError, run};

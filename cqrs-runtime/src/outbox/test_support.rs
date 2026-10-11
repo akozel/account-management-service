@@ -95,7 +95,7 @@ impl OutboxQueue for Queue {
                 id: task.delivery().id(),
                 format: task.delivery().format().clone(),
                 attempt: task.delivery().attempt(),
-                cause: TaskFailureCause::HandlerPermanent,
+                cause: TaskFailureCause::PermanentRejection,
             }),
         };
         self.outcomes.lock().unwrap().push((task.delivery().id(), outcome));

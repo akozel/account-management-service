@@ -201,8 +201,8 @@ using Tokio and tokio-util 0.7:
 
 ```rust
 use cqrs_runtime::{
-    postgres::{PostgresOutboxQueueConfig, PostgresOutboxPreparationError, prepare_outbox_worker},
-    worker::{OutboxRuntimeConfig, HandlerRegistryFactory, PreparedOutboxWorker},
+    postgres::{PostgresOutboxQueueConfig, prepare_outbox_runtime},
+    worker::{OutboxRuntimeConfig, HandlerRegistryFactory, PreparedOutboxRuntime, WorkerRegistryError},
 };
 use sqlx::PgPool;
 
@@ -211,8 +211,8 @@ pub fn prepare_tasks(
     factory: HandlerRegistryFactory,
     queue_config: PostgresOutboxQueueConfig,
     runtime_config: OutboxRuntimeConfig,
-) -> Result<PreparedOutboxWorker, PostgresOutboxPreparationError> {
-    prepare_outbox_worker(pool, factory, queue_config, runtime_config)
+) -> Result<PreparedOutboxRuntime, WorkerRegistryError> {
+    prepare_outbox_runtime(pool, factory, queue_config, runtime_config)
 }
 
 ```
@@ -224,7 +224,7 @@ Pass a `child_token()` for an isolated pool. Dropping a token handle does not
 cancel it; a lifecycle owner can hold `shutdown.clone().drop_guard()`.
 
 Prepare before binding inbound listeners. `worker::prepare(queue, factory, config)`
-works with any queue; `postgres::prepare_outbox_worker` assembles the PostgreSQL
+works with any queue; `postgres::prepare_outbox_runtime` assembles the PostgreSQL
 adapter when both `postgres` and `worker` features are enabled. Neither function
 performs storage I/O or starts background tasks. Preparation calls the factory
 exactly C times, freezes ordered formats, and keeps the first registry for worker
@@ -236,16 +236,25 @@ setting, its units/default, and the full lease-budget formula.
 `OutboxRuntimeConfig` combines the existing coordinator and worker configs,
 checks the complete lease budget at construction/load time, and keeps PostgreSQL
 statement timeout separate. The service loads configs before connecting to the
-database. `PreparedOutboxWorker` is consumed by `run`; it rebuilds registries only
+database. `PreparedOutboxRuntime` is consumed by `run`; it rebuilds registries only
 on restart, preserving each worker's mutable state. Dropping the prepared object
 releases handlers without cancellation. A polled run owns a cancellation DropGuard;
 a pre-cancelled token starts no tasks or storage operations.
 
 Configuration errors (`OutboxRuntimeConfigError`), preparation errors
-(`OutboxPreparationError` / `PostgresOutboxPreparationError`) and runtime exits
-(`WorkerPoolError`) remain distinct. Low-level `worker::run` is retained for
+(`WorkerRegistryError`) and runtime exits
+(`OutboxWorkerPoolError`) remain distinct. Low-level `worker::run` is retained for
 custom coordinators; it uses the same supervisor engine and preserves cancelled
 startup and actual-coordinator budget validation.
+
+Configs validate local values at construction; `OutboxRuntimeConfig` validates
+their combined lease budget. Building a coordinator or PostgreSQL queue from
+checked configs is infallible. Both preparation APIs return `WorkerRegistryError`
+directly: `Build` retains its source and worker index, while `FormatsMismatch`
+identifies the worker with a different ordered format list.
+`OutboxWorkerPoolError::{Configuration, Registry}` covers low-level startup budget
+validation and startup/restart registry errors. Registry getters borrow their
+stored formats; handler and coordinator traits still return owned format lists.
 
 Generate local API documentation with:
 
@@ -258,12 +267,12 @@ cargo doc --all-features --no-deps
 Enable `features = ["host"]` and give the inbound adapter and outbox the same
 `CancellationToken`. The inbound future returns `io::Result<()>`; it may borrow
 local state and need not be `Send`. The outbox future returns
-`Result<(), worker::WorkerPoolError>` and must be `Send + 'static`, because host
+`Result<(), worker::OutboxWorkerPoolError>` and must be `Send + 'static`, because host
 spawns it. Signal futures can also borrow local state and need not be `Send`.
 
 ```rust,no_run
 use std::{future::Future, io};
-use cqrs_runtime::{host::{self, HostError}, worker::WorkerPoolError};
+use cqrs_runtime::{host::{self, HostError}, worker::OutboxWorkerPoolError};
 use tokio_util::sync::CancellationToken;
 
 async fn serve<Inbound, Outbox>(
@@ -271,13 +280,13 @@ async fn serve<Inbound, Outbox>(
 ) -> Result<(), HostError>
 where
     Inbound: Future<Output = io::Result<()>>,
-    Outbox: Future<Output = Result<(), WorkerPoolError>> + Send + 'static,
+    Outbox: Future<Output = Result<(), OutboxWorkerPoolError>> + Send + 'static,
 {
     host::run(inbound, outbox, shutdown, host::shutdown_signal()).await
 }
 ```
 
-For a prepared worker, pass `outbox.run(shutdown.clone())` directly to `host::run`.
+For a prepared runtime, pass `outbox.run(shutdown.clone())` directly to `host::run`.
 The host installs its cancellation DropGuard before spawning outbox on first
 poll; simply creating or dropping an unpolled host future starts nothing and
 leaves the token unchanged. `shutdown_signal` observes SIGINT/SIGTERM on Unix
@@ -347,8 +356,17 @@ completion, scheduled retry, failure, and lost ownership. `TaskFailureCause`
 provides fixed safe log reasons, independent of persisted handler error text.
 `LeaseRecoveryReport` derives its total from retries and confirmed failures.
 
+`OutboxError::InvalidRequest` only describes invalid queue request parameters.
+`InvalidDelivery` describes structurally invalid queue data or settlement results;
+`InvalidExecutionBudget` describes an invalid invocation budget. Storage timeout
+and exhausted lease budgets remain distinct and do not establish a failed commit.
+
+Host I/O diagnostics expose only the error kind, and registry error formatting
+sanitizes task type names. Original sources and duplicate formats remain available
+for programmatic inspection, without appearing as arbitrary text in host logs.
+
 `HandlerRegistryFactory` returns `Result<TaskHandlerRegistry, TaskHandlerRegistryError>`.
-`PreparedOutboxWorker::run` reports `WorkerPoolError` for runtime failures.
+`PreparedOutboxRuntime::run` reports `OutboxWorkerPoolError` for runtime failures.
 Low-level `worker::run` also reports configuration and registry errors on startup.
 Preparation reports typed errors before any workers start. It still supervises
 one mutable registry per permanent Tokio task and leaves interrupted work for recovery.

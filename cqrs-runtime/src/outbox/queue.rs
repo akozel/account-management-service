@@ -18,14 +18,14 @@ pub enum SettlementRequest {
 /// Fixed safe diagnostics, never a handler's arbitrary error text.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum TaskFailureCause {
-    HandlerPermanent,
+    PermanentRejection,
     AttemptLimitReached,
     LeaseExpired,
 }
 impl TaskFailureCause {
     pub fn as_str(self) -> &'static str {
         match self {
-            Self::HandlerPermanent => "permanent failure",
+            Self::PermanentRejection => "permanent failure",
             Self::AttemptLimitReached => "retry limit reached",
             Self::LeaseExpired => "worker lease expired",
         }

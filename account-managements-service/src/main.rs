@@ -25,7 +25,7 @@ use config::ServiceConfig;
 use cqrs_runtime::{
     host,
     outbox::TaskHandlerRegistry,
-    postgres::{PostgresCommandConfig, command_executor, connect_pool, prepare_outbox_worker},
+    postgres::{PostgresCommandConfig, command_executor, connect_pool, prepare_outbox_runtime},
     worker,
 };
 use startup::{ServiceError, load_dotenv, with_pool_cleanup};
@@ -59,7 +59,7 @@ async fn main() -> Result<(), ServiceError> {
                     record_account_created_task_handler(registration.clone())?,
                 ])
             });
-            let outbox = prepare_outbox_worker(
+            let outbox = prepare_outbox_runtime(
                 pool.clone(),
                 handler_factory,
                 config.postgres_queue().clone(),

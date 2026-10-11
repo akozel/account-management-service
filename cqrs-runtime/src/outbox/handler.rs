@@ -28,8 +28,8 @@ pub enum TaskHandlerError {
 /// Handler input has no platform ownership API:
 /// ```compile_fail
 /// use cqrs_runtime::outbox::TaskDelivery;
-/// fn inspect_lease(task: &TaskDelivery) {
-///     let _ = task.lease();
+/// fn inspect_lease(delivery: &TaskDelivery) {
+///     let _ = delivery.lease();
 /// }
 /// ```
 ///
@@ -48,5 +48,5 @@ pub trait TaskHandler: Send {
     fn formats(&self) -> Vec<TaskFormat>;
     /// Perform exactly one retryable target command or external effect.
     /// `Ok(())` requests completion; the coordinator separately settles ownership.
-    async fn handle(&mut self, task: &TaskDelivery) -> Result<(), TaskHandlerError>;
+    async fn handle(&mut self, delivery: &TaskDelivery) -> Result<(), TaskHandlerError>;
 }

@@ -7,15 +7,15 @@ pub enum QueueRequestError {
     InvalidLeaseDuration,
     #[error("retry delay is not representable")]
     InvalidRetryDelay,
-    #[error("execution budget must be positive and representable")]
-    InvalidExecutionBudget,
-    #[error("queue returned structurally invalid delivery data")]
-    InvalidDelivery,
 }
 #[derive(Clone, Debug, Error, PartialEq, Eq)]
 pub enum OutboxError {
     #[error(transparent)]
     InvalidRequest(#[from] QueueRequestError),
+    #[error("queue returned structurally invalid delivery data")]
+    InvalidDelivery,
+    #[error("execution budget must be positive and representable")]
+    InvalidExecutionBudget,
     #[error("outbox storage is unavailable")]
     Unavailable,
     #[error("outbox storage operation timed out; its result is unknown")]

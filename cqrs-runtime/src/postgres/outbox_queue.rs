@@ -9,7 +9,7 @@
 use std::time::Duration;
 
 use async_trait::async_trait;
-use sqlx::{PgPool, Postgres, Row, Transaction};
+use sqlx::{FromRow, PgPool, Postgres, Row, Transaction, postgres::PgRow};
 use tokio::time::Instant;
 
 use crate::outbox::{
@@ -26,18 +26,14 @@ mod config;
 pub use config::{PostgresOutboxQueueConfig, PostgresOutboxQueueConfigError};
 impl PostgresOutboxQueue {
     pub fn new(pool: PgPool) -> Self {
-        Self {
-            pool,
-            statement_timeout: PostgresOutboxQueueConfig::default().statement_timeout(),
-        }
+        Self::with_config(pool, PostgresOutboxQueueConfig::default())
     }
 
-    pub fn with_config(pool: PgPool, config: PostgresOutboxQueueConfig) -> Result<Self, PostgresOutboxQueueConfigError> {
-        config.validate()?;
-        Ok(Self {
+    pub fn with_config(pool: PgPool, config: PostgresOutboxQueueConfig) -> Self {
+        Self {
             pool,
             statement_timeout: config.statement_timeout(),
-        })
+        }
     }
 
     async fn begin_queue_transaction(&self, operation: &'static str) -> Result<Transaction<'_, Postgres>, OutboxError> {
@@ -63,6 +59,114 @@ fn milliseconds(duration: Duration, invalid: QueueRequestError) -> Result<f64, O
         .map_err(|_| OutboxError::from(invalid))
 }
 
+struct ClaimRow {
+    id: uuid::Uuid,
+    payload: serde_json::Value,
+    metadata: serde_json::Value,
+    attempts: i32,
+    lock_token: uuid::Uuid,
+}
+
+impl FromRow<'_, PgRow> for ClaimRow {
+    fn from_row(row: &PgRow) -> Result<Self, sqlx::Error> {
+        Ok(Self {
+            id: row.try_get("id")?,
+            payload: row.try_get("payload")?,
+            metadata: row.try_get("metadata")?,
+            attempts: row.try_get("attempts")?,
+            lock_token: row.try_get("lock_token")?,
+        })
+    }
+}
+
+impl ClaimRow {
+    fn into_claimed_task(self, format: &TaskFormat, lease_deadline: Instant) -> Result<ClaimedTask, OutboxError> {
+        let delivery = TaskDelivery::new(self.id, format.clone(), self.payload, self.metadata, self.attempts)
+            .map_err(|_| OutboxError::InvalidDelivery)?;
+        Ok(ClaimedTask::new(delivery, ClaimLease::new(self.lock_token, lease_deadline)))
+    }
+}
+
+struct RecoveryRow {
+    id: uuid::Uuid,
+    task_type: String,
+    task_version: i32,
+    attempts: i32,
+    max_attempts: i32,
+}
+
+impl FromRow<'_, PgRow> for RecoveryRow {
+    fn from_row(row: &PgRow) -> Result<Self, sqlx::Error> {
+        Ok(Self {
+            id: row.try_get("id")?,
+            task_type: row.try_get("task_type")?,
+            task_version: row.try_get("task_version")?,
+            attempts: row.try_get("attempts")?,
+            max_attempts: row.try_get("max_attempts")?,
+        })
+    }
+}
+
+impl RecoveryRow {
+    fn into_failure(self) -> Result<TaskFailure, OutboxError> {
+        Ok(TaskFailure {
+            id: self.id,
+            format: TaskFormat::new(self.task_type, self.task_version).map_err(|_| OutboxError::InvalidDelivery)?,
+            attempt: self.attempts,
+            cause: TaskFailureCause::LeaseExpired,
+        })
+    }
+}
+
+struct SettlementParameters {
+    status: &'static str,
+    delay: Duration,
+    last_error: Option<String>,
+    failure_cause: Option<TaskFailureCause>,
+}
+
+fn settlement_parameters(request: SettlementRequest) -> SettlementParameters {
+    match request {
+        SettlementRequest::Completed => SettlementParameters {
+            status: "completed",
+            delay: Duration::ZERO,
+            last_error: None,
+            failure_cause: None,
+        },
+        SettlementRequest::Retry { delay, reason } => SettlementParameters {
+            status: "pending",
+            delay,
+            last_error: Some(reason),
+            failure_cause: Some(TaskFailureCause::AttemptLimitReached),
+        },
+        SettlementRequest::Failed { reason } => SettlementParameters {
+            status: "failed",
+            delay: Duration::ZERO,
+            last_error: Some(reason),
+            failure_cause: Some(TaskFailureCause::PermanentRejection),
+        },
+    }
+}
+
+fn settlement_result(
+    delivery: &TaskDelivery,
+    status: Option<&str>,
+    failure_cause: Option<TaskFailureCause>,
+) -> Result<SettlementResult, OutboxError> {
+    match status {
+        None => Ok(SettlementResult::OwnershipLost),
+        Some("completed") => Ok(SettlementResult::Completed),
+        Some("pending") => Ok(SettlementResult::RetryScheduled),
+        Some("failed") => Ok(SettlementResult::Failed(TaskFailure {
+            id: delivery.id(),
+            format: delivery.format().clone(),
+            attempt: delivery.attempt(),
+            cause: failure_cause.ok_or(OutboxError::InvalidDelivery)?,
+        })),
+        _ => Err(OutboxError::InvalidDelivery),
+    }
+}
+
 #[async_trait]
 impl OutboxQueue for PostgresOutboxQueue {
     async fn claim(
@@ -82,7 +186,7 @@ impl OutboxQueue for PostgresOutboxQueue {
             .ok_or(QueueRequestError::InvalidLeaseDuration)?;
         let limit = i64::try_from(limit).map_err(|_| OutboxError::from(QueueRequestError::InvalidLimit))?;
         let mut tx = self.begin_queue_transaction("claim").await?;
-        let rows = sqlx::query(
+        let rows = sqlx::query_as::<_, ClaimRow>(
             r#"
             WITH ready AS (
                 SELECT id FROM transactional_outbox
@@ -108,23 +212,7 @@ impl OutboxQueue for PostgresOutboxQueue {
         .map_err(|error| storage_error(error, "claim"))?;
         let tasks = rows
             .into_iter()
-            .map(|row| {
-                let delivery = TaskDelivery::new(
-                    row.try_get("id").map_err(|error| storage_error(error, "claim"))?,
-                    format.clone(),
-                    row.try_get("payload").map_err(|error| storage_error(error, "claim"))?,
-                    row.try_get("metadata").map_err(|error| storage_error(error, "claim"))?,
-                    row.try_get("attempts").map_err(|error| storage_error(error, "claim"))?,
-                )
-                .map_err(|_| QueueRequestError::InvalidDelivery)?;
-                Ok(ClaimedTask::new(
-                    delivery,
-                    ClaimLease::new(
-                        row.try_get("lock_token").map_err(|error| storage_error(error, "claim"))?,
-                        lease_deadline,
-                    ),
-                ))
-            })
+            .map(|row| row.into_claimed_task(format, lease_deadline))
             .collect::<Result<Vec<_>, OutboxError>>()?;
         tx.commit().await.map_err(|error| storage_error(error, "claim"))?;
         Ok(tasks)
@@ -132,16 +220,7 @@ impl OutboxQueue for PostgresOutboxQueue {
 
     async fn settle(&self, task: &ClaimedTask, request: SettlementRequest) -> Result<SettlementResult, OutboxError> {
         let mut tx = self.begin_queue_transaction("settle").await?;
-        let failure_cause = match &request {
-            SettlementRequest::Completed => None,
-            SettlementRequest::Retry { .. } => Some(TaskFailureCause::AttemptLimitReached),
-            SettlementRequest::Failed { .. } => Some(TaskFailureCause::HandlerPermanent),
-        };
-        let (status, delay, error) = match request {
-            SettlementRequest::Completed => ("completed", Duration::ZERO, None),
-            SettlementRequest::Retry { delay, reason } => ("pending", delay, Some(reason)),
-            SettlementRequest::Failed { reason } => ("failed", Duration::ZERO, Some(reason)),
-        };
+        let parameters = settlement_parameters(request);
         let row = sqlx::query(r#"
             UPDATE transactional_outbox
             SET status = CASE WHEN $3 = 'pending' AND attempts >= max_attempts THEN 'failed' ELSE $3 END,
@@ -150,30 +229,20 @@ impl OutboxQueue for PostgresOutboxQueue {
                 last_error = $5, locked_by = NULL, lock_token = NULL, locked_until = NULL
             WHERE id = $1 AND lock_token = $2 AND status = 'processing' AND locked_until > clock_timestamp()
             RETURNING status
-        "#).bind(task.delivery().id()).bind(task.lease().lock_token()).bind(status).bind(milliseconds(delay, QueueRequestError::InvalidRetryDelay)?)
-            .bind(error.map(|e| e.chars().take(2048).collect::<String>()))
+        "#).bind(task.delivery().id()).bind(task.lease().lock_token()).bind(parameters.status).bind(milliseconds(parameters.delay, QueueRequestError::InvalidRetryDelay)?)
+            .bind(parameters.last_error.map(|reason| reason.chars().take(2048).collect::<String>()))
             .fetch_optional(&mut *tx).await.map_err(|error| storage_error(error, "settle"))?;
         tx.commit().await.map_err(|error| storage_error(error, "settle"))?;
-        let Some(row) = row else {
-            return Ok(SettlementResult::OwnershipLost);
-        };
-        let status: String = row.try_get("status").map_err(|error| storage_error(error, "settle"))?;
-        match status.as_str() {
-            "completed" => Ok(SettlementResult::Completed),
-            "pending" => Ok(SettlementResult::RetryScheduled),
-            "failed" => Ok(SettlementResult::Failed(TaskFailure {
-                id: task.delivery().id(),
-                format: task.delivery().format().clone(),
-                attempt: task.delivery().attempt(),
-                cause: failure_cause.ok_or(QueueRequestError::InvalidDelivery)?,
-            })),
-            _ => Err(QueueRequestError::InvalidDelivery.into()),
-        }
+        let status = row
+            .map(|row| row.try_get::<String, _>("status"))
+            .transpose()
+            .map_err(|error| storage_error(error, "settle"))?;
+        settlement_result(task.delivery(), status.as_deref(), parameters.failure_cause)
     }
 
     async fn recover_expired(&self, limit: usize) -> Result<LeaseRecoveryReport, OutboxError> {
         let mut tx = self.begin_queue_transaction("recover_expired").await?;
-        let rows = sqlx::query(
+        let rows = sqlx::query_as::<_, RecoveryRow>(
             r#"
             SELECT id, task_type, task_version, attempts, max_attempts FROM transactional_outbox
             WHERE status = 'processing' AND locked_until <= statement_timestamp()
@@ -185,14 +254,8 @@ impl OutboxQueue for PostgresOutboxQueue {
         .await
         .map_err(|error| storage_error(error, "recover_expired"))?;
         let mut failed = Vec::new();
-        for row in &rows {
-            let id: uuid::Uuid = row.try_get("id").map_err(|error| storage_error(error, "recover_expired"))?;
-            let attempt: i32 = row
-                .try_get("attempts")
-                .map_err(|error| storage_error(error, "recover_expired"))?;
-            let max_attempts: i32 = row
-                .try_get("max_attempts")
-                .map_err(|error| storage_error(error, "recover_expired"))?;
+        let processed_count = rows.len();
+        for row in rows {
             sqlx::query(
                 r#"
                 UPDATE transactional_outbox
@@ -203,37 +266,99 @@ impl OutboxQueue for PostgresOutboxQueue {
                 WHERE id = $1
             "#,
             )
-            .bind(id)
+            .bind(row.id)
             .bind(milliseconds(
-                redelivery_backoff(attempt),
+                redelivery_backoff(row.attempts),
                 QueueRequestError::InvalidRetryDelay,
             )?)
             .execute(&mut *tx)
             .await
             .map_err(|error| storage_error(error, "recover_expired"))?;
-            if attempt >= max_attempts {
-                failed.push(TaskFailure {
-                    id,
-                    format: TaskFormat::new(
-                        row.try_get::<String, _>("task_type")
-                            .map_err(|error| storage_error(error, "recover_expired"))?,
-                        row.try_get("task_version")
-                            .map_err(|error| storage_error(error, "recover_expired"))?,
-                    )
-                    .map_err(|_| QueueRequestError::InvalidDelivery)?,
-                    attempt,
-                    cause: TaskFailureCause::LeaseExpired,
-                });
+            if row.attempts >= row.max_attempts {
+                failed.push(row.into_failure()?);
             }
         }
         tx.commit().await.map_err(|error| storage_error(error, "recover_expired"))?;
-        Ok(LeaseRecoveryReport::new(rows.len() - failed.len(), failed))
+        Ok(LeaseRecoveryReport::new(processed_count - failed.len(), failed))
     }
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn claim_rows_validate_delivery_data_and_preserve_lease_context() {
+        use serde_json::json;
+        let id = uuid::Uuid::new_v4();
+        let lock_token = uuid::Uuid::new_v4();
+        let deadline = Instant::now();
+        let format = TaskFormat::new("test", 1).unwrap();
+        for (payload, metadata, attempts, valid) in [
+            (json!({"value": 1}), json!({}), 2, true),
+            (json!([]), json!({}), 2, false),
+            (json!({}), json!([]), 2, false),
+            (json!({}), json!({}), 0, false),
+        ] {
+            let row = ClaimRow {
+                id,
+                payload,
+                metadata,
+                attempts,
+                lock_token,
+            };
+            let result = row.into_claimed_task(&format, deadline);
+            if valid {
+                let claimed = result.unwrap();
+                assert_eq!(claimed.delivery().id(), id);
+                assert_eq!(claimed.delivery().attempt(), 2);
+                assert_eq!(claimed.delivery().payload(), &json!({"value": 1}));
+                assert_eq!(claimed.lease().deadline(), deadline);
+                assert_eq!(claimed.lease().lock_token(), lock_token);
+            } else {
+                assert!(matches!(result, Err(OutboxError::InvalidDelivery)));
+            }
+        }
+    }
+
+    #[test]
+    fn confirmed_settlement_rejects_unknown_status_and_missing_failure_cause() {
+        let task = crate::outbox::test_support::claimed();
+        for status in [Some("unexpected"), Some("failed")] {
+            assert_eq!(
+                settlement_result(task.delivery(), status, None),
+                Err(OutboxError::InvalidDelivery)
+            );
+        }
+        for request in [
+            SettlementRequest::Retry {
+                delay: Duration::ZERO,
+                reason: "retry".into(),
+            },
+            SettlementRequest::Failed {
+                reason: "permanent".into(),
+            },
+        ] {
+            let parameters = settlement_parameters(request);
+            let result = settlement_result(task.delivery(), Some("failed"), parameters.failure_cause).unwrap();
+            let failure = result.failure().unwrap();
+            assert_eq!(failure.id, task.delivery().id());
+            assert_eq!(failure.attempt, task.delivery().attempt());
+            assert_eq!(Some(failure.cause), parameters.failure_cause);
+        }
+    }
+
+    #[test]
+    fn invalid_recovery_format_is_an_invalid_delivery() {
+        let row = RecoveryRow {
+            id: uuid::Uuid::new_v4(),
+            task_type: "test".into(),
+            task_version: 0,
+            attempts: 1,
+            max_attempts: 1,
+        };
+        assert_eq!(row.into_failure(), Err(OutboxError::InvalidDelivery));
+    }
 
     #[tokio::test]
     async fn unavailable_queue_logs_operation_and_cause_before_erasing_source() {

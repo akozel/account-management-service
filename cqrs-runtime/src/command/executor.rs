@@ -49,22 +49,19 @@ where
             framework_ref.execute(aggregate_id, command.clone())
         })
         .await
-        .map_err(|error| {
-            match &error {
-                AggregateError::DatabaseConnectionError(source) => {
-                    crate::diagnostics::log_command_failure(A::TYPE, "connection", source.as_ref())
-                }
-                AggregateError::DeserializationError(source) => {
-                    crate::diagnostics::log_command_failure(A::TYPE, "deserialization", source.as_ref())
-                }
-                AggregateError::UnexpectedError(source) => {
-                    crate::diagnostics::log_command_failure(A::TYPE, "unexpected", source.as_ref())
-                }
-                AggregateError::UserError(_) | AggregateError::AggregateConflict => {}
-            }
-            map_aggregate_error(error)
-        })
+        .inspect_err(|error| log_aggregate_error(A::TYPE, error))
+        .map_err(map_aggregate_error)
     }
+}
+
+fn log_aggregate_error<D: Error>(aggregate_type: &str, error: &AggregateError<D>) {
+    let (category, source) = match error {
+        AggregateError::DatabaseConnectionError(source) => ("connection", source),
+        AggregateError::DeserializationError(source) => ("deserialization", source),
+        AggregateError::UnexpectedError(source) => ("unexpected", source),
+        AggregateError::UserError(_) | AggregateError::AggregateConflict => return,
+    };
+    crate::diagnostics::log_command_failure(aggregate_type, category, source.as_ref());
 }
 
 #[async_trait]

@@ -1,6 +1,8 @@
+#[cfg(test)]
+use crate::worker::WorkerRegistryError;
 use std::{fmt, io};
 
-use crate::worker::WorkerPoolError;
+use crate::worker::OutboxWorkerPoolError;
 use thiserror::Error;
 use tokio::task::JoinError;
 use tracing::error;
@@ -17,7 +19,7 @@ pub enum HostError {
     #[error("outbox supervisor task failed")]
     OutboxSupervisorTask(#[source] JoinError),
     #[error("outbox supervisor failed")]
-    OutboxSupervisor(#[source] WorkerPoolError),
+    OutboxSupervisor(#[source] OutboxWorkerPoolError),
     #[error("outbox supervisor terminated before shutdown")]
     OutboxSupervisorStopped,
 }
@@ -27,8 +29,8 @@ pub enum HostError {
 impl fmt::Debug for HostError {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         match self {
-            Self::ShutdownSignal(error) => f.debug_tuple("ShutdownSignal").field(error).finish(),
-            Self::Inbound(error) => f.debug_tuple("Inbound").field(error).finish(),
+            Self::ShutdownSignal(error) => f.debug_struct("ShutdownSignal").field("kind", &error.kind()).finish(),
+            Self::Inbound(error) => f.debug_struct("Inbound").field("kind", &error.kind()).finish(),
             Self::OutboxSupervisor(error) => f.debug_tuple("OutboxSupervisor").field(error).finish(),
             Self::OutboxSupervisorTask(error) => f
                 .debug_struct("OutboxSupervisorTask")
@@ -58,6 +60,33 @@ impl HostError {
 mod tests {
     use super::*;
     use std::sync::Arc;
+
+    #[tokio::test]
+    async fn io_and_registry_diagnostics_preserve_sources_without_rendering_private_text() {
+        use crate::outbox::{TaskFormat, TaskHandlerRegistryError};
+
+        let (_, log) = crate::diagnostics::test_support::capture(async {
+            for error in [
+                HostError::Inbound(io::Error::new(io::ErrorKind::PermissionDenied, "private_io_source")),
+                HostError::ShutdownSignal(io::Error::other("private_signal_source")),
+                HostError::OutboxSupervisor(OutboxWorkerPoolError::Registry(WorkerRegistryError::Build {
+                    worker_index: 3,
+                    source: TaskHandlerRegistryError::DuplicateFormat(
+                        TaskFormat::new("private_format\nmail@example.com", 2).unwrap(),
+                    ),
+                })),
+            ] {
+                assert!(std::error::Error::source(&error).is_some());
+                assert!(!format!("{error:?} {error}").contains("private_"));
+                error.log("additional failure during host shutdown");
+            }
+        })
+        .await;
+        assert!(log.contains("PermissionDenied"));
+        assert!(log.contains("unknown"));
+        assert!(!log.contains("private_"));
+        assert!(!log.contains("mail@example.com"));
+    }
 
     #[derive(Clone, Default)]
     struct RecordingWriter(Arc<std::sync::Mutex<Vec<u8>>>);

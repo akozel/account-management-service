@@ -33,7 +33,7 @@ flowchart TB
         Logger["logging::LoggingConfig<br/>explicit fallible fmt initialization"]
         Lifecycle["host::run / shutdown_signal<br/>signal, cancellation and adapter drain"]
         Executor["CqrsCommandExecutor<br/>bounded optimistic-conflict retry"]
-        Preparation["worker::prepare / PreparedOutboxWorker<br/>all C registries checked before HTTP"]
+        Preparation["worker::prepare / PreparedOutboxRuntime<br/>all C registries checked before HTTP"]
         Supervisor["prepared.run / worker::run<br/>shared polling, restarts, shutdown"]
         Channel["Bounded async-channel queue<br/>Q waiting deliveries"]
         Slot["Permanent Tokio worker<br/>one registry; one in-flight delivery"]
@@ -117,7 +117,7 @@ metadata is not cloned for delivery. See the
 
 `OutboxRuntimeConfig` checks coordinator/worker budgets at construction or env
 load time. PostgreSQL statement timeout remains adapter configuration.
-`prepare_outbox_worker` constructs the queue and delegates to `worker::prepare`,
+`prepare_outbox_runtime` constructs the queue and delegates to `worker::prepare`,
 without SQL or background tasks. Exactly C registries are retained, including the
 first used for ordered format discovery. Errors/drop release prepared handlers;
 no cancellation token exists in the prepared object. A polled run binds the host's

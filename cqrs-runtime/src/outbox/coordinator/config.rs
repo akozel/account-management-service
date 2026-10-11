@@ -1,5 +1,6 @@
 use std::time::Duration;
 use thiserror::Error;
+const DEFAULT_STORAGE_TIMEOUT_MS: u64 = 6_000;
 /// Validated end-to-end storage budget. Defaults do not read the environment.
 #[derive(Clone, Debug)]
 pub struct OutboxTaskCoordinatorConfig {
@@ -14,16 +15,15 @@ pub enum OutboxTaskCoordinatorConfigError {
 }
 impl Default for OutboxTaskCoordinatorConfig {
     fn default() -> Self {
-        Self {
-            storage_timeout: Duration::from_secs(6),
-        }
+        Self::new(Duration::from_millis(DEFAULT_STORAGE_TIMEOUT_MS)).expect("valid default storage timeout")
     }
 }
 impl OutboxTaskCoordinatorConfig {
     pub fn new(storage_timeout: Duration) -> Result<Self, OutboxTaskCoordinatorConfigError> {
-        let config = Self { storage_timeout };
-        config.validate()?;
-        Ok(config)
+        if storage_timeout.is_zero() || storage_timeout.as_millis() > i64::MAX as u128 {
+            return Err(OutboxTaskCoordinatorConfigError::InvalidStorageTimeout);
+        }
+        Ok(Self { storage_timeout })
     }
     pub fn storage_timeout(&self) -> Duration {
         self.storage_timeout
@@ -32,16 +32,9 @@ impl OutboxTaskCoordinatorConfig {
         Self::from_lookup(|name| std::env::var(name).ok())
     }
     pub fn from_lookup(mut lookup: impl FnMut(&str) -> Option<String>) -> Result<Self, OutboxTaskCoordinatorConfigError> {
-        let millis = crate::env::read_u64(&mut lookup, "OUTBOX_STORAGE_TIMEOUT_MS", 6_000)
+        let millis = crate::env::read_u64(&mut lookup, "OUTBOX_STORAGE_TIMEOUT_MS", DEFAULT_STORAGE_TIMEOUT_MS)
             .map_err(|_| OutboxTaskCoordinatorConfigError::InvalidEnvironmentValue)?;
         Self::new(Duration::from_millis(millis))
-    }
-    pub fn validate(&self) -> Result<(), OutboxTaskCoordinatorConfigError> {
-        if self.storage_timeout.is_zero() || self.storage_timeout.as_millis() > i64::MAX as u128 {
-            Err(OutboxTaskCoordinatorConfigError::InvalidStorageTimeout)
-        } else {
-            Ok(())
-        }
     }
 }
 

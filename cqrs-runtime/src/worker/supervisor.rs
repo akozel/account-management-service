@@ -1,7 +1,7 @@
 //! Bounded delivery admission and JoinSet supervision of permanent registry-owning workers.
 use super::{
     OutboxWorkerPoolConfig, OutboxWorkerPoolConfigError,
-    worker_task::{log_failed, run_worker},
+    delivery_worker::{log_failed, run_delivery_worker},
 };
 use crate::outbox::{ClaimedTask, OutboxTaskCoordinator, TaskFormat, TaskHandlerRegistry, TaskHandlerRegistryError};
 use std::{collections::HashMap, sync::Arc, time::Duration};
@@ -23,53 +23,60 @@ const RECOVERY_BATCH_LIMIT: usize = 32;
 pub type HandlerRegistryFactory = Arc<dyn Fn() -> Result<TaskHandlerRegistry, TaskHandlerRegistryError> + Send + Sync>;
 
 #[derive(Debug, Error, PartialEq, Eq)]
-pub enum WorkerPoolError {
+pub enum OutboxWorkerPoolError {
     #[error(transparent)]
     Configuration(#[from] OutboxWorkerPoolConfigError),
+    #[error("{0}")]
+    Registry(#[from] WorkerRegistryError),
+}
+
+/// Registry construction or format mismatch, shared by preparation and restart.
+#[derive(Debug, Error, PartialEq, Eq)]
+pub enum WorkerRegistryError {
     #[error("worker {worker_index} registry construction failed: {source}")]
-    RegistryBuild {
+    Build {
         worker_index: usize,
         #[source]
         source: TaskHandlerRegistryError,
     },
     #[error("worker {worker_index} registry and coordinator formats differ")]
-    HandlerFormatsMismatch { worker_index: usize },
+    FormatsMismatch { worker_index: usize },
 }
 
-pub(super) fn checked_handler(
+pub(super) fn build_checked_registry(
     factory: &HandlerRegistryFactory,
     formats: &[TaskFormat],
     worker_index: usize,
-) -> Result<TaskHandlerRegistry, WorkerPoolError> {
-    let handler = factory().map_err(|source| WorkerPoolError::RegistryBuild { worker_index, source })?;
-    if handler.formats() == formats {
-        Ok(handler)
+) -> Result<TaskHandlerRegistry, WorkerRegistryError> {
+    let registry = factory().map_err(|source| WorkerRegistryError::Build { worker_index, source })?;
+    if registry.formats() == formats {
+        Ok(registry)
     } else {
-        Err(WorkerPoolError::HandlerFormatsMismatch { worker_index })
+        Err(WorkerRegistryError::FormatsMismatch { worker_index })
     }
 }
 
 struct WorkerPool {
     workers: JoinSet<usize>,
-    indices: HashMap<Id, usize>,
+    worker_indices: HashMap<Id, usize>,
     coordinator: Arc<dyn OutboxTaskCoordinator>,
     receiver: async_channel::Receiver<ClaimedTask>,
-    available: Arc<Notify>,
+    capacity_available: Arc<Notify>,
     handler_timeout: Duration,
     stop: CancellationToken,
 }
 impl WorkerPool {
-    fn spawn(&mut self, index: usize, handler: TaskHandlerRegistry) {
-        let handle = self.workers.spawn(run_worker(
+    fn spawn(&mut self, index: usize, registry: TaskHandlerRegistry) {
+        let handle = self.workers.spawn(run_delivery_worker(
             index,
-            handler,
+            registry,
             self.coordinator.clone(),
             self.receiver.clone(),
-            self.available.clone(),
+            self.capacity_available.clone(),
             self.handler_timeout,
             self.stop.clone(),
         ));
-        self.indices.insert(handle.id(), index);
+        self.worker_indices.insert(handle.id(), index);
     }
 
     async fn drain(&mut self) {
@@ -100,17 +107,17 @@ pub async fn run(
     factory: HandlerRegistryFactory,
     config: OutboxWorkerPoolConfig,
     shutdown: CancellationToken,
-) -> Result<(), WorkerPoolError> {
+) -> Result<(), OutboxWorkerPoolError> {
     let _cancel_on_exit = shutdown.clone().drop_guard();
     config.validate_for_storage_timeout(coordinator.storage_timeout())?;
     if shutdown.is_cancelled() {
         return Ok(());
     }
     let formats = coordinator.formats();
-    let handlers = (0..config.concurrency())
-        .map(|index| checked_handler(&factory, &formats, index))
+    let registries = (0..config.concurrency())
+        .map(|index| build_checked_registry(&factory, &formats, index))
         .collect::<Result<Vec<_>, _>>()?;
-    run_prepared(coordinator, factory, config, handlers, shutdown).await
+    run_prepared(coordinator, factory, config, registries, shutdown).await
 }
 
 /// Shared execution engine for ready registries and the low-level entry point.
@@ -118,9 +125,9 @@ pub(super) async fn run_prepared(
     coordinator: Arc<dyn OutboxTaskCoordinator>,
     factory: HandlerRegistryFactory,
     config: OutboxWorkerPoolConfig,
-    handlers: Vec<TaskHandlerRegistry>,
+    registries: Vec<TaskHandlerRegistry>,
     shutdown: CancellationToken,
-) -> Result<(), WorkerPoolError> {
+) -> Result<(), OutboxWorkerPoolError> {
     let _cancel_on_exit = shutdown.clone().drop_guard();
     if shutdown.is_cancelled() {
         return Ok(());
@@ -128,18 +135,18 @@ pub(super) async fn run_prepared(
     let formats = coordinator.formats();
     let owner = Uuid::new_v4().to_string();
     let (sender, receiver) = async_channel::bounded(config.queue_capacity());
-    let available = Arc::new(Notify::new());
+    let capacity_available = Arc::new(Notify::new());
     let mut pool = WorkerPool {
         workers: JoinSet::new(),
-        indices: HashMap::new(),
+        worker_indices: HashMap::new(),
         coordinator: coordinator.clone(),
         receiver,
-        available: available.clone(),
+        capacity_available: capacity_available.clone(),
         handler_timeout: config.handler_timeout(),
         stop: shutdown.clone(),
     };
-    for (index, handler) in handlers.into_iter().enumerate() {
-        pool.spawn(index, handler);
+    for (index, registry) in registries.into_iter().enumerate() {
+        pool.spawn(index, registry);
     }
     info!(concurrency = config.concurrency(), queue_capacity = config.queue_capacity(),
         lease_seconds = config.lease_duration().as_secs(), owner = %owner, "outbox worker pool started");
@@ -156,14 +163,14 @@ pub(super) async fn run_prepared(
                         Ok((id, _)) => (*id, false, false),
                         Err(error) => (error.id(), error.is_panic(), error.is_cancelled()),
                     };
-                    let index = pool.indices.remove(&id).expect("every worker has a registered index");
+                    let index = pool.worker_indices.remove(&id).expect("every worker has a registered index");
                     error!(worker = index, tokio_task_id = %id, panicked, cancelled,
                         owner = %owner, "outbox worker stopped; restarting");
-                    let handler = checked_handler(&factory, &formats, index)?;
+                    let registry = build_checked_registry(&factory, &formats, index)?;
                     if shutdown.is_cancelled() {
                         break;
                     }
-                    pool.spawn(index, handler);
+                    pool.spawn(index, registry);
                 }
                 _ = interval.tick() => {
                     let recovery = tokio::select! {
@@ -176,7 +183,7 @@ pub(super) async fn run_prepared(
                         Err(error) => error!(error = %error, "outbox lease recovery failed"),
                     }
                 }
-                _ = available.notified() => {},
+                _ = capacity_available.notified() => {},
             }
             let limit = config.queue_capacity() - sender.len();
             if limit == 0 {
@@ -237,8 +244,7 @@ mod tests {
             queue.clone(),
             vec![format()],
             OutboxTaskCoordinatorConfig::new(Duration::from_secs(10)).unwrap(),
-        )
-        .unwrap();
+        );
         let factory: HandlerRegistryFactory = Arc::new(|| TaskHandlerRegistry::try_new(vec![Box::new(handler())]));
         let shutdown = CancellationToken::new();
         assert!(
@@ -372,8 +378,7 @@ mod tests {
                 queue.clone(),
                 vec![format()],
                 OutboxTaskCoordinatorConfig::new(Duration::from_millis(5)).unwrap(),
-            )
-            .unwrap();
+            );
             let calls = Arc::new(AtomicUsize::new(0));
             let factory: HandlerRegistryFactory = Arc::new({
                 let calls = calls.clone();
@@ -454,8 +459,7 @@ mod tests {
             queue.clone(),
             vec![format()],
             OutboxTaskCoordinatorConfig::new(Duration::from_secs(10)).unwrap(),
-        )
-        .unwrap();
+        );
         let factory: HandlerRegistryFactory = Arc::new(|| {
             let mut handler = handler();
             handler.hang = true;
@@ -519,7 +523,12 @@ mod tests {
             shutdown,
         )
         .await;
-        assert_eq!(result, Err(WorkerPoolError::HandlerFormatsMismatch { worker_index: 1 }));
+        assert_eq!(
+            result,
+            Err(OutboxWorkerPoolError::Registry(WorkerRegistryError::FormatsMismatch {
+                worker_index: 1
+            }))
+        );
         assert_eq!(calls.load(Ordering::SeqCst), 2);
     }
 
@@ -562,10 +571,10 @@ mod tests {
                 .unwrap_err();
             assert_eq!(
                 error,
-                WorkerPoolError::RegistryBuild {
+                OutboxWorkerPoolError::Registry(WorkerRegistryError::Build {
                     worker_index: 0,
                     source: TaskHandlerRegistryError::Empty
-                }
+                })
             );
             assert_eq!(queue.requested.lock().unwrap().len(), usize::from(fail_on_restart));
             assert!(queue.outcomes.lock().unwrap().is_empty());
@@ -638,7 +647,7 @@ mod tests {
         queue: Arc<dyn OutboxQueue>,
         factory: HandlerRegistryFactory,
         config: OutboxWorkerPoolConfig,
-    ) -> super::super::PreparedOutboxWorker {
+    ) -> super::super::PreparedOutboxRuntime {
         super::super::prepare(
             queue,
             factory,
@@ -780,8 +789,8 @@ mod tests {
             fn formats(&self) -> Vec<TaskFormat> {
                 vec![format()]
             }
-            async fn handle(&mut self, task: &TaskDelivery) -> Result<(), TaskHandlerError> {
-                self.0.lock().unwrap().push(task.id());
+            async fn handle(&mut self, delivery: &TaskDelivery) -> Result<(), TaskHandlerError> {
+                self.0.lock().unwrap().push(delivery.id());
                 tokio::task::yield_now().await;
                 Ok(())
             }
@@ -999,12 +1008,12 @@ mod tests {
         assert!(queue.outcomes.lock().unwrap().is_empty());
         probe.gate.add_permits(1);
         let expected = if mismatch {
-            WorkerPoolError::HandlerFormatsMismatch { worker_index: 0 }
+            OutboxWorkerPoolError::Registry(WorkerRegistryError::FormatsMismatch { worker_index: 0 })
         } else {
-            WorkerPoolError::RegistryBuild {
+            OutboxWorkerPoolError::Registry(WorkerRegistryError::Build {
                 worker_index: 0,
                 source: TaskHandlerRegistryError::Empty,
-            }
+            })
         };
         assert_eq!(pool.await.unwrap(), Err(expected));
         assert_eq!(queue.outcomes.lock().unwrap().len(), 1);
@@ -1063,10 +1072,10 @@ mod tests {
         let stop = CancellationToken::new();
         let mut pool = WorkerPool {
             workers: JoinSet::new(),
-            indices: HashMap::new(),
+            worker_indices: HashMap::new(),
             coordinator: Arc::new(StalledCoordinator(probe.clone())),
             receiver,
-            available: Arc::new(Notify::new()),
+            capacity_available: Arc::new(Notify::new()),
             handler_timeout: Duration::from_millis(20),
             stop,
         };

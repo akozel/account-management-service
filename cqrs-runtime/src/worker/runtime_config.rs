@@ -23,7 +23,6 @@ impl OutboxRuntimeConfig {
         coordinator: OutboxTaskCoordinatorConfig,
         worker: OutboxWorkerPoolConfig,
     ) -> Result<Self, OutboxRuntimeConfigError> {
-        coordinator.validate()?;
         worker.validate_for_storage_timeout(coordinator.storage_timeout())?;
         Ok(Self { coordinator, worker })
     }
@@ -34,6 +33,10 @@ impl OutboxRuntimeConfig {
 
     pub fn worker(&self) -> &OutboxWorkerPoolConfig {
         &self.worker
+    }
+
+    pub(super) fn into_parts(self) -> (OutboxTaskCoordinatorConfig, OutboxWorkerPoolConfig) {
+        (self.coordinator, self.worker)
     }
 
     pub fn from_env() -> Result<Self, OutboxRuntimeConfigError> {

@@ -59,9 +59,8 @@ pub fn outbox_task_coordinator_with_config(
     queue: Arc<dyn OutboxQueue>,
     formats: Vec<TaskFormat>,
     config: OutboxTaskCoordinatorConfig,
-) -> Result<Arc<dyn OutboxTaskCoordinator>, OutboxTaskCoordinatorConfigError> {
-    config.validate()?;
-    Ok(Arc::new(DefaultOutboxTaskCoordinator::new(queue, formats, config)))
+) -> Arc<dyn OutboxTaskCoordinator> {
+    Arc::new(DefaultOutboxTaskCoordinator::new(queue, formats, config))
 }
 
 pub(super) struct DefaultOutboxTaskCoordinator {
@@ -165,24 +164,33 @@ impl OutboxTaskCoordinator for DefaultOutboxTaskCoordinator {
                 }
                 ExecutionPlan::RecoverOnly => return Err(OutboxError::LeaseBudgetExhausted),
             };
-        let outcome = tokio::select! {
+        let result = tokio::select! {
             biased;
-            _ = sleep_until(handler_deadline) => SettlementRequest::Retry {
+            _ = sleep_until(handler_deadline) => Err(TaskHandlerError::Retry {
                 reason: "handler timed out".to_owned(),
-                delay: redelivery_backoff(task.delivery().attempt()),
-            },
-            result = handler.handle(task.delivery()) => match result {
-                Ok(()) => SettlementRequest::Completed,
-                Err(TaskHandlerError::Permanent { reason }) => SettlementRequest::Failed { reason },
-                Err(TaskHandlerError::Retry { reason, retry_after }) => SettlementRequest::Retry {
-                    reason,
-                    delay: retry_after.unwrap_or_else(|| redelivery_backoff(task.delivery().attempt())),
-                },
-            },
+                retry_after: None,
+            }),
+            result = handler.handle(task.delivery()) => result,
         };
+        let fallback_delay = match &result {
+            Err(TaskHandlerError::Retry { retry_after: None, .. }) => redelivery_backoff(task.delivery().attempt()),
+            _ => Duration::ZERO,
+        };
+        let outcome = settlement_request(result, fallback_delay);
         // Retain a margin before local expiry; queue-side token and database
         // clock checks remain authoritative, including after clock changes.
         self.settle_before(&task, outcome, settlement_deadline).await
+    }
+}
+
+fn settlement_request(result: Result<(), TaskHandlerError>, fallback_delay: Duration) -> SettlementRequest {
+    match result {
+        Ok(()) => SettlementRequest::Completed,
+        Err(TaskHandlerError::Permanent { reason }) => SettlementRequest::Failed { reason },
+        Err(TaskHandlerError::Retry { reason, retry_after }) => SettlementRequest::Retry {
+            reason,
+            delay: retry_after.unwrap_or(fallback_delay),
+        },
     }
 }
 
@@ -224,8 +232,7 @@ mod tests {
             queue.clone(),
             vec![format()],
             OutboxTaskCoordinatorConfig::new(Duration::from_secs(5)).unwrap(),
-        )
-        .unwrap();
+        );
         let calls = Arc::new(std::sync::atomic::AtomicUsize::new(0));
         let mut handler = ProbeHandler {
             calls: calls.clone(),
@@ -305,7 +312,7 @@ mod tests {
         let service = outbox_task_coordinator(queue.clone(), vec![format()]);
         assert_eq!(
             service.execute_and_settle(&mut handler(), claimed(), Duration::MAX).await,
-            Err(OutboxError::from(crate::outbox::QueueRequestError::InvalidExecutionBudget))
+            Err(OutboxError::InvalidExecutionBudget)
         );
         assert!(queue.outcomes.lock().unwrap().is_empty());
     }
@@ -317,8 +324,7 @@ mod tests {
             queue.clone(),
             vec![format()],
             OutboxTaskCoordinatorConfig::new(Duration::from_secs(3)).unwrap(),
-        )
-        .unwrap();
+        );
         queue.hang_claim.store(true, Ordering::SeqCst);
         let started = Instant::now();
         assert_eq!(
@@ -356,8 +362,7 @@ mod tests {
             queue.clone(),
             vec![format(), second_format],
             OutboxTaskCoordinatorConfig::new(Duration::from_secs(3)).unwrap(),
-        )
-        .unwrap();
+        );
         let started = Instant::now();
         let tasks = service.claim("test", 2, Duration::from_secs(60)).await.unwrap();
         assert_eq!(started.elapsed(), Duration::from_secs(3));

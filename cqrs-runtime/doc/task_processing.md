@@ -172,7 +172,7 @@ post-commit `Completed`, `RetryScheduled`, or `Failed(TaskFailure)`;
 `OwnershipLost` confirms no owned transition. `is_applied()` includes retry.
 Do not infer completion merely from an applied settlement.
 
-`TaskFailureCause::{HandlerPermanent, AttemptLimitReached, LeaseExpired}`
+`TaskFailureCause::{PermanentRejection, AttemptLimitReached, LeaseExpired}`
 is fixed safe diagnostic context. The handler's persisted reason remains
 separate and must not contain secrets. `LeaseRecoveryReport::processed_count()`
 includes both rescheduled work and confirmed terminal failures; use
@@ -200,6 +200,13 @@ zero-capacity rendezvous is not supported. Defaults for concurrency and queue
 capacity are independent, even when only one environment variable is overridden. The
 PostgreSQL setting must fit `1..=2147483647` milliseconds; the other types
 validate their supported duration ranges.
+
+Each config validates its local values at construction. Building a coordinator
+or PostgreSQL queue from these checked configs is infallible. The combined config
+checks the lease budget; low-level `worker::run` still checks against its custom
+coordinator's actual storage budget. Defaults and env fallback values share the
+same constants. Runtime `from_env` loaders currently treat non-Unicode values as
+absent; the executable's `ServiceConfig` rejects them before delegating to loaders.
 
 The runtime storage deadline includes connection acquisition, SQL, commit,
 and response waiting. All formats in a claim batch share one deadline;
@@ -306,13 +313,19 @@ Panic payloads are not logged by supervision; panic=abort ends the process.
 
 Prepare startup handlers before opening inbound listeners with
 `worker::prepare(queue, factory, OutboxRuntimeConfig)` or, for PostgreSQL,
-`postgres::prepare_outbox_worker(pool, factory, queue_config, runtime_config)`.
+`postgres::prepare_outbox_runtime(pool, factory, queue_config, runtime_config)`.
 Both functions are synchronous and perform no storage work or background spawn.
 The first registry defines ordered formats and is retained for worker zero;
 all remaining C−1 registries must match before preparation succeeds. There is
 no extra disposable registry. Preparation errors free already built handlers.
 
-`PreparedOutboxWorker` owns the coordinator, restart factory, worker config and
+Both preparation functions return `WorkerRegistryError` directly. `Build` reports
+the worker index and retains its `TaskHandlerRegistryError` source;
+`FormatsMismatch` reports a differing ordered format list at that index.
+`TaskHandlerRegistry::formats()` borrows the stored list, while the handler and
+coordinator trait methods continue to return owned lists.
+
+`PreparedOutboxRuntime` owns the coordinator, restart factory, worker config and
 C registries. It cannot be cloned and is consumed by `run(shutdown)`. Before run,
 Drop just releases its handlers; there is no owned cancellation token or work to
 drain. A run future binds the supplied token and installs a DropGuard at first
@@ -320,12 +333,17 @@ poll. A pre-cancelled token releases prepared handlers without spawning workers,
 calling the factory again, or accessing storage. Each worker receives its same
 prepared mutable registry; only replacement workers invoke the factory anew.
 
+Both run entry points return `OutboxWorkerPoolError`, whose `Registry` variant
+wraps startup/restart construction failures and format mismatches. Its
+`Configuration` variant applies to low-level startup's actual-budget check.
+There are no PostgreSQL-specific preparation error wrappers.
+
 The retained low-level `worker::run(coordinator, factory, config, shutdown)`
 validates against the actual coordinator budget and builds registries when polled.
 Both APIs share the same supervisor engine. In the low-level path, a pre-cancelled
 token skips registry creation; startup errors or panics cancel it through DropGuard.
 
-`PreparedOutboxWorker::run` and `worker::run` take a
+`PreparedOutboxRuntime::run` and `worker::run` take a
 `tokio_util::sync::CancellationToken`. Its clones share
 one cancellation request between the host, supervisor, and permanent workers.
 Cancellation stops claims and dequeue, including while the supervisor awaits
@@ -337,7 +355,7 @@ Pure preparation has no supplied token and returns indexed startup errors before
 any runtime is started. Low-level startup configuration/registry errors cancel
 the supplied token before returning.
 Restart-factory errors and format mismatches cancel it **before** draining healthy
-workers, notifying the host immediately, and return the original `WorkerPoolError`
+workers, notifying the host immediately, and return the original `OutboxWorkerPoolError`
 after drain. A worker panic alone does not cancel it: the supervisor restarts that
 worker. A host that needs to isolate a pool passes `parent.child_token()`; cancelling
 that child does not cancel the parent. Factories are synchronous and must return
@@ -411,6 +429,12 @@ checks remain authoritative. Timers require cooperative async code and cannot
 preempt blocking work. Cancellation does not retract a remote request already
 accepted by a receiver. There is no heartbeat/renewal or exactly-once guarantee.
 
+Invalid queue request parameters are `OutboxError::InvalidRequest`; invalid
+returned delivery data and invocation budgets are separately `InvalidDelivery`
+and `InvalidExecutionBudget`. Neither is an expired-lease recovery signal.
+Host diagnostics retain I/O sources but render only their error kind. Registry
+errors render sanitized type/version, preserving the original format for inspection.
+
 ## Integrating another application
 
 1. Keep versioned `TaskPayload` DTOs readable while persisted tasks can still
@@ -442,7 +466,7 @@ accepted by a receiver. There is no heartbeat/renewal or exactly-once guarantee.
 5. Load `OutboxRuntimeConfig::from_env` and the separate PostgreSQL queue config
    before connecting the database. The combined config checks independent C/Q and
    the full queued-wave lease budget. After business dependencies and handler
-   factory are ready, call `prepare_outbox_worker` (or `worker::prepare` for another
+   factory are ready, call `prepare_outbox_runtime` (or `worker::prepare` for another
    queue) before binding listeners. Start `prepared.run(token)` and share its token
    with critical inbound adapters. Observe configuration, preparation and runtime
    errors at their respective boundaries. Custom coordinators can retain low-level

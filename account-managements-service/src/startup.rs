@@ -2,7 +2,7 @@
 
 use std::{fmt, future::Future, io, path::PathBuf};
 
-use cqrs_runtime::{host::HostError, logging::LoggingInitError, postgres::PostgresOutboxPreparationError};
+use cqrs_runtime::{host::HostError, logging::LoggingInitError, worker::WorkerRegistryError};
 use sqlx::PgPool;
 use thiserror::Error;
 
@@ -19,7 +19,7 @@ pub(crate) enum ServiceError {
     #[error("unable to connect to PostgreSQL")]
     Database(#[from] sqlx::Error),
     #[error("unable to prepare outbox workers")]
-    OutboxPreparation(#[from] PostgresOutboxPreparationError),
+    OutboxPreparation(#[from] WorkerRegistryError),
     #[error("unable to bind HTTP listener")]
     Bind(#[from] io::Error),
     #[error("{0}")]
@@ -84,21 +84,17 @@ pub(crate) async fn with_pool_cleanup(
 #[cfg(test)]
 mod tests {
     use super::*;
-    use cqrs_runtime::{
-        outbox::TaskHandlerRegistryError,
-        postgres::PostgresOutboxPreparationError,
-        worker::{OutboxPreparationError, WorkerPoolError},
-    };
+    use cqrs_runtime::{outbox::TaskHandlerRegistryError, worker::OutboxWorkerPoolError};
     use std::{
         error::Error,
         sync::{Arc, Mutex},
     };
 
     fn preparation_error() -> ServiceError {
-        PostgresOutboxPreparationError::Preparation(OutboxPreparationError::Worker(WorkerPoolError::RegistryBuild {
+        WorkerRegistryError::Build {
             worker_index: 0,
             source: TaskHandlerRegistryError::Empty,
-        }))
+        }
         .into()
     }
 
@@ -179,6 +175,16 @@ mod tests {
                 ServiceError::Dotenv(dotenvy::Error::LineParse("private_env_line".into(), 0)),
                 ServiceError::Configuration(ServiceConfigError::Missing("DATABASE_URL")),
                 ServiceError::Host(HostError::InboundStopped),
+                ServiceError::Host(HostError::Inbound(io::Error::other("private_inbound_source"))),
+                ServiceError::Host(HostError::ShutdownSignal(io::Error::other("private_signal_source"))),
+                ServiceError::Host(HostError::OutboxSupervisor(OutboxWorkerPoolError::Registry(
+                    WorkerRegistryError::Build {
+                        worker_index: 2,
+                        source: TaskHandlerRegistryError::DuplicateFormat(
+                            cqrs_runtime::outbox::TaskFormat::new("private_format\nmail@example.com", 1).unwrap(),
+                        ),
+                    },
+                ))),
             ] {
                 assert!(error.source().is_some());
                 assert!(!format!("{error:?} {error}").contains("private_"));

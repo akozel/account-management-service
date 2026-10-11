@@ -63,8 +63,7 @@ async fn deadlines_after_committed_claim_or_settlement_preserve_durable_outcomes
         queue.clone(),
         vec![format()],
         OutboxTaskCoordinatorConfig::new(Duration::from_millis(200)).unwrap(),
-    )
-    .unwrap();
+    );
     assert_eq!(
         coordinator.claim("test", 1, Duration::from_secs(60)).await.unwrap_err(),
         OutboxError::TimedOut
@@ -115,8 +114,7 @@ async fn delayed_batch_keeps_the_original_task_deadline_and_skips_expired_execut
         queue.clone(),
         vec![format(), delayed_format],
         OutboxTaskCoordinatorConfig::new(Duration::from_millis(300)).unwrap(),
-    )
-    .unwrap();
+    );
     let old = coordinator
         .claim("test", 2, Duration::from_millis(100))
         .await
@@ -169,8 +167,7 @@ async fn insufficient_remaining_lease_returns_task_to_retry_without_performing_i
         queue.clone(),
         vec![format()],
         OutboxTaskCoordinatorConfig::new(Duration::from_millis(300)).unwrap(),
-    )
-    .unwrap();
+    );
     let mut old = coordinator
         .claim("test", 1, Duration::from_secs(60))
         .await
@@ -242,8 +239,7 @@ async fn server_timeout_bounds_queue_lock_waits_rolls_back_and_restores_pool_set
     let queue = PostgresOutboxQueue::with_config(
         pool.clone(),
         PostgresOutboxQueueConfig::new(Duration::from_millis(100)).unwrap(),
-    )
-    .unwrap();
+    );
 
     let processing = new_task();
     enqueue(&db.pool, vec![processing.clone()]).await;
@@ -311,8 +307,7 @@ async fn server_timeout_cancels_slow_execution_and_claim_changes_are_rolled_back
     let queue = PostgresOutboxQueue::with_config(
         db.pool.clone(),
         PostgresOutboxQueueConfig::new(Duration::from_millis(100)).unwrap(),
-    )
-    .unwrap();
+    );
     let result = tokio::time::timeout(
         Duration::from_secs(3),
         queue.claim(&format(), "test", 1, Duration::from_secs(60)),
@@ -345,8 +340,7 @@ async fn runtime_deadline_includes_connection_acquisition() {
         queue,
         vec![format()],
         OutboxTaskCoordinatorConfig::new(Duration::from_millis(200)).unwrap(),
-    )
-    .unwrap();
+    );
     assert_eq!(
         coordinator.claim("test", 1, Duration::from_secs(60)).await.unwrap_err(),
         OutboxError::TimedOut
@@ -398,8 +392,7 @@ async fn shutdown_after_committed_claim_or_settlement_preserves_durable_outcomes
             queue.clone(),
             vec![format()],
             OutboxTaskCoordinatorConfig::new(Duration::from_millis(300)).unwrap(),
-        )
-        .unwrap();
+        );
         let calls = Arc::new(AtomicUsize::new(0));
         let factory: HandlerRegistryFactory = Arc::new({
             let calls = calls.clone();

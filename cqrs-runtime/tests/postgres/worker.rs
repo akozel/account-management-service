@@ -1,11 +1,12 @@
 use cqrs_runtime::outbox::TaskDelivery;
+use cqrs_runtime::worker::WorkerRegistryError;
 use std::sync::Mutex;
 
 use super::*;
 use cqrs_runtime::{
     outbox::{OutboxTaskCoordinatorConfig, TaskHandlerRegistryError},
-    postgres::{PostgresOutboxPreparationError, PostgresOutboxQueueConfig, prepare_outbox_worker},
-    worker::{OutboxPreparationError, OutboxRuntimeConfig, WorkerPoolError},
+    postgres::{PostgresOutboxQueueConfig, prepare_outbox_runtime},
+    worker::OutboxRuntimeConfig,
 };
 
 struct DummyHandler(Arc<Mutex<Vec<(Uuid, String)>>>);
@@ -16,11 +17,12 @@ impl TaskHandler for DummyHandler {
         vec![format()]
     }
 
-    async fn handle(&mut self, task: &TaskDelivery) -> Result<(), TaskHandlerError> {
-        let payload = serde_json::from_value::<DummyTaskV1>(task.payload().clone()).map_err(|_| TaskHandlerError::Permanent {
-            reason: "invalid dummy task payload".to_owned(),
-        })?;
-        self.0.lock().unwrap().push((task.id(), payload.value));
+    async fn handle(&mut self, delivery: &TaskDelivery) -> Result<(), TaskHandlerError> {
+        let payload =
+            serde_json::from_value::<DummyTaskV1>(delivery.payload().clone()).map_err(|_| TaskHandlerError::Permanent {
+                reason: "invalid dummy task payload".to_owned(),
+            })?;
+        self.0.lock().unwrap().push((delivery.id(), payload.value));
         Ok(())
     }
 }
@@ -49,7 +51,7 @@ async fn two_live_workers_complete_every_supported_task_and_quarantine_bad_paylo
     .unwrap();
     let config = OutboxRuntimeConfig::new(OutboxTaskCoordinatorConfig::default(), config).unwrap();
     // A startup failure must leave existing durable work unclaimed.
-    let failed = prepare_outbox_worker(
+    let failed = prepare_outbox_runtime(
         db.pool.clone(),
         Arc::new(|| Err(TaskHandlerRegistryError::Empty)),
         PostgresOutboxQueueConfig::default(),
@@ -57,21 +59,19 @@ async fn two_live_workers_complete_every_supported_task_and_quarantine_bad_paylo
     );
     assert!(matches!(
         failed,
-        Err(PostgresOutboxPreparationError::Preparation(OutboxPreparationError::Worker(
-            WorkerPoolError::RegistryBuild {
-                worker_index: 0,
-                source: TaskHandlerRegistryError::Empty,
-            }
-        )))
+        Err(WorkerRegistryError::Build {
+            worker_index: 0,
+            source: TaskHandlerRegistryError::Empty,
+        })
     ));
-    let left = prepare_outbox_worker(
+    let left = prepare_outbox_runtime(
         db.pool.clone(),
         factory.clone(),
         PostgresOutboxQueueConfig::default(),
         config.clone(),
     )
     .unwrap();
-    let right = prepare_outbox_worker(db.pool.clone(), factory, PostgresOutboxQueueConfig::default(), config).unwrap();
+    let right = prepare_outbox_runtime(db.pool.clone(), factory, PostgresOutboxQueueConfig::default(), config).unwrap();
     for task in [&first, &second, &bad] {
         assert_worker_state(&db.pool, task.id(), "pending", 0, None).await;
     }
@@ -142,7 +142,7 @@ async fn one_worker_pool_routes_two_registered_task_types() {
     });
     let shutdown = CancellationToken::new();
     let stop = shutdown.clone();
-    let prepared = prepare_outbox_worker(
+    let prepared = prepare_outbox_runtime(
         db.pool.clone(),
         factory,
         PostgresOutboxQueueConfig::default(),

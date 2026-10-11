@@ -6,12 +6,12 @@ use tokio::sync::Notify;
 use tokio_util::sync::CancellationToken;
 use tracing::error;
 
-pub(super) async fn run_worker(
+pub(super) async fn run_delivery_worker(
     index: usize,
-    mut handler: TaskHandlerRegistry,
+    mut registry: TaskHandlerRegistry,
     coordinator: Arc<dyn OutboxTaskCoordinator>,
     receiver: Receiver<ClaimedTask>,
-    available: Arc<Notify>,
+    capacity_available: Arc<Notify>,
     handler_timeout: Duration,
     stop: CancellationToken,
 ) -> usize {
@@ -24,13 +24,13 @@ pub(super) async fn run_worker(
         let Ok(task) = task else {
             break;
         };
-        available.notify_one();
+        capacity_available.notify_one();
         if stop.is_cancelled() {
             break;
         }
         let id = task.delivery().id();
         // Graceful stop does not cancel the current invocation or settlement.
-        match coordinator.execute_and_settle(&mut handler, task, handler_timeout).await {
+        match coordinator.execute_and_settle(&mut registry, task, handler_timeout).await {
             Ok(SettlementResult::Failed(failed)) => log_failed(&failed),
             Ok(SettlementResult::Completed | SettlementResult::RetryScheduled) => {}
             Ok(SettlementResult::OwnershipLost) => error!(task_id = %id, "outbox ownership lost"),
@@ -42,11 +42,7 @@ pub(super) async fn run_worker(
 
 pub(super) fn log_failed(task: &TaskFailure) {
     let task_type = task.format.task_type();
-    let safe_type = if task_type.chars().all(|c| c.is_ascii_alphanumeric() || c == '_') {
-        task_type
-    } else {
-        "unknown"
-    };
+    let safe_type = crate::diagnostics::safe_type(task_type);
     error!(
         task_id = %task.id,
         task_type = %safe_type,
@@ -105,7 +101,7 @@ mod tests {
             .finish();
         tracing::subscriber::with_default(subscriber, || {
             for cause in [
-                TaskFailureCause::HandlerPermanent,
+                TaskFailureCause::PermanentRejection,
                 TaskFailureCause::AttemptLimitReached,
                 TaskFailureCause::LeaseExpired,
             ] {
@@ -177,7 +173,7 @@ mod tests {
         let (sender, receiver) = async_channel::bounded(1);
         let shutdown = CancellationToken::new();
         let stop = shutdown.clone();
-        let mut worker = Box::pin(run_worker(
+        let mut worker = Box::pin(run_delivery_worker(
             0,
             TaskHandlerRegistry::try_new(vec![Box::new(handler())]).unwrap(),
             outbox_task_coordinator(queue.clone(), vec![format()]),

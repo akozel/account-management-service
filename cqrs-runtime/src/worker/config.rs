@@ -4,6 +4,11 @@ use thiserror::Error;
 
 // Preserve the existing configuration range independently of Tokio internals.
 const MAX_QUEUE_CAPACITY: usize = usize::MAX >> 3;
+const DEFAULT_CONCURRENCY: u64 = 128;
+const DEFAULT_QUEUE_CAPACITY: u64 = 128;
+const DEFAULT_POLL_INTERVAL_MS: u64 = 1_000;
+const DEFAULT_HANDLER_TIMEOUT_SECS: u64 = 15;
+const DEFAULT_LEASE_SECS: u64 = 60;
 
 /// Independent process-wide execution and waiting limits, with validated local values.
 /// Defaults: C=128, Q=128, poll=1s, handler=15s, lease=60s.
@@ -39,13 +44,14 @@ pub enum OutboxWorkerPoolConfigError {
 }
 impl Default for OutboxWorkerPoolConfig {
     fn default() -> Self {
-        Self {
-            concurrency: 128,
-            queue_capacity: 128,
-            poll_interval: Duration::from_secs(1),
-            handler_timeout: Duration::from_secs(15),
-            lease_duration: Duration::from_secs(60),
-        }
+        Self::new(
+            DEFAULT_CONCURRENCY as usize,
+            DEFAULT_QUEUE_CAPACITY as usize,
+            Duration::from_millis(DEFAULT_POLL_INTERVAL_MS),
+            Duration::from_secs(DEFAULT_HANDLER_TIMEOUT_SECS),
+            Duration::from_secs(DEFAULT_LEASE_SECS),
+        )
+        .expect("valid default worker pool limits")
     }
 }
 impl OutboxWorkerPoolConfig {
@@ -107,13 +113,13 @@ impl OutboxWorkerPoolConfig {
                 .map_err(|_| OutboxWorkerPoolConfigError::InvalidEnvironmentValue(name))
         };
         Self::new(
-            usize::try_from(read_u64("OUTBOX_WORKER_CONCURRENCY", 128)?)
+            usize::try_from(read_u64("OUTBOX_WORKER_CONCURRENCY", DEFAULT_CONCURRENCY)?)
                 .map_err(|_| OutboxWorkerPoolConfigError::InvalidConcurrency)?,
-            usize::try_from(read_u64("OUTBOX_QUEUE_CAPACITY", 128)?)
+            usize::try_from(read_u64("OUTBOX_QUEUE_CAPACITY", DEFAULT_QUEUE_CAPACITY)?)
                 .map_err(|_| OutboxWorkerPoolConfigError::InvalidQueueCapacity)?,
-            Duration::from_millis(read_u64("OUTBOX_POLL_INTERVAL_MS", 1000)?),
-            Duration::from_secs(read_u64("OUTBOX_HANDLER_TIMEOUT_SECS", 15)?),
-            Duration::from_secs(read_u64("OUTBOX_LEASE_SECS", 60)?),
+            Duration::from_millis(read_u64("OUTBOX_POLL_INTERVAL_MS", DEFAULT_POLL_INTERVAL_MS)?),
+            Duration::from_secs(read_u64("OUTBOX_HANDLER_TIMEOUT_SECS", DEFAULT_HANDLER_TIMEOUT_SECS)?),
+            Duration::from_secs(read_u64("OUTBOX_LEASE_SECS", DEFAULT_LEASE_SECS)?),
         )
     }
     /// Conservative healthy-pool budget: lease > 2*S + H + margin + ceil(Q/C)*(H+S).

@@ -36,7 +36,7 @@ H=15s/S=6s/SQL=4s/lease=60s. №10 перенесена в known issues.
 ## Исходные точки
 
 - [Supervisor](../../cqrs-runtime/src/worker/supervisor.rs).
-- [Permanent worker](../../cqrs-runtime/src/worker/worker_task.rs).
+- [Permanent worker](../../cqrs-runtime/src/worker/delivery_worker.rs).
 - [Coordinator](../../cqrs-runtime/src/outbox/coordinator.rs).
 - [Atomic publication](../../cqrs-runtime/src/postgres/event_repository_with_outbox/write.rs).
 - [PostgreSQL queue](../../cqrs-runtime/src/postgres/outbox_queue.rs).
