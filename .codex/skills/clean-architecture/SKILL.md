@@ -25,11 +25,15 @@ configuration in this repository.
   persistence behavior.
 - `cqrs-runtime` owns domain-agnostic CQRS command execution, outbox
   contracts and coordination, PostgreSQL persistence, canonical SQL, and the
-  worker supervisor. It must never depend on `account-managements-service`.
-- `main` only composes dependencies and starts the application.
-- `account-managements-service/src/runtime.rs`, included privately by the binary, supervises process lifecycle:
-  shutdown signals, coordinated adapter draining, and runtime exit errors. It
-  may depend on presentation adapters but is not part of the library API.
+  worker supervisor and optional transport-independent process host. It must
+  never depend on `account-managements-service` or Axum.
+- `main` composes business dependencies and HTTP adapters, passes inbound and
+  outbox futures to `cqrs_runtime::host::run`, then closes the database pool
+  regardless of the host result before logging/returning `HostError`.
+- The optional `host` feature enables `worker` and `tokio/signal`. Its facade
+  exports `run`, `shutdown_signal`, and `HostError`; private `lifecycle`, `error`,
+  and `signal` modules own transport-independent coordination. No service-local
+  runtime wrapper or Axum dependency belongs in runtime.
 
 ## Application feature layout
 
@@ -310,17 +314,24 @@ never log panic payloads. Normal shutdown and restart-factory errors share bound
 H+S draining of started work only; cancel the shared CancellationToken before
 closing the channel, as closure alone permits buffered receives. Queued claims
 remain for recovery. Abort and observe remaining tasks after the deadline.
-The host shares token clones with HTTP, process runtime, and the supervisor.
+The composition root shares token clones with HTTP, runtime host, and supervisor.
 Fatal startup/restart errors cancel the supplied token before returning/draining,
 so HTTP stops admission immediately; a worker panic alone is restarted. Callers
 can pass a child token to isolate a pool. Ordinary token-handle Drop does not
 cancel; lifecycle owners hold DropGuard. Supervisor panic/abort requests host
 cancellation through its guard and aborts JoinSet workers without async drain.
 Never race token cancellation against an active handler/settlement invocation.
-The process runtime awaits HTTP and outbox before DB cleanup; preserve the first
-unexpected component failure, or signal/outbox/HTTP error priority for requested
+The runtime host awaits inbound and outbox before caller-owned DB cleanup; preserve the first
+unexpected component failure, or signal/outbox/inbound error priority for requested
 shutdown, and log secondary failures. Format JoinError only as task ID and
-panic/cancellation flags, including RuntimeError Debug used by termination.
+panic/cancellation flags, including HostError Debug used by termination.
+Host installs its cancellation DropGuard before spawning the outbox future on
+first poll; constructing an unpolled host starts nothing. Inbound/signal futures
+need neither Send nor 'static; only outbox does. Dropping/aborting a polled host
+cancels its token and detaches outbox for independent drain on a live Tokio
+runtime, without awaiting components or guaranteeing DB cleanup. Preserve H+S
+outbox drain and no host timeout for inbound/pool closure; force/watchdog policy
+remains [known issue #10](../../../doc/known_issues/http_shutdown.md).
 Recovery batches are capped at min(C, 32). `main` loads checked
 `OutboxRuntimeConfig` before DB connection, builds the business handler factory,
 and calls `postgres::prepare_outbox_worker` before binding HTTP. Queue/coordinator
@@ -337,7 +348,7 @@ the engine to another project.
 
 Preserve this project's aggregate-owned business sequence and one-operation
 Task invariant. Import runtime APIs through its public `command`, `outbox`,
-`postgres`, and `worker` facades; child modules are private. Task DTOs and
+`postgres`, `worker`, and `host` facades; child modules are private. Task DTOs and
 configs are created through checked constructors/builders, not public-field
 mutation. `SettlementRequest` is intent; `SettlementResult` is a confirmed
 transition. Do not equate scheduled retry with completed work. Registry factories
@@ -387,8 +398,9 @@ account-managements-service/src/
 - `account-managements-service/src/main.rs` is the composition root. Exclude it from line coverage because
   it only wires dependencies and starts the process; do not add brittle unit
   tests around process startup.
-- Keep `account-managements-service/src/runtime.rs` in coverage and test lifecycle coordination there with
-  controlled futures rather than real process signals.
+- Keep `cqrs-runtime/src/host/` in coverage and test lifecycle/signal multiplexing
+  with controlled futures rather than sending OS signals. The real Axum
+  admission/drain/cleanup test belongs in the service integration suite.
 - Keep `account-managements-service/src/presentation/http.rs` in coverage. Test its top-level router through an
   in-memory Axum request so route composition is verified without PostgreSQL.
 - Keep infrastructure adapters in coverage until their integration-test

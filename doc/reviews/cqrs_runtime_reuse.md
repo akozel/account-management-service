@@ -30,7 +30,7 @@ helpers можно перенести после этих изменений. Co
 | --- | --- | --- |
 | 1. Командный путь PostgreSQL | Checked config, готовая factory, CommandExecutor interface, два простых gateways; сохраняются retries, snapshot replay и atomic event/tasks. 159 tests passed; line coverage 97.97%; все обязательные проверки прошли. | Выполнено |
 | 2. Подготовка outbox | Checked OutboxRuntimeConfig, prepared registries и PostgreSQL helper; все C registries проверяются до HTTP и используются workers. 166 tests passed; line coverage 97.97%; обязательные и feature checks прошли. | Выполнено |
-| 3. Lifecycle процесса | Общий host наблюдает signals/token/component exits и drain; сохраняются error priority и текущая shutdown policy. Lifecycle tests перенесены. | Backlog |
+| 3. Lifecycle процесса | [План и реализация](../backlog/cqrs_runtime_host_lifecycle.md): optional host владеет signals/token/spawn/drain; lifecycle tests в runtime, Axum test в сервисе. 176 tests passed; line coverage 97.79%; обязательные и feature checks прошли. | Выполнено |
 | 4. Типизированные tasks | Runtime проверяет format и декодирует payload; бизнес-handler получает DTO и выполняет свою операцию. Общие decode tests и бизнес-redelivery tests проходят. | Backlog |
 | 5. Конфигурация и диагностика | ServiceConfig, fallible pool connection, optional telemetry, private env helpers и safe storage categories; настройки валидируются до подключения БД. | Backlog |
 | 6. Workspace и CI | Общие dependency versions с сохранением features/optional; compile matrix покрывает независимые runtime features. | Backlog |
@@ -49,7 +49,7 @@ configs, а этап 6 проверяет итоговые feature combinations.
 | --- | --- | --- |
 | P1 | [`main.rs`](../../account-managements-service/src/main.rs), строки 47–67 | Дважды повторяется repository → snapshot store → framework. Snapshot interval `25` задан дважды. Каждый следующий агрегат потребует такой же технической сборки. |
 | P1 | [`main.rs`](../../account-managements-service/src/main.rs), строки 70–86; [`supervisor.rs`](../../cqrs-runtime/src/worker/supervisor.rs) | Host вручную согласует queue, registry formats, coordinator и worker budgets. Проверочный registry создается и выбрасывается, затем supervisor создает еще C registries. Обязательные шаги интеграции runtime распределены между host и supervisor. |
-| P1 | [`runtime.rs`](../../account-managements-service/src/runtime.rs), строки 1–151; [`main.rs`](../../account-managements-service/src/main.rs), строки 114–128 | Управление signal/token/component exit, drain и приоритетом ошибок не использует бизнес-типы. Это готовый кандидат на перенос вместе с lifecycle-тестами. |
+| P1 | `runtime.rs` (исходный сервисный модуль; перенесен в [`host`](../../cqrs-runtime/src/host.rs)), строки 1–151; [`main.rs`](../../account-managements-service/src/main.rs), строки 114–128 | Управление signal/token/component exit, drain и приоритетом ошибок не использует бизнес-типы. Это готовый кандидат на перенос вместе с lifecycle-тестами. |
 | P2 | [`create_account.rs`](../../account-managements-service/src/application/user_account/tasks/create_account.rs), [`record_account_created.rs`](../../account-managements-service/src/application/user_account/tasks/record_account_created.rs), [`send_verification_code.rs`](../../account-managements-service/src/application/email_reservation/tasks/send_verification_code.rs) | Три handlers повторяют регистрацию формата, проверку версии, JSON decode и permanent error. Бизнес-операция занимает лишь часть каждого обработчика. |
 | P2 | [`email_reservation_gateway.rs`](../../account-managements-service/src/infrastructure/cqrs/email_reservation_gateway.rs), [`user_account_gateway.rs`](../../account-managements-service/src/infrastructure/cqrs/user_account_gateway.rs) | Сервисные gateways несут `BuildFramework`, `EventStore` и связанные bounds. Их собственная ответственность гораздо меньше: выбрать aggregate ID и делегировать команду. |
 | P2 | [`main.rs`](../../account-managements-service/src/main.rs), строки 38–45, 83–89 | Некоторые настройки проверяются после подключения БД, startup failures обрабатываются через `expect`. В локальном исходнике `postgres-es::default_postgress_pool` также обнаружен `expect` и фиксированные `max_connections(10)`. |
@@ -155,6 +155,11 @@ defaults C=128/Q=128/H=15s/S=6s/lease=60s, исходные deadlines, checked a
 unknown claim outcomes, replacement workers и bounded H+S drain.
 
 ## Этап 3. Host lifecycle: перенести готовую реализацию
+
+[Сохраненный план и результаты реализации](../backlog/cqrs_runtime_host_lifecycle.md).
+Lifecycle теперь принадлежит runtime; main передает outbox future без внешнего
+spawn и закрывает pool после host независимо от результата. Default features
+сохранены; `host` явно включен сервисом. Описанный ниже перенос реализован.
 
 `cqrs-runtime::host` под feature `host`, включающей `worker` и `tokio/signal`,
 владеет наблюдением signals, общим CancellationToken и координацией inbound
@@ -296,8 +301,9 @@ build framework или `build.rs` для этой цели не требуетс
 
 Clean-architecture skill обновлен вместе с этапом 1: main вызывает техническую
 factory, gateways получают ready executor. Этап 2 закрепляет runtime-owned
-preparation и раннюю проверку budgets/registries. При реализации этапа 3 нужно отдельно
-закрепить host ownership. DDD domain layout не меняется.
+preparation и раннюю проверку budgets/registries. Этап 3 закрепляет
+runtime host ownership, first-poll guard/spawn и самостоятельный outbox drain при
+Drop/abort. DDD domain layout не меняется.
 
 Каждый этап меняющий Rust проходит fmt, workspace Clippy, workspace tests и
 llvm-cov с line coverage ≥90%, как требует AGENTS.md. Новые env settings отражаются
@@ -315,4 +321,5 @@ schema, event formats или task payloads.
 При исходном review PostgreSQL suites и llvm-cov не запускались. Эти исходные
 checks не подтверждают реализацию; актуальные результаты реализации записаны в документах
 [этапа 1](../backlog/cqrs_runtime_command_factory.md) и
-[этапа 2](../backlog/cqrs_runtime_outbox_preparation.md).
+[этапа 2](../backlog/cqrs_runtime_outbox_preparation.md) и
+[этапа 3](../backlog/cqrs_runtime_host_lifecycle.md).

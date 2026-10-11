@@ -15,8 +15,9 @@ responsibilities and Mermaid diagrams of command publication and task delivery.
   handler routing, and task coordination.
 - `postgres`: checked command factory, event repository, queue, and canonical SQL assets.
 - `worker`: JoinSet-supervised permanent Tokio workers, a bounded async-channel queue, and shutdown draining.
+- `host`: process signals, shared cancellation and inbound/outbox draining; enables `worker` and `tokio/signal`, with no HTTP framework dependency.
 
-Both optional features are enabled by default. Use
+`postgres` and `worker` are enabled by default; `host` is opt-in. Use
 `default-features = false` when only the base contracts are needed.
 
 ## Command integration
@@ -77,7 +78,9 @@ order. Redelivery is expected, including after a successful effect.
 
 The host applies [event-store SQL](sql/001-event-store.sql) and
 [outbox SQL](sql/002-transactional-outbox.sql), supplies handler factories and
-a database pool, and owns process signals and inbound-adapter draining.
+a database pool. The optional `host` facade owns process signals and
+inbound-adapter draining; the application constructs its inbound adapter and
+closes the pool after the host returns.
 Load runtime and queue configs before connecting the pool. The following
 preparation function requires the `postgres` and `worker` features and a host
 dependency on SQLx 0.8. Start its returned object only after binding listeners,
@@ -137,6 +140,51 @@ Generate local API documentation with:
 cargo doc --all-features --no-deps
 ```
 
+## Process lifecycle integration
+
+Enable `features = ["host"]` and give the inbound adapter and outbox the same
+`CancellationToken`. The inbound future returns `io::Result<()>`; it may borrow
+local state and need not be `Send`. The outbox future returns
+`Result<(), worker::WorkerPoolError>` and must be `Send + 'static`, because host
+spawns it. Signal futures can also borrow local state and need not be `Send`.
+
+```rust,no_run
+use std::{future::Future, io};
+use cqrs_runtime::{host::{self, HostError}, worker::WorkerPoolError};
+use tokio_util::sync::CancellationToken;
+
+async fn serve<Inbound, Outbox>(
+    inbound: Inbound, outbox: Outbox, shutdown: CancellationToken,
+) -> Result<(), HostError>
+where
+    Inbound: Future<Output = io::Result<()>>,
+    Outbox: Future<Output = Result<(), WorkerPoolError>> + Send + 'static,
+{
+    host::run(inbound, outbox, shutdown, host::shutdown_signal()).await
+}
+```
+
+For a prepared worker, pass `outbox.run(shutdown.clone())` directly to `host::run`.
+The host installs its cancellation DropGuard before spawning outbox on first
+poll; simply creating or dropping an unpolled host future starts nothing and
+leaves the token unchanged. `shutdown_signal` observes SIGINT/SIGTERM on Unix
+and Ctrl-C elsewhere, returning observation errors, including a closed SIGTERM
+stream.
+
+Stop observation uses biased priority: signal → token → inbound exit → outbox
+exit. The host cancels the token and awaits both components. An unexpected exit
+remains the primary error; requested shutdown prefers signal observation, outbox,
+then inbound errors. Secondary failures are logged. `HostError::log` and `Debug`
+render task failures as task ID and panic/cancellation flags, preserving the
+original `JoinError` as a source without rendering its panic payload.
+
+Normal return happens after both components drain; the caller then closes the
+pool even on error. Dropping/aborting a polled host cancels the token and detaches
+the outbox task so its independent drain can finish while Tokio remains running.
+The inbound future is dropped, and the host cannot await components or guarantee
+resource cleanup. Outbox retains its H+S budget; inbound drain and pool closure
+have no host timeout ([known issue #10](../doc/known_issues/http_shutdown.md)).
+
 ## PostgreSQL persistence and operational limits
 
 `PostgresEventRepositoryWithOutbox` supports one domain event per command.
@@ -162,7 +210,7 @@ receiver's idempotency window.
 
 ## Code organization and validated APIs
 
-The public namespaces are `command`, `outbox`, `postgres`, and `worker`;
+The public namespaces are `command`, `outbox`, `postgres`, `worker`, and `host`;
 their child modules are private implementation details. Command execution and
 conflict retry are separate. Outbox modules group wire data, delivery/ownership,
 handler routing, queue transitions, and coordination. The worker groups combined config, startup preparation,

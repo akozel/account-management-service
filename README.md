@@ -64,7 +64,8 @@ The repository is a Cargo workspace with two packages:
   execution, outbox coordination, PostgreSQL persistence, and worker
   supervision without depending on the account-management domain.
 
-`cqrs-runtime` enables its `postgres` and `worker` features by default. Minimal
+`cqrs-runtime` enables its `postgres` and `worker` features by default; the service
+explicitly enables `host` for signals and lifecycle coordination. Minimal
 consumers can opt into only the portable contracts with
 `default-features = false`. The domain continues to implement the upstream
 `cqrs-es::Aggregate` and `DomainEvent` traits directly.
@@ -273,10 +274,14 @@ cargo build --release
 ## Graceful shutdown timeline
 
 The service shares a `CancellationToken` between HTTP, the outbox supervisor,
-and the process runtime. SIGTERM/SIGINT or a critical component exit cancels it.
+and `cqrs_runtime::host`. SIGTERM/SIGINT or a critical component exit cancels it.
 Axum stops accepting new TCP connections and waits for current requests; outbox
 stops claiming/dequeuing and drains already-started operations concurrently.
-PostgreSQL closes after both components finish.
+PostgreSQL closes after both components finish, including when host returns an
+error. Host creates its cancellation guard and spawns outbox on first poll.
+Dropping/aborting a running host cancels the token and lets outbox drain on a live
+Tokio runtime, but cannot await components or guarantee database cleanup. See the
+[host lifecycle plan](doc/backlog/cqrs_runtime_host_lifecycle.md).
 
 | Setting | Default | Scope |
 | --- | --- | --- |

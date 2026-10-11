@@ -279,14 +279,29 @@ hold a drop guard and explicitly cancel/await components for normal shutdown.
 This replaces the former watch receiver API, including its sender-closure and
 false-update semantics; no compatibility adapter is provided.
 
-The service host gives HTTP and outbox the same token. It observes process signals,
-token cancellation, and critical component exits in that priority order (HTTP
+The optional `cqrs_runtime::host` facade coordinates inbound and outbox with the
+shared token supplied by the composition root.
+The service constructs its Axum adapter, then calls
+`host::run(inbound, outbox.run(shutdown.clone()), shutdown, host::shutdown_signal())`.
+The runtime has no Axum dependency. Host observes process signals,
+token cancellation, and critical component exits in that priority order (inbound
 before outbox when neither stop request is ready), then awaits both components.
 An unexpected component exit remains the primary failure. With a signal/token
-request, failure priority is signal-observation error, outbox failure, then HTTP
+request, failure priority is signal-observation error, outbox failure, then inbound
 failure; other observed failures are logged separately. Supervisor task diagnostics
 use task ID and panic/cancellation flags, not JoinError's payload-bearing formatting.
 The ordinary panic hook is independent of these structured diagnostics.
+
+Host installs its cancellation DropGuard before spawning outbox on first poll;
+creating an unpolled host starts nothing. Inbound and signal futures execute
+inside host and can borrow non-Send state; outbox is `Send + 'static`. Normal
+return waits for both components before caller-owned cleanup. Dropping/aborting
+a polled host cancels the token and detaches outbox without aborting it, preserving
+independent drain on a live Tokio runtime. Host drops inbound and cannot await
+components or guarantee database cleanup in that case. SIGINT/SIGTERM observation
+is portable through `host::shutdown_signal` (Ctrl-C only outside Unix); a closed
+SIGTERM stream remains an I/O error. Lifecycle and signal multiplexing tests use
+controlled futures; the real Axum shutdown check lives in the service suite.
 
 HTTP and outbox drain concurrently. An in-flight HTTP request or handler may commit
 new durable tasks after outbox admission stops; they are processed by a subsequent

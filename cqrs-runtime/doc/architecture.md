@@ -2,7 +2,8 @@
 
 The diagrams describe the PostgreSQL integration with the `worker` feature.
 `cqrs-es` supplies the framework and event store; the host supplies aggregates,
-gateways, handlers, senders, configuration, and process lifecycle.
+gateways, handlers, senders, configuration, and inbound adapters. The optional
+`host` feature owns process lifecycle without depending on an HTTP framework.
 For the complete delivery, retry, and timeout contract, see
 [Task processing](task_processing.md).
 
@@ -15,8 +16,7 @@ generic executor; the runtime contains no application-domain dependencies.
 ```mermaid
 flowchart TB
     subgraph Host["Host application and domain"]
-        Root["Composition root<br/>dependency wiring and process lifecycle"]
-        Lifecycle["Process runtime<br/>signal, cancellation and adapter drain"]
+        Root["Composition root<br/>business wiring and pool cleanup"]
         Http["HTTP server<br/>graceful shutdown"]
         Stop["CancellationToken<br/>shared process stop request"]
         Gateway["Application / command gateway<br/>command and explicit NewOutboxTask list"]
@@ -27,6 +27,7 @@ flowchart TB
     end
 
     subgraph Runtime["cqrs-runtime: reusable orchestration"]
+        Lifecycle["host::run / shutdown_signal<br/>signal, cancellation and adapter drain"]
         Executor["CqrsCommandExecutor<br/>bounded optimistic-conflict retry"]
         Preparation["worker::prepare / PreparedOutboxWorker<br/>all C registries checked before HTTP"]
         Supervisor["prepared.run / worker::run<br/>shared polling, restarts, shutdown"]
@@ -58,6 +59,9 @@ flowchart TB
     Root -.->|"creates shared token"| Stop
     Root -.->|"starts"| Lifecycle
     Root -.->|"constructs"| Http
+    Lifecycle -.->|"first poll: spawn outbox"| Supervisor
+    Lifecycle -.->|"await before pool cleanup"| Http
+    Lifecycle -.->|"await independent H+S drain"| Supervisor
     Lifecycle -.->|"signal or critical component exit: cancel"| Stop
     Supervisor -.->|"fatal error: cancel before drain"| Stop
     Stop -.->|"stop HTTP admission"| Http
@@ -317,3 +321,12 @@ effect, so its idempotency belongs to the handler/receiver, not to queue fencing
   execution budgets, settlement requests/results.
 - [worker](../src/worker.rs): combined configuration, synchronous preparation, bounded admission, JoinSet supervision and permanent worker lifecycle.
 - [postgres](../src/postgres.rs): event repository, queue and canonical SQL assets.
+- [host](../src/host.rs): signal observation, shared cancellation and inbound/outbox lifecycle.
+
+`host::run` installs a cancellation guard before outbox spawn on first poll.
+Inbound and signal futures execute within host without `Send`/`'static` bounds.
+Normal return waits for both components, then the composition root closes the
+pool even on error. Host Drop/abort cancels the token and detaches outbox for
+independent drain on a live Tokio runtime; it drops inbound and cannot guarantee
+cleanup. No host timeout or watchdog is added. See the
+[host lifecycle implementation plan](../../doc/backlog/cqrs_runtime_host_lifecycle.md).

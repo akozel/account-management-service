@@ -3,7 +3,11 @@
 //! Application implements [`outbox::TaskPayload`] and [`outbox::TaskHandler`].
 //! The runtime owns task delivery and leases; aggregates own business sequence.
 //! PostgreSQL adapters are under `postgres` when that feature is enabled,
-//! and the supervisor is under `worker` when the worker feature is enabled.
+//! the supervisor is under `worker` when the worker feature is enabled, and
+//! process lifecycle is under `host` when the optional host feature is enabled.
+
+#[cfg(feature = "host")]
+pub mod host;
 
 pub mod command;
 pub mod outbox;

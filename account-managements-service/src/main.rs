@@ -1,5 +1,3 @@
-mod runtime;
-
 use std::sync::Arc;
 
 use account_managements_service::{
@@ -22,17 +20,17 @@ use account_managements_service::{
     presentation,
 };
 use cqrs_runtime::{
+    host::{self, HostError},
     outbox::TaskHandlerRegistry,
     postgres::{PostgresCommandConfig, PostgresOutboxQueueConfig, command_executor, prepare_outbox_worker},
     worker,
 };
-use runtime::RuntimeError;
 use tokio::net::TcpListener;
 use tokio_util::sync::CancellationToken;
 use tracing::info;
 
 #[tokio::main]
-async fn main() -> Result<(), RuntimeError> {
+async fn main() -> Result<(), HostError> {
     dotenvy::dotenv().ok();
     let level_filter = LogingConfig::level_filter_from_env().expect("RUST_LOG must be a valid tracing level");
     LogingConfig::default_setup(level_filter);
@@ -68,14 +66,13 @@ async fn main() -> Result<(), RuntimeError> {
     info!(address = %bind_address, "HTTP server is listening");
 
     let shutdown = CancellationToken::new();
-    let worker = tokio::spawn(outbox.run(shutdown.clone()));
     let http_shutdown = shutdown.clone();
     let serve = async move {
         axum::serve(listener, app)
             .with_graceful_shutdown(http_shutdown.cancelled_owned())
             .await
     };
-    let runtime_result = runtime::run(serve, worker, shutdown, shutdown_signal()).await;
+    let runtime_result = host::run(serve, outbox.run(shutdown.clone()), shutdown, host::shutdown_signal()).await;
     pool.close().await;
     match runtime_result {
         Ok(()) => {
@@ -87,20 +84,4 @@ async fn main() -> Result<(), RuntimeError> {
             Err(error)
         }
     }
-}
-
-#[cfg(unix)]
-async fn shutdown_signal() -> std::io::Result<()> {
-    let mut terminate = tokio::signal::unix::signal(tokio::signal::unix::SignalKind::terminate())?;
-    tokio::select! {
-        result = tokio::signal::ctrl_c() => result,
-        signal = terminate.recv() => signal
-            .map(|_| ())
-            .ok_or_else(|| std::io::Error::other("SIGTERM signal stream closed")),
-    }
-}
-
-#[cfg(not(unix))]
-async fn shutdown_signal() -> std::io::Result<()> {
-    tokio::signal::ctrl_c().await
 }

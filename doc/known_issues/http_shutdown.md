@@ -7,7 +7,7 @@ watchdog и host shutdown deadlines откачены по решению пол�
 ## Текущее поведение
 
 Асинхронный composition root использует штатный Tokio runtime. SIGTERM/SIGINT
-наблюдаются через Tokio; process runtime отменяет общий `CancellationToken` и
+наблюдаются через Tokio; `cqrs_runtime::host` отменяет общий `CancellationToken` и
 ожидает HTTP/outbox. Ошибка supervisor отменяет токен до аварийного drain;
 DropGuard владельца lifecycle тоже сохраняется.
 
@@ -69,6 +69,9 @@ preStop и TERM доставлен своевременно. HTTP/observation/DB
 См. [timeline в README](../../README.md#graceful-shutdown-timeline).
 
 Область: [composition root](../../account-managements-service/src/main.rs),
-[process runtime](../../account-managements-service/src/runtime.rs) и
+[runtime host](../../cqrs-runtime/src/host.rs) и
 [portable runtime guide](../../cqrs-runtime/doc/task_processing.md).
-№11 (блокирующий console sender) остается отдельной задачей.
+Перенос host и согласованная семантика Drop/abort описаны в
+[этапе 3](../backlog/cqrs_runtime_host_lifecycle.md): Drop отменяет token и позволяет
+outbox самостоятельно drain в работающем Tokio runtime, но не гарантирует
+ожидание HTTP и закрытие БД. №11 (блокирующий console sender) остается отдельной задачей.

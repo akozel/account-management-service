@@ -7,6 +7,7 @@ publish = false
 
 [features]
 default = ["postgres", "worker"]
+host = ["worker", "tokio/signal"]
 postgres = ["dep:postgres-es", "dep:sqlx"]
 worker = ["dep:async-channel", "dep:tracing", "dep:tokio-util", "tokio/rt", "tokio/sync"]
 
