@@ -49,7 +49,21 @@ where
             framework_ref.execute(aggregate_id, command.clone())
         })
         .await
-        .map_err(map_aggregate_error)
+        .map_err(|error| {
+            match &error {
+                AggregateError::DatabaseConnectionError(source) => {
+                    crate::diagnostics::log_command_failure(A::TYPE, "connection", source.as_ref())
+                }
+                AggregateError::DeserializationError(source) => {
+                    crate::diagnostics::log_command_failure(A::TYPE, "deserialization", source.as_ref())
+                }
+                AggregateError::UnexpectedError(source) => {
+                    crate::diagnostics::log_command_failure(A::TYPE, "unexpected", source.as_ref())
+                }
+                AggregateError::UserError(_) | AggregateError::AggregateConflict => {}
+            }
+            map_aggregate_error(error)
+        })
     }
 }
 

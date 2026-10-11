@@ -20,11 +20,10 @@ impl Database {
             .unwrap();
         let host = container.get_host().await.unwrap();
         let port = container.get_host_port_ipv4(5432.tcp()).await.unwrap();
-        let pool = PgPoolOptions::new()
-            .max_connections(10)
-            .connect(&format!("postgresql://outbox_test:outbox_test@{host}:{port}/outbox_test"))
-            .await
+        let options = format!("postgresql://outbox_test:outbox_test@{host}:{port}/outbox_test")
+            .parse()
             .unwrap();
+        let pool = cqrs_runtime::postgres::connect_pool(options).await.unwrap();
         sqlx::raw_sql(EVENT_STORE_SCHEMA).execute(&pool).await.unwrap();
         sqlx::raw_sql(TRANSACTIONAL_OUTBOX_SCHEMA).execute(&pool).await.unwrap();
         Self { pool, container }

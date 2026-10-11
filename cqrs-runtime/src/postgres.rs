@@ -1,12 +1,14 @@
 mod command_factory;
 mod event_repository_with_outbox;
 mod outbox_queue;
+mod pool;
 #[cfg(feature = "worker")]
 mod worker_factory;
 
 pub use command_factory::{PostgresCommandConfig, PostgresCommandConfigError, command_executor};
 pub use event_repository_with_outbox::PostgresEventRepositoryWithOutbox;
 pub use outbox_queue::{PostgresOutboxQueue, PostgresOutboxQueueConfig, PostgresOutboxQueueConfigError};
+pub use pool::connect_pool;
 #[cfg(feature = "worker")]
 pub use worker_factory::{PostgresOutboxPreparationError, prepare_outbox_worker};
 

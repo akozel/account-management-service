@@ -21,9 +21,10 @@ Outbox сохраняет bounded drain H+S=21s при defaults H=15s/S=6s. Ег
 abort/observation timer нет. SQL timeout=4s, lease=60s, C=Q=128, poll=1s и
 safety margin=5s сохранены; lease >53s.
 
-После завершения HTTP/outbox main вызывает `pool.close().await`, логирует результат
+После завершения HTTP/outbox binary cleanup вызывает `pool.close().await`; также
+закрывает pool при preparation/bind errors, затем main логирует результат
 и возвращается. Закрытие пула и teardown Tokio также не имеют host timeout.
-`controller.rs`, `config.rs`, системные signal/cancellation/watchdog threads,
+Прежние process controller/config и системные signal/cancellation/watchdog threads,
 `_exit(124)` и `shutdown_timeout` удалены. Настройки `HTTP_SHUTDOWN_GRACE_SECS`,
 `SHUTDOWN_FORCE_TIMEOUT_SECS`, `DB_CLOSE_TIMEOUT_SECS` больше не поддерживаются.
 Цель 28 секунд для выхода всего приложения пока не обеспечена host deadlines.
@@ -75,3 +76,7 @@ preStop и TERM доставлен своевременно. HTTP/observation/DB
 [этапе 3](../backlog/cqrs_runtime_host_lifecycle.md): Drop отменяет token и позволяет
 outbox самостоятельно drain в работающем Tokio runtime, но не гарантирует
 ожидание HTTP и закрытие БД. №11 (блокирующий console sender) остается отдельной задачей.
+
+[Этап 5](../backlog/cqrs_runtime_configuration_logging.md) добавляет проверенный
+startup, fallible logger/pool setup и cleanup при ошибках подготовки/HTTP bind.
+Новый binary config не содержит shutdown deadlines и не закрывает эту known issue.

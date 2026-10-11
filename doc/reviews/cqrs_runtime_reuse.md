@@ -32,7 +32,7 @@ helpers можно перенести после этих изменений. Co
 | 2. Подготовка outbox | Checked OutboxRuntimeConfig, prepared registries и PostgreSQL helper; все C registries проверяются до HTTP и используются workers. 166 tests passed; line coverage 97.97%; обязательные и feature checks прошли. | Выполнено |
 | 3. Lifecycle процесса | [План и реализация](../backlog/cqrs_runtime_host_lifecycle.md): optional host владеет signals/token/spawn/drain; lifecycle tests в runtime, Axum test в сервисе. 176 tests passed; line coverage 97.79%; обязательные и feature checks прошли. | Выполнено |
 | 4. Типизированные tasks | [План и реализация](../backlog/cqrs_runtime_typed_task_adapter.md): boxed typed adapter, три бизнес-handler и borrowed sender context. 187 tests passed; line coverage 97.91%; обязательные и feature checks прошли. | Выполнено |
-| 5. Конфигурация и диагностика | ServiceConfig, fallible pool connection, optional telemetry, private env helpers и safe storage categories; настройки валидируются до подключения БД. | Backlog |
+| 5. Конфигурация и диагностика | [План и реализация](../backlog/cqrs_runtime_configuration_logging.md): ServiceConfig, fallible logger/pool, cleanup и safe storage diagnostics. 201 tests passed; line coverage 97.54%; обязательные и feature checks прошли. | Выполнено |
 | 6. Workspace и CI | Общие dependency versions с сохранением features/optional; compile matrix покрывает независимые runtime features. | Backlog |
 
 Этап 3 использует prepared outbox этапа 2; этап 5 объединяет появившиеся runtime
@@ -54,7 +54,7 @@ configs, а этап 6 проверяет итоговые feature combinations.
 | P2 | [`email_reservation_gateway.rs`](../../account-managements-service/src/infrastructure/cqrs/email_reservation_gateway.rs), [`user_account_gateway.rs`](../../account-managements-service/src/infrastructure/cqrs/user_account_gateway.rs) | Сервисные gateways несут `BuildFramework`, `EventStore` и связанные bounds. Их собственная ответственность гораздо меньше: выбрать aggregate ID и делегировать команду. |
 | P2 | [`main.rs`](../../account-managements-service/src/main.rs), строки 38–45, 83–89 | Некоторые настройки проверяются после подключения БД, startup failures обрабатываются через `expect`. В локальном исходнике `postgres-es::default_postgress_pool` также обнаружен `expect` и фиксированные `max_connections(10)`. |
 | P2 | [`executor.rs`](../../cqrs-runtime/src/command/executor.rs), строки 52–58; [`outbox_queue.rs`](../../cqrs-runtime/src/postgres/outbox_queue.rs), функция `storage_error` | Технические причины сводятся к `Unavailable` без сохранения диагностической категории. Это безопасно для внешнего API, но затрудняет различение недоступной БД, ошибки сериализации и внутренней ошибки записи. |
-| P3 | [`logging.rs`](../../account-managements-service/src/infrastructure/logging.rs) | Настройка tracing полностью универсальна, но принадлежит бизнес-crate. `LogingConfig` — struct без данных с опечаткой в имени; установка subscriber происходит через `.init()`. |
+| P3 | `logging.rs` (исходный service module; перенесен в [runtime logging](../../cqrs-runtime/src/logging.rs)) | Настройка tracing полностью универсальна, но принадлежит бизнес-crate. `LogingConfig` — struct без данных с опечаткой в имени; установка subscriber происходит через `.init()`. |
 
 ## Этап 1. PostgreSQL: готовая сборка командного пути
 
@@ -238,6 +238,14 @@ Application handler tests и их фейки перенесены в service int
 
 ## Этап 5. Конфигурация, logging, диагностика и небольшие helpers
 
+[Сохраненный план и результаты](../backlog/cqrs_runtime_configuration_logging.md).
+По решению пользователя здесь только logger; telemetry/exporters отложены.
+ServiceConfig валидирует URI, numeric bind, Unicode и вложенные budgets до DB.
+Отсутствие dotenv допустимо; прочие ошибки возвращаются. Main сохраняет явный
+business wiring, закрывая pool при preparation/bind/host errors до логирования.
+Default pool limit 10 и LevelFilter semantics сохранены; startup sources
+редактируются в diagnostics без потери оригиналов.
+
 У сервиса появляется небольшой `ServiceConfig`: database URL, bind address и
 вложенные runtime configs. Загрузка dotenv остается действием executable.
 Runtime не должен автоматически читать `.env` или устанавливать subscriber.
@@ -250,7 +258,7 @@ Runtime не должен автоматически читать `.env` или 
 Startup ошибки возвращаются типизированно, без `expect` на пользовательских
 настройках. Constant checked defaults могут сохранять `expect`.
 
-Логирование переносится в optional `telemetry`: `LoggingConfig` с данными,
+Логирование переносится в optional `logging`: `LoggingConfig` с данными,
 `from_lookup` и `try_init`. Сохраняются поддерживаемые сейчас значения RUST_LOG
 (`off/error/warn/info/debug/trace`) и default info. Полный EnvFilter — отдельное
 расширение контракта, а не побочный эффект переноса. `try_init` возвращает ошибку,
@@ -301,7 +309,7 @@ Cargo dependency versions повторяются в двух manifests. Их м�
 
 CI живет в [`.github/workflows/ci.yml`](../../.github/workflows/ci.yml) и проверяет
 all-features. Для переносимости runtime полезна дополнительная compile matrix:
-no-default-features, postgres only, worker only, затем host/telemetry после их
+no-default-features, postgres only, worker only, затем host/logging после их
 добавления. Cargo/CI helpers остаются на уровне repository tooling. Отдельный
 build framework или `build.rs` для этой цели не требуется.
 
@@ -330,5 +338,6 @@ schema, event formats или task payloads.
 checks не подтверждают реализацию; актуальные результаты реализации записаны в документах
 [этапа 1](../backlog/cqrs_runtime_command_factory.md),
 [этапа 2](../backlog/cqrs_runtime_outbox_preparation.md),
-[этапа 3](../backlog/cqrs_runtime_host_lifecycle.md) и
-[этапа 4](../backlog/cqrs_runtime_typed_task_adapter.md).
+[этапа 3](../backlog/cqrs_runtime_host_lifecycle.md),
+[этапа 4](../backlog/cqrs_runtime_typed_task_adapter.md) и
+[этапа 5](../backlog/cqrs_runtime_configuration_logging.md).

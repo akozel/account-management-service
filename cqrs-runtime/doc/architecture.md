@@ -4,6 +4,8 @@ The diagrams describe the PostgreSQL integration with the `worker` feature.
 `cqrs-es` supplies the framework and event store; the host supplies aggregates,
 gateways, handlers, senders, configuration, and inbound adapters. The optional
 `host` feature owns process lifecycle without depending on an HTTP framework.
+Optional `logging` configures only the process logger; base tracing emits safe
+diagnostics without installing a subscriber.
 For the complete delivery, retry, and timeout contract, see
 [Task processing](task_processing.md).
 
@@ -16,7 +18,8 @@ generic executor; the runtime contains no application-domain dependencies.
 ```mermaid
 flowchart TB
     subgraph Host["Host application and domain"]
-        Root["Composition root<br/>business wiring and pool cleanup"]
+        Root["Composition root<br/>checked startup, business wiring and pool cleanup"]
+        Config["ServiceConfig / ServiceError<br/>URI, numeric bind, logger and budgets; redacted sources"]
         Http["HTTP server<br/>graceful shutdown"]
         Stop["CancellationToken<br/>shared process stop request"]
         Gateway["Application / command gateway<br/>command and explicit NewOutboxTask list"]
@@ -27,6 +30,7 @@ flowchart TB
     end
 
     subgraph Runtime["cqrs-runtime: reusable orchestration"]
+        Logger["logging::LoggingConfig<br/>explicit fallible fmt initialization"]
         Lifecycle["host::run / shutdown_signal<br/>signal, cancellation and adapter drain"]
         Executor["CqrsCommandExecutor<br/>bounded optimistic-conflict retry"]
         Preparation["worker::prepare / PreparedOutboxWorker<br/>all C registries checked before HTTP"]
@@ -45,6 +49,7 @@ flowchart TB
     end
 
     subgraph Adapters["cqrs-runtime: PostgreSQL adapters"]
+        Pool["postgres::connect_pool<br/>ten connections; original SQLx errors"]
         CommandFactory["postgres::command_executor<br/>checked snapshot and retry configuration"]
         Repository["PostgresEventRepositoryWithOutbox<br/>atomic event, snapshot and tasks"]
         Queue["PostgresOutboxQueue<br/>claim, token fencing and expired-lease recovery"]
@@ -53,6 +58,10 @@ flowchart TB
     Database[("PostgreSQL<br/>events, snapshots, transactional_outbox")]
     Receiver["External receiver<br/>effect and idempotency enforcement"]
 
+    Root -.->|"dotenv then validate before DB"| Config
+    Root -.->|"explicit init after config"| Logger
+    Root -.->|"checked PgConnectOptions"| Pool
+    Pool -->|"connect"| Database
     Root -.->|"pool and PostgresCommandConfig"| CommandFactory
     CommandFactory -.->|"constructs CommandExecutor"| Executor
     Root -.->|"prepare before binding HTTP"| Preparation
@@ -118,6 +127,39 @@ this same execution engine.
 The two database writers have different jobs: the event repository publishes
 work with an accepted event, while the queue manages delivery ownership.
 Neither worker state nor task settlement advances an aggregate's business phase.
+
+## Startup and caller-owned cleanup
+
+```mermaid
+flowchart TD
+    Env["Executable dotenv loading<br/>missing file allowed; other errors returned"] --> Config["ServiceConfig validation<br/>PostgreSQL URI, numeric SocketAddr, Unicode, log level and budgets"]
+    Config --> Logger["Explicit LoggingConfig::try_init<br/>typed duplicate/initialization error"]
+    Logger --> Pool["postgres::connect_pool<br/>max 10; other SQLx defaults"]
+    Pool --> Wiring["Business wiring and outbox preparation"]
+    Wiring --> Bind["Bind HTTP listener"]
+    Bind --> Host["host::run<br/>inbound and outbox drain"]
+    Wiring -->|"preparation error"| Close["Caller closes pool<br/>before reporting result"]
+    Bind -->|"bind error"| Close
+    Host -->|"success or error"| Close
+    Close --> Report["Log and return original result<br/>safe Display/Debug; source preserved"]
+    Env -->|"error"| Report
+    Config -->|"error"| Report
+    Logger -->|"error"| Report
+    Pool -->|"connection error"| Report
+```
+
+Private binary config/startup modules own settings and pool cleanup; host still
+owns component lifecycle. Startup error reporting never formats raw dotenv lines,
+connection options, URL/password or arbitrary SQLx/I/O causes. Native SQLx PG option
+behavior is preserved. Normal await closes pool on preparation/bind/host errors;
+Drop/abort cannot guarantee cleanup. No pool or host deadline is added. See the
+[startup plan](../../doc/backlog/cqrs_runtime_configuration_logging.md).
+
+The executor logs terminal technical command errors before mapping to Unavailable,
+with execute operation and sanitized aggregate type. SQLx sources are inspected
+without their Display/Debug; queue errors log safe category and operation before
+the source is erased. Only valid SQLSTATE is emitted. Domain/conflict behavior,
+retry ownership and database mappings remain unchanged.
 
 ## Command execution and atomic publication
 
@@ -342,6 +384,7 @@ effect, so its idempotency belongs to the handler/receiver, not to queue fencing
 - [worker](../src/worker.rs): combined configuration, synchronous preparation, bounded admission, JoinSet supervision and permanent worker lifecycle.
 - [postgres](../src/postgres.rs): event repository, queue and canonical SQL assets.
 - [host](../src/host.rs): signal observation, shared cancellation and inbound/outbox lifecycle.
+- [logging](../src/logging.rs): explicit process logger configuration and fallible installation.
 
 `host::run` installs a cancellation guard before outbox spawn on first poll.
 Inbound and signal futures execute within host without `Send`/`'static` bounds.

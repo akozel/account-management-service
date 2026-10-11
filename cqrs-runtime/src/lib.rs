@@ -9,6 +9,12 @@
 #[cfg(feature = "host")]
 pub mod host;
 
+mod diagnostics;
+mod env;
+
+#[cfg(feature = "logging")]
+pub mod logging;
+
 pub mod command;
 pub mod outbox;
 

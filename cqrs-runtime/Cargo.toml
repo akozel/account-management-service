@@ -8,8 +8,9 @@ publish = false
 [features]
 default = ["postgres", "worker"]
 host = ["worker", "tokio/signal"]
+logging = ["dep:tracing-subscriber"]
 postgres = ["dep:postgres-es", "dep:sqlx"]
-worker = ["dep:async-channel", "dep:tracing", "dep:tokio-util", "tokio/rt", "tokio/sync"]
+worker = ["dep:async-channel", "dep:tokio-util", "tokio/rt", "tokio/sync"]
 
 [dependencies]
 async-channel = { version = "2.5.0", optional = true }
@@ -24,7 +25,8 @@ sqlx = { version = "0.8.6", default-features = false, features = ["json", "chron
 thiserror = "2.0.20"
 tokio = { version = "1.53.1", features = ["time", "macros"] }
 tokio-util = { version = "0.7.19", default-features = false, optional = true }
-tracing = { version = "0.1.44", optional = true }
+tracing = "0.1.44"
+tracing-subscriber = { version = "0.3.23", optional = true }
 uuid = { version = "1.26.1", features = ["serde", "v4"] }
 
 [dev-dependencies]

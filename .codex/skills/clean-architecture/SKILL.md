@@ -29,11 +29,44 @@ configuration in this repository.
   never depend on `account-managements-service` or Axum.
 - `main` composes business dependencies and HTTP adapters, passes inbound and
   outbox futures to `cqrs_runtime::host::run`, then closes the database pool
-  regardless of the host result before logging/returning `HostError`.
+  regardless of preparation/bind/host results before logging/returning the
+  binary ServiceError. Private config/startup modules own process configuration,
+  safe error reporting and pool cleanup; host retains component lifecycle.
 - The optional `host` feature enables `worker` and `tokio/signal`. Its facade
   exports `run`, `shutdown_signal`, and `HostError`; private `lifecycle`, `error`,
   and `signal` modules own transport-independent coordination. No service-local
   runtime wrapper or Axum dependency belongs in runtime.
+
+## Startup configuration and diagnostics
+
+Private binary ServiceConfig owns PostgreSQL options, numeric SocketAddr, logger,
+outbox and queue configs. from_env snapshots supported keys, rejects non-Unicode
+values and delegates to injected lookup. Update its key list and .env.example when
+adding settings. Required DATABASE_URL uses postgres/postgresql URI; BIND_ADDRESS
+requires numeric IPv4/IPv6 plus port. Executable dotenv loading allows only missing
+files; other errors are typed. Validate all settings before logger/DB initialization.
+Runtime must never load dotenv or install a subscriber implicitly.
+
+Runtime logging is optional and independent; telemetry is deferred. LoggingConfig
+has private fields, LevelFilter new/default/getter/from_lookup/from_env and try_init.
+Preserve formatter defaults (target false, thread names true) and log bridge.
+Caller-provided PgConnectOptions feed postgres::connect_pool (max 10, other SQLx
+defaults). Service SQLx dependency is production; no direct postgres-es adapter
+construction or connection helper belongs in service code.
+
+Startup errors retain sources but Display/Debug/logging must hide PgConnectOptions
+credentials, URL, dotenv lines and arbitrary SQLx/I/O source text. Global logger
+setup tests live in an isolated integration executable. Normal await closes the
+pool after work (including preparation/bind/host errors), before reporting the
+original result. No host/pool deadline or Drop cleanup guarantee is added.
+
+Technical command failures log fixed category, execute operation and safe aggregate
+type before mapping to Unavailable. Domain/conflict handling stays unchanged.
+PostgreSQL diagnostics classify SQLx sources before they are discarded, emitting
+only fixed categories and valid five-character uppercase/digit SQLSTATE. Never
+format raw errors, SQL detail/query/constraint, command/task payload/metadata,
+aggregate ID/email or connection URL. Private diagnostics/env helpers have no
+public facade; keep retries, per-config ranges/errors and backoff ownership intact.
 
 ## Application feature layout
 
@@ -181,9 +214,11 @@ account-managements-service/src/
   concrete adapter through its technology path.
 - Runtime diagnostics use structured `tracing` events at the adapter boundary
   that observes the outcome; do not write directly with `println!`, `eprintln!`,
-  or process-global stdout/stderr handles. `infrastructure::logging` owns the
-  subscriber and logging-backed outbound adapters, while `main` only installs
-  it. The default level is `info`, configurable through `RUST_LOG`. Keep domain
+  or process-global stdout/stderr handles. Runtime's optional `logging` facade
+  owns LoggingConfig and explicit fallible subscriber installation; the binary
+  installs it after validating all settings. The base tracing dependency emits
+  diagnostics without installing anything. Default level is info; preserve
+  LevelFilter aliases and parsing for RUST_LOG, without EnvFilter. Keep domain
   code free of logging and never include outbox payloads or secrets in failure
   events.
 - `main` is the only composition root. It calls the runtime's checked PostgreSQL

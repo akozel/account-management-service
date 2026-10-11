@@ -40,19 +40,20 @@ impl PostgresOutboxQueue {
         })
     }
 
-    async fn begin_queue_transaction(&self) -> Result<Transaction<'_, Postgres>, OutboxError> {
-        let mut tx = self.pool.begin().await.map_err(storage_error)?;
+    async fn begin_queue_transaction(&self, operation: &'static str) -> Result<Transaction<'_, Postgres>, OutboxError> {
+        let mut tx = self.pool.begin().await.map_err(|error| storage_error(error, operation))?;
         // Transaction-local settings never change the shared pool's session defaults.
         sqlx::query("SELECT set_config('statement_timeout', $1, true)")
             .bind(self.statement_timeout.as_millis().to_string())
             .execute(&mut *tx)
             .await
-            .map_err(storage_error)?;
+            .map_err(|error| storage_error(error, operation))?;
         Ok(tx)
     }
 }
 
-fn storage_error(_: sqlx::Error) -> OutboxError {
+fn storage_error(error: sqlx::Error, operation: &'static str) -> OutboxError {
+    crate::diagnostics::log_sqlx_failure(operation, &error);
     OutboxError::Unavailable
 }
 
@@ -80,7 +81,7 @@ impl OutboxQueue for PostgresOutboxQueue {
             .checked_add(lease_duration)
             .ok_or(QueueRequestError::InvalidLeaseDuration)?;
         let limit = i64::try_from(limit).map_err(|_| OutboxError::from(QueueRequestError::InvalidLimit))?;
-        let mut tx = self.begin_queue_transaction().await?;
+        let mut tx = self.begin_queue_transaction("claim").await?;
         let rows = sqlx::query(
             r#"
             WITH ready AS (
@@ -104,30 +105,33 @@ impl OutboxQueue for PostgresOutboxQueue {
         .bind(milliseconds(lease_duration, QueueRequestError::InvalidLeaseDuration)?)
         .fetch_all(&mut *tx)
         .await
-        .map_err(storage_error)?;
+        .map_err(|error| storage_error(error, "claim"))?;
         let tasks = rows
             .into_iter()
             .map(|row| {
                 let delivery = TaskDelivery::new(
-                    row.try_get("id").map_err(storage_error)?,
+                    row.try_get("id").map_err(|error| storage_error(error, "claim"))?,
                     format.clone(),
-                    row.try_get("payload").map_err(storage_error)?,
-                    row.try_get("metadata").map_err(storage_error)?,
-                    row.try_get("attempts").map_err(storage_error)?,
+                    row.try_get("payload").map_err(|error| storage_error(error, "claim"))?,
+                    row.try_get("metadata").map_err(|error| storage_error(error, "claim"))?,
+                    row.try_get("attempts").map_err(|error| storage_error(error, "claim"))?,
                 )
                 .map_err(|_| QueueRequestError::InvalidDelivery)?;
                 Ok(ClaimedTask::new(
                     delivery,
-                    ClaimLease::new(row.try_get("lock_token").map_err(storage_error)?, lease_deadline),
+                    ClaimLease::new(
+                        row.try_get("lock_token").map_err(|error| storage_error(error, "claim"))?,
+                        lease_deadline,
+                    ),
                 ))
             })
             .collect::<Result<Vec<_>, OutboxError>>()?;
-        tx.commit().await.map_err(storage_error)?;
+        tx.commit().await.map_err(|error| storage_error(error, "claim"))?;
         Ok(tasks)
     }
 
     async fn settle(&self, task: &ClaimedTask, request: SettlementRequest) -> Result<SettlementResult, OutboxError> {
-        let mut tx = self.begin_queue_transaction().await?;
+        let mut tx = self.begin_queue_transaction("settle").await?;
         let failure_cause = match &request {
             SettlementRequest::Completed => None,
             SettlementRequest::Retry { .. } => Some(TaskFailureCause::AttemptLimitReached),
@@ -148,12 +152,12 @@ impl OutboxQueue for PostgresOutboxQueue {
             RETURNING status
         "#).bind(task.delivery().id()).bind(task.lease().lock_token()).bind(status).bind(milliseconds(delay, QueueRequestError::InvalidRetryDelay)?)
             .bind(error.map(|e| e.chars().take(2048).collect::<String>()))
-            .fetch_optional(&mut *tx).await.map_err(storage_error)?;
-        tx.commit().await.map_err(storage_error)?;
+            .fetch_optional(&mut *tx).await.map_err(|error| storage_error(error, "settle"))?;
+        tx.commit().await.map_err(|error| storage_error(error, "settle"))?;
         let Some(row) = row else {
             return Ok(SettlementResult::OwnershipLost);
         };
-        let status: String = row.try_get("status").map_err(storage_error)?;
+        let status: String = row.try_get("status").map_err(|error| storage_error(error, "settle"))?;
         match status.as_str() {
             "completed" => Ok(SettlementResult::Completed),
             "pending" => Ok(SettlementResult::RetryScheduled),
@@ -168,7 +172,7 @@ impl OutboxQueue for PostgresOutboxQueue {
     }
 
     async fn recover_expired(&self, limit: usize) -> Result<LeaseRecoveryReport, OutboxError> {
-        let mut tx = self.begin_queue_transaction().await?;
+        let mut tx = self.begin_queue_transaction("recover_expired").await?;
         let rows = sqlx::query(
             r#"
             SELECT id, task_type, task_version, attempts, max_attempts FROM transactional_outbox
@@ -179,12 +183,16 @@ impl OutboxQueue for PostgresOutboxQueue {
         .bind(i64::try_from(limit).map_err(|_| OutboxError::from(QueueRequestError::InvalidLimit))?)
         .fetch_all(&mut *tx)
         .await
-        .map_err(storage_error)?;
+        .map_err(|error| storage_error(error, "recover_expired"))?;
         let mut failed = Vec::new();
         for row in &rows {
-            let id: uuid::Uuid = row.try_get("id").map_err(storage_error)?;
-            let attempt: i32 = row.try_get("attempts").map_err(storage_error)?;
-            let max_attempts: i32 = row.try_get("max_attempts").map_err(storage_error)?;
+            let id: uuid::Uuid = row.try_get("id").map_err(|error| storage_error(error, "recover_expired"))?;
+            let attempt: i32 = row
+                .try_get("attempts")
+                .map_err(|error| storage_error(error, "recover_expired"))?;
+            let max_attempts: i32 = row
+                .try_get("max_attempts")
+                .map_err(|error| storage_error(error, "recover_expired"))?;
             sqlx::query(
                 r#"
                 UPDATE transactional_outbox
@@ -202,13 +210,15 @@ impl OutboxQueue for PostgresOutboxQueue {
             )?)
             .execute(&mut *tx)
             .await
-            .map_err(storage_error)?;
+            .map_err(|error| storage_error(error, "recover_expired"))?;
             if attempt >= max_attempts {
                 failed.push(TaskFailure {
                     id,
                     format: TaskFormat::new(
-                        row.try_get::<String, _>("task_type").map_err(storage_error)?,
-                        row.try_get("task_version").map_err(storage_error)?,
+                        row.try_get::<String, _>("task_type")
+                            .map_err(|error| storage_error(error, "recover_expired"))?,
+                        row.try_get("task_version")
+                            .map_err(|error| storage_error(error, "recover_expired"))?,
                     )
                     .map_err(|_| QueueRequestError::InvalidDelivery)?,
                     attempt,
@@ -216,7 +226,7 @@ impl OutboxQueue for PostgresOutboxQueue {
                 });
             }
         }
-        tx.commit().await.map_err(storage_error)?;
+        tx.commit().await.map_err(|error| storage_error(error, "recover_expired"))?;
         Ok(LeaseRecoveryReport::new(rows.len() - failed.len(), failed))
     }
 }
@@ -224,6 +234,37 @@ impl OutboxQueue for PostgresOutboxQueue {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[tokio::test]
+    async fn unavailable_queue_logs_operation_and_cause_before_erasing_source() {
+        let pool = sqlx::postgres::PgPoolOptions::new()
+            .connect_lazy("postgres://localhost/unused")
+            .unwrap();
+        pool.close().await;
+        let queue = PostgresOutboxQueue::new(pool);
+        let task = crate::outbox::test_support::claimed();
+        let (_, log) = crate::diagnostics::test_support::capture(async {
+            assert_eq!(
+                queue
+                    .claim(task.delivery().format(), "private_owner", 1, Duration::from_secs(60))
+                    .await
+                    .unwrap_err(),
+                OutboxError::Unavailable
+            );
+            assert_eq!(
+                queue.settle(&task, SettlementRequest::Completed).await.unwrap_err(),
+                OutboxError::Unavailable
+            );
+            assert_eq!(queue.recover_expired(1).await.unwrap_err(), OutboxError::Unavailable);
+        })
+        .await;
+        assert_eq!(log.matches("storage operation failed").count(), 3);
+        for operation in ["claim", "settle", "recover_expired"] {
+            assert!(log.contains(operation));
+        }
+        assert!(log.contains("pool_closed"));
+        assert!(!log.contains("private_"));
+    }
 
     #[tokio::test]
     async fn statement_timeout_config_validates_defaults_overrides_and_server_range() {

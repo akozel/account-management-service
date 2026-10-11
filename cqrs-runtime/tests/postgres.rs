@@ -47,6 +47,8 @@ use uuid::Uuid;
 mod command_factory;
 #[path = "postgres/persistence.rs"]
 mod persistence;
+#[path = "postgres/pool.rs"]
+mod pool;
 #[path = "postgres/processing.rs"]
 mod processing;
 #[path = "postgres/queue.rs"]

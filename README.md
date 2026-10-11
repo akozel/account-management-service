@@ -65,7 +65,7 @@ The repository is a Cargo workspace with two packages:
   supervision without depending on the account-management domain.
 
 `cqrs-runtime` enables its `postgres` and `worker` features by default; the service
-explicitly enables `host` for signals and lifecycle coordination. Minimal
+explicitly enables `host` for lifecycle coordination and `logging` for logger setup. Minimal
 consumers can opt into only the portable contracts with
 `default-features = false`. The domain continues to implement the upstream
 `cqrs-es::Aggregate` and `DomainEvent` traits directly.
@@ -270,6 +270,20 @@ cp account-managements-service/.env.example .env
 cargo build --release
 ./target/release/account-managements-service
 ```
+
+Service startup validates every supported env setting before logger setup and
+PostgreSQL connection. `DATABASE_URL` is a required PostgreSQL URI; `BIND_ADDRESS`
+is required numeric IPv4/IPv6 plus port (hostname is no longer supported). A missing
+`.env` is allowed, while malformed/unreadable dotenv files return safe startup
+errors. RUST_LOG keeps its LevelFilter parser (default info, aliases 0–5,
+case-insensitive names, empty value error); EnvFilter directives are rejected.
+
+The runtime `logging` feature configures only the process logger, with explicit
+fallible installation. PostgreSQL connects through the runtime helper with ten
+connections and other SQLx defaults. Preparation, bind and host errors close the
+pool before reporting the original failure. Startup diagnostics redact secrets
+and preserve sources. See the
+[startup plan and checks](doc/backlog/cqrs_runtime_configuration_logging.md).
 
 ## Graceful shutdown timeline
 

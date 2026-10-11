@@ -103,11 +103,8 @@ impl OutboxWorkerPoolConfig {
     }
     pub fn from_lookup(mut lookup: impl FnMut(&str) -> Option<String>) -> Result<Self, OutboxWorkerPoolConfigError> {
         let mut read_u64 = |name, default| {
-            lookup(name)
-                .map(|value| value.parse::<u64>())
-                .transpose()
+            crate::env::read_u64(&mut lookup, name, default)
                 .map_err(|_| OutboxWorkerPoolConfigError::InvalidEnvironmentValue(name))
-                .map(|value| value.unwrap_or(default))
         };
         Self::new(
             usize::try_from(read_u64("OUTBOX_WORKER_CONCURRENCY", 128)?)

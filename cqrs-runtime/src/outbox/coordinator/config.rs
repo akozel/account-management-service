@@ -32,11 +32,8 @@ impl OutboxTaskCoordinatorConfig {
         Self::from_lookup(|name| std::env::var(name).ok())
     }
     pub fn from_lookup(mut lookup: impl FnMut(&str) -> Option<String>) -> Result<Self, OutboxTaskCoordinatorConfigError> {
-        let millis = lookup("OUTBOX_STORAGE_TIMEOUT_MS")
-            .map(|value| value.parse::<u64>())
-            .transpose()
-            .map_err(|_| OutboxTaskCoordinatorConfigError::InvalidEnvironmentValue)?
-            .unwrap_or(6_000);
+        let millis = crate::env::read_u64(&mut lookup, "OUTBOX_STORAGE_TIMEOUT_MS", 6_000)
+            .map_err(|_| OutboxTaskCoordinatorConfigError::InvalidEnvironmentValue)?;
         Self::new(Duration::from_millis(millis))
     }
     pub fn validate(&self) -> Result<(), OutboxTaskCoordinatorConfigError> {

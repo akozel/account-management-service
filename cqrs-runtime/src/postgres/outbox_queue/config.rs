@@ -32,11 +32,8 @@ impl PostgresOutboxQueueConfig {
         Self::from_lookup(|name| std::env::var(name).ok())
     }
     pub fn from_lookup(mut lookup: impl FnMut(&str) -> Option<String>) -> Result<Self, PostgresOutboxQueueConfigError> {
-        let millis = lookup("OUTBOX_POSTGRES_STATEMENT_TIMEOUT_MS")
-            .map(|value| value.parse::<u64>())
-            .transpose()
-            .map_err(|_| PostgresOutboxQueueConfigError::InvalidEnvironmentValue)?
-            .unwrap_or(4_000);
+        let millis = crate::env::read_u64(&mut lookup, "OUTBOX_POSTGRES_STATEMENT_TIMEOUT_MS", 4_000)
+            .map_err(|_| PostgresOutboxQueueConfigError::InvalidEnvironmentValue)?;
         Self::new(Duration::from_millis(millis))
     }
     pub fn validate(&self) -> Result<(), PostgresOutboxQueueConfigError> {

@@ -231,6 +231,46 @@ it does not guarantee timely execution after panic, scheduler pauses, or storage
 failures. Original per-delivery deadline checks still apply. Larger queues require
 longer leases or higher concurrency; skipped invocations still consume attempts.
 
+## Service startup and logging
+
+Service settings are owned by the binary's `ServiceConfig`; runtime configs keep
+their own checked constructors, defaults and boundary errors. The executable loads
+optional dotenv (missing file is allowed, other errors returned), snapshots its
+supported env keys, rejects non-Unicode values and validates PostgreSQL URI,
+numeric IPv4/IPv6 bind address, logging level and all budgets before DB connection.
+It installs `logging::LoggingConfig` only after config validation, connects with
+`postgres::connect_pool` (ten connections, other SQLx defaults), prepares all
+registries and binds HTTP before starting host. Constructors with no `from_env`
+read no environment. The private shared integer parser preserves per-config units,
+validation, defaults and error variants; it adds no public utility API.
+
+Optional `logging` is independent of postgres/worker/host; only the service opts
+in by default. `LoggingConfig::new(LevelFilter)` and Default (info) install nothing.
+`from_lookup` / `from_env` preserve RUST_LOG's LevelFilter parser: off/error/warn/
+info/debug/trace, case-insensitive aliases, 0–5 and empty string (error). Absent
+RUST_LOG means info. `try_init` explicitly installs fmt (no target, thread names)
+and returns a typed error on duplicate/failed global setup. The source is retained;
+its implicit formatting is safe. No metrics, tracing exporter or telemetry feature
+is introduced. Runtime event emission uses base tracing independently of setup.
+
+Startup errors preserve original sources but redact connection options, URLs,
+passwords, dotenv lines and arbitrary source text in Display/Debug/logs. The caller
+closes its pool after successful host drain and also after preparation or bind
+failure; it returns/logs the original error only after cleanup. Normal await
+preserves this order; Drop/abort cannot guarantee asynchronous cleanup. Inbound
+and pool cleanup keep their current unbounded policy.
+
+Command technical failures are logged once before being mapped to Unavailable,
+with operation execute, sanitized aggregate type, framework category and available
+SQLx classification. Domain/conflict behavior and retries are unchanged. Queue
+errors log category and operation claim/settle/recover_expired before losing their
+SQLx source in OutboxError::Unavailable; connect errors also get safe diagnostics.
+Only valid five-character uppercase/digit SQLSTATE is emitted. Fixed categories
+are io/tls/database/pool_timeout/pool_closed/decode/configuration/other. Never
+format commands, payload/metadata, aggregate ID/email, URL, raw errors or database
+message/detail/query/constraint. Worker summary events remain separate.
+See the [startup plan](../../doc/backlog/cqrs_runtime_configuration_logging.md).
+
 ## Worker lifecycle and bounded admission
 
 Every permanent Tokio worker owns one mutable handler registry and performs one

@@ -16,9 +16,71 @@ responsibilities and Mermaid diagrams of command publication and task delivery.
 - `postgres`: checked command factory, event repository, queue, and canonical SQL assets.
 - `worker`: JoinSet-supervised permanent Tokio workers, a bounded async-channel queue, and shutdown draining.
 - `host`: process signals, shared cancellation and inbound/outbox draining; enables `worker` and `tokio/signal`, with no HTTP framework dependency.
+- `logging`: explicit fmt logger configuration and fallible installation; independent of other optional features.
 
-`postgres` and `worker` are enabled by default; `host` is opt-in. Use
+`postgres` and `worker` are enabled by default; `host` and `logging` are opt-in.
+The base crate emits structured `tracing` diagnostics; callers choose the subscriber. Use
 `default-features = false` when only the base contracts are needed.
+
+## Startup and logger integration
+
+The application owns dotenv loading and service settings. In this service, the
+binary snapshots supported env keys, rejects non-Unicode values, requires
+`DATABASE_URL` and numeric IPv4/IPv6 `BIND_ADDRESS`, and validates all runtime
+settings before installing its logger or connecting to PostgreSQL. Missing `.env`
+is allowed; other dotenv errors stop startup. No library import installs a
+subscriber or loads `.env`.
+
+With `features = ["logging"]`, `logging::LoggingConfig` owns a checked
+`tracing::level_filters::LevelFilter`. `new` and `Default` read no environment;
+`from_lookup` and `from_env` explicitly load `RUST_LOG`, defaulting to `info` when
+absent. Names are case-insensitive; numeric aliases 0–5 and empty input (`error`)
+retain the original LevelFilter parser. EnvFilter directives are rejected.
+
+```rust,no_run
+use cqrs_runtime::logging::LoggingConfig;
+
+let config = LoggingConfig::from_env()?;
+config.try_init()?;
+# Ok::<(), Box<dyn std::error::Error>>(())
+```
+
+`try_init` explicitly installs the fmt subscriber with target disabled and thread
+names enabled, preserving the other formatting defaults and log compatibility
+bridge. It returns `LoggingInitError` if installation fails, including an existing
+global subscriber/logger; the original `TryInitError` is retained as source with
+safe Display/Debug. This feature installs only a logger.
+
+With `postgres`, `postgres::connect_pool(PgConnectOptions)` returns
+`Result<PgPool, sqlx::Error>`, using ten connections and other SQLx defaults.
+Parse options before logger setup and connection; the helper accepts ready
+options, adds no custom retry policy, and returns the original connection error.
+`PgConnectOptions` contains credentials in Debug: callers must redact it and SQLx
+error text in their own startup reporting, as the service's private config/error
+modules do. Driver PG environment/pgpass option behavior remains SQLx's.
+
+After successful connection, the service awaits all setup/host work and closes
+the pool on success or preparation/bind/host error before logging the result.
+Cleanup still has no timeout; Drop/abort cannot guarantee it. See the
+[startup implementation plan](../doc/backlog/cqrs_runtime_configuration_logging.md).
+
+### Safe technical failure diagnostics
+
+The command executor emits one error event for a terminal technical failure
+before mapping it to `Unavailable`: operation `execute`, sanitized aggregate
+type, and framework category `connection`, `deserialization` or `unexpected`.
+Domain rejections and optimistic conflicts keep their original classification
+and retry policy without these error events. PostgreSQL source chains can add
+fixed storage category and SQLSTATE.
+
+The PostgreSQL adapter emits operation `connect`, `claim`, `settle` or
+`recover_expired` and a fixed storage category: `io`, `tls`, `database`,
+`pool_timeout`, `pool_closed`, `decode`, `configuration`, or `other`. Database codes
+are emitted only when they are five uppercase ASCII letters/digits. Aggregate
+types use ASCII letters/digits/underscore, otherwise `unknown` for diagnostics.
+Error text, database message/detail/query/constraint, command, task payload,
+metadata, aggregate ID/email and connection URL are omitted. Existing worker
+summary events remain; public errors and unknown commit semantics are unchanged.
 
 ## Command integration
 
@@ -261,7 +323,7 @@ receiver's idempotency window.
 
 ## Code organization and validated APIs
 
-The public namespaces are `command`, `outbox`, `postgres`, `worker`, and `host`;
+The public namespaces are `command`, `outbox`, `postgres`, `worker`, `host`, and `logging`;
 their child modules are private implementation details. Command execution and
 conflict retry are separate. Outbox modules group wire data, delivery/ownership,
 handler routing, queue transitions, and coordination. The worker groups combined config, startup preparation,

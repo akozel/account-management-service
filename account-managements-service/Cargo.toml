@@ -10,11 +10,10 @@ axum = "0.8.9"
 base64 = "0.22.1"
 chrono = { version = "0.4.45", features = ["serde"] }
 cqrs-es = "0.5.0"
-cqrs-runtime = { path = "../cqrs-runtime", features = ["host"] }
+cqrs-runtime = { path = "../cqrs-runtime", features = ["host", "logging"] }
 dotenvy = "0.15.7"
 email_address = "0.2.9"
 hex = "0.4.3"
-postgres-es = "0.5.0"
 percent-encoding = "2.3.2"
 rand = "0.10.2"
 serde = { version = "1.0.229", features = ["derive"] }
@@ -24,11 +23,12 @@ thiserror = "2.0.20"
 tokio = { version = "1.53.1", features = ["macros", "net", "rt-multi-thread", "sync", "time"] }
 tokio-util = { version = "0.7.19", default-features = false }
 tracing = "0.1.44"
-tracing-subscriber = { version = "0.3.23", features = ["env-filter"] }
 uuid = { version = "1.26.1", features = ["serde", "v4"] }
 
-[dev-dependencies]
 sqlx = { version = "0.8.6", default-features = false, features = ["json", "chrono", "uuid", "postgres", "runtime-tokio-rustls"] }
+
+[dev-dependencies]
+tracing-subscriber = { version = "0.3.23" }
 testcontainers = "0.28.0"
 tokio = { version = "1.53.1", features = ["sync", "time", "test-util", "io-util"] }
 tower = { version = "0.5.3", features = ["util"] }

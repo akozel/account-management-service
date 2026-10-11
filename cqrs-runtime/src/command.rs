@@ -349,6 +349,76 @@ mod tests {
         }
     }
 
+    #[tokio::test]
+    async fn executor_logs_technical_failure_once_and_suppresses_domain_and_conflict_failures() {
+        let (_, log) = crate::diagnostics::test_support::capture(async {
+            for error in [
+                || AggregateError::DatabaseConnectionError(Box::new(io::Error::other("private_connection"))),
+                || AggregateError::DeserializationError(Box::new(io::Error::other("private_json"))),
+                || AggregateError::UnexpectedError(Box::new(io::Error::other("private_unexpected"))),
+            ] {
+                let executor = CqrsCommandExecutor::<DummyAggregate, _>::new(
+                    move |_| {
+                        CqrsFramework::new(
+                            DummyStore {
+                                commits: Arc::default(),
+                                conflicts: 0,
+                                load_error: Some(error),
+                            },
+                            vec![],
+                            Arc::default(),
+                        )
+                    },
+                    no_delay_policy(3),
+                );
+                assert_eq!(
+                    executor
+                        .execute(
+                            "private_id@example.com",
+                            DummyCommand::Record("private_command".into()),
+                            vec![]
+                        )
+                        .await,
+                    Err(CommandGatewayError::Unavailable)
+                );
+            }
+            let commits = Arc::new(AtomicUsize::new(0));
+            let count = commits.clone();
+            let executor = CqrsCommandExecutor::<DummyAggregate, _>::new(
+                move |_| {
+                    CqrsFramework::new(
+                        DummyStore {
+                            commits: count.clone(),
+                            conflicts: usize::MAX,
+                            load_error: None,
+                        },
+                        vec![],
+                        Arc::default(),
+                    )
+                },
+                no_delay_policy(3),
+            );
+            assert_eq!(
+                executor.execute("private_id", DummyCommand::Reject, vec![]).await,
+                Err(CommandGatewayError::Domain(DummyError))
+            );
+            assert_eq!(
+                executor
+                    .execute("private_id", DummyCommand::Record("private_command".into()), vec![])
+                    .await,
+                Err(CommandGatewayError::Conflict)
+            );
+            assert_eq!(commits.load(Ordering::SeqCst), 3);
+        })
+        .await;
+        assert_eq!(log.matches("command execution failed").count(), 3);
+        assert!(log.contains("aggregate_type=\"dummy\""));
+        for category in ["connection", "deserialization", "unexpected"] {
+            assert!(log.contains(category));
+        }
+        assert!(!log.contains("private_"));
+    }
+
     #[test]
     fn maps_every_framework_error_category() {
         assert_eq!(
