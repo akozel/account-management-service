@@ -28,7 +28,8 @@ flowchart TB
 
     subgraph Runtime["cqrs-runtime: reusable orchestration"]
         Executor["CqrsCommandExecutor<br/>bounded optimistic-conflict retry"]
-        Supervisor["worker::run<br/>polling, capacity, restarts, shutdown"]
+        Preparation["worker::prepare / PreparedOutboxWorker<br/>all C registries checked before HTTP"]
+        Supervisor["prepared.run / worker::run<br/>shared polling, restarts, shutdown"]
         Channel["Bounded async-channel queue<br/>Q waiting deliveries"]
         Slot["Permanent Tokio worker<br/>one registry; one in-flight delivery"]
         JoinSet["JoinSet<br/>worker lifecycle, restart and abort"]
@@ -52,7 +53,8 @@ flowchart TB
 
     Root -.->|"pool and PostgresCommandConfig"| CommandFactory
     CommandFactory -.->|"constructs CommandExecutor"| Executor
-    Root -.->|"starts"| Supervisor
+    Root -.->|"prepare before binding HTTP"| Preparation
+    Preparation -.->|"owns checked handlers; run consumes"| Supervisor
     Root -.->|"creates shared token"| Stop
     Root -.->|"starts"| Lifecycle
     Root -.->|"constructs"| Http
@@ -73,7 +75,8 @@ flowchart TB
     Channel -->|"dequeue; Notify available capacity"| Slot
     Supervisor -.->|"observe exit / restart"| JoinSet
     JoinSet -.->|"owns C worker tasks"| Slot
-    Supervisor -.->|"calls on start / restart"| Factory
+    Preparation -.->|"calls C times before admission"| Factory
+    Supervisor -.->|"calls on restart"| Factory
     Factory -.->|"constructs per worker"| Registry
     Slot -.->|"owns mutable registry"| Registry
     Slot -->|"execute_and_settle"| Coordinator
@@ -86,6 +89,15 @@ flowchart TB
     Queue -.->|"implements"| QueuePort
     Queue -->|"separate queue transactions"| Database
 ```
+
+`OutboxRuntimeConfig` checks coordinator/worker budgets at construction or env
+load time. PostgreSQL statement timeout remains adapter configuration.
+`prepare_outbox_worker` constructs the queue and delegates to `worker::prepare`,
+without SQL or background tasks. Exactly C registries are retained, including the
+first used for ordered format discovery. Errors/drop release prepared handlers;
+no cancellation token exists in the prepared object. A polled run binds the host's
+token with DropGuard. Low-level run retains custom coordinator support and uses
+this same execution engine.
 
 The two database writers have different jobs: the event repository publishes
 work with an accepted event, while the queue manages delivery ownership.
@@ -206,7 +218,8 @@ sequenceDiagram
     end
     participant Receiver as External receiver
 
-    Note over Supervisor,Registry: Startup: validate lease budget, factory builds and validates each registry
+    Note over Supervisor,Registry: Before HTTP: combined config validates budget; prepare builds C registries
+    Note over Supervisor,Registry: run uses those same registries; low-level run shares the engine
     Note over Supervisor,Slot: JoinSet observes exits; replace one worker with a fresh checked registry
     Supervisor->>Supervisor: Polling tick
     Supervisor->>Coordinator: recover_expired(min(worker count, 32))
@@ -302,5 +315,5 @@ effect, so its idempotency belongs to the handler/receiver, not to queue fencing
 - [command](../src/command.rs): executor and optimistic-conflict policy.
 - [outbox](../src/outbox.rs): delivery/lease types, registry, queue contracts,
   execution budgets, settlement requests/results.
-- [worker](../src/worker.rs): configuration, bounded admission, JoinSet supervision and permanent worker lifecycle.
+- [worker](../src/worker.rs): combined configuration, synchronous preparation, bounded admission, JoinSet supervision and permanent worker lifecycle.
 - [postgres](../src/postgres.rs): event repository, queue and canonical SQL assets.

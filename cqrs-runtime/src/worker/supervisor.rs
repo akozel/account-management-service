@@ -36,7 +36,7 @@ pub enum WorkerPoolError {
     HandlerFormatsMismatch { worker_index: usize },
 }
 
-fn checked_handler(
+pub(super) fn checked_handler(
     factory: &HandlerRegistryFactory,
     formats: &[TaskFormat],
     worker_index: usize,
@@ -110,6 +110,22 @@ pub async fn run(
     let handlers = (0..config.concurrency())
         .map(|index| checked_handler(&factory, &formats, index))
         .collect::<Result<Vec<_>, _>>()?;
+    run_prepared(coordinator, factory, config, handlers, shutdown).await
+}
+
+/// Shared execution engine for ready registries and the low-level entry point.
+pub(super) async fn run_prepared(
+    coordinator: Arc<dyn OutboxTaskCoordinator>,
+    factory: HandlerRegistryFactory,
+    config: OutboxWorkerPoolConfig,
+    handlers: Vec<TaskHandlerRegistry>,
+    shutdown: CancellationToken,
+) -> Result<(), WorkerPoolError> {
+    let _cancel_on_exit = shutdown.clone().drop_guard();
+    if shutdown.is_cancelled() {
+        return Ok(());
+    }
+    let formats = coordinator.formats();
     let owner = Uuid::new_v4().to_string();
     let (sender, receiver) = async_channel::bounded(config.queue_capacity());
     let available = Arc::new(Notify::new());
@@ -618,21 +634,35 @@ mod tests {
         OutboxWorkerPoolConfig::new(c, q, poll, Duration::from_secs(30), Duration::from_secs(120)).unwrap()
     }
 
+    fn prepared_worker(
+        queue: Arc<dyn OutboxQueue>,
+        factory: HandlerRegistryFactory,
+        config: OutboxWorkerPoolConfig,
+    ) -> super::super::PreparedOutboxWorker {
+        super::super::prepare(
+            queue,
+            factory,
+            super::super::OutboxRuntimeConfig::new(OutboxTaskCoordinatorConfig::default(), config).unwrap(),
+        )
+        .unwrap()
+    }
+
     #[tokio::test]
     async fn bounded_admission_is_independent_of_concurrency_and_shutdown_leaves_queue_for_recovery() {
         for (c, q) in [(2, 3), (2, 1), (3, 1)] {
             let queue = Arc::new(Queue::default());
             queue.incoming.lock().unwrap().extend((0..20).map(|_| claimed()));
             let probe = Arc::new(IoProbe::default());
-            let coordinator = outbox_task_coordinator(queue.clone(), vec![format()]);
             let shutdown = CancellationToken::new();
             let stop = shutdown.clone();
-            let pool = tokio::spawn(super::run(
-                coordinator,
-                io_factory(probe.clone()),
-                worker_config(c, q, Duration::from_millis(2)),
-                shutdown,
-            ));
+            let pool = tokio::spawn(
+                prepared_worker(
+                    queue.clone(),
+                    io_factory(probe.clone()),
+                    worker_config(c, q, Duration::from_millis(2)),
+                )
+                .run(shutdown),
+            );
             wait_until(|| probe.active.load(Ordering::SeqCst) == c && queue.incoming.lock().unwrap().len() == 20 - c - q).await;
             assert_eq!(probe.built.load(Ordering::SeqCst), c);
             assert_eq!(probe.peak.load(Ordering::SeqCst), c);
@@ -768,13 +798,15 @@ mod tests {
         });
         let shutdown = CancellationToken::new();
         let stop = shutdown.clone();
-        let pool = tokio::spawn(super::run(
-            outbox_task_coordinator(queue.clone(), vec![format()]),
-            factory,
-            // More deliveries than C+Q exercises batch admission and Notify refill.
-            worker_config(16, 32, Duration::from_secs(3600)),
-            shutdown,
-        ));
+        let pool = tokio::spawn(
+            prepared_worker(
+                queue.clone(),
+                factory,
+                // More deliveries than C+Q exercises batch admission and Notify refill.
+                worker_config(16, 32, Duration::from_secs(3600)),
+            )
+            .run(shutdown),
+        );
         wait_until(|| queue.outcomes.lock().unwrap().len() >= expected.len()).await;
         stop.cancel();
         tokio::time::timeout(Duration::from_secs(5), pool)
@@ -805,12 +837,14 @@ mod tests {
         let probe = Arc::new(IoProbe::default());
         let shutdown = CancellationToken::new();
         let stop = shutdown.clone();
-        let pool = tokio::spawn(super::run(
-            outbox_task_coordinator(queue.clone(), vec![format()]),
-            io_factory(probe.clone()),
-            worker_config(1000, 1000, Duration::from_millis(2)),
-            shutdown,
-        ));
+        let pool = tokio::spawn(
+            prepared_worker(
+                queue.clone(),
+                io_factory(probe.clone()),
+                worker_config(1000, 1000, Duration::from_millis(2)),
+            )
+            .run(shutdown),
+        );
         wait_until(|| probe.active.load(Ordering::SeqCst) == 1000 && queue.incoming.lock().unwrap().len() == 100).await;
         assert_eq!(probe.peak.load(Ordering::SeqCst), 1000);
         let task_ids: std::collections::HashSet<_> = probe.calls.lock().unwrap().iter().map(|call| call.1).collect();
@@ -830,16 +864,19 @@ mod tests {
         let probe = Arc::new(IoProbe::default());
         let shutdown = CancellationToken::new();
         let stop = shutdown.clone();
-        let pool = tokio::spawn(super::run(
-            outbox_task_coordinator(queue.clone(), vec![format()]),
-            io_factory(probe.clone()),
-            worker_config(1, 1, Duration::from_millis(2)),
-            shutdown,
-        ));
+        let pool = tokio::spawn(
+            prepared_worker(
+                queue.clone(),
+                io_factory(probe.clone()),
+                worker_config(1, 1, Duration::from_millis(2)),
+            )
+            .run(shutdown),
+        );
         wait_until(|| probe.calls.lock().unwrap().len() == 1).await;
         probe.gate.add_permits(1);
         wait_until(|| probe.calls.lock().unwrap().len() == 2).await;
         let calls = probe.calls.lock().unwrap().clone();
+        assert_eq!(calls[0].0, 0, "the first prepared registry must execute");
         assert_eq!(calls[0].0, calls[1].0);
         assert_eq!(calls[0].1, calls[1].1);
         assert_eq!((calls[0].2, calls[1].2), (1, 2));
@@ -883,12 +920,8 @@ mod tests {
         });
         let shutdown = CancellationToken::new();
         let stop = shutdown.clone();
-        let pool = tokio::spawn(super::run(
-            outbox_task_coordinator(queue.clone(), vec![format()]),
-            factory,
-            worker_config(1, 1, Duration::from_secs(3600)),
-            shutdown,
-        ));
+        let pool =
+            tokio::spawn(prepared_worker(queue.clone(), factory, worker_config(1, 1, Duration::from_secs(3600))).run(shutdown));
         wait_until(|| queue.outcomes.lock().unwrap().len() == 1).await;
         let records = records.lock().unwrap().clone();
         assert_eq!(built.load(Ordering::SeqCst), 2);
@@ -951,12 +984,9 @@ mod tests {
         });
         let parent = CancellationToken::new();
         let shutdown = parent.child_token();
-        let pool = tokio::spawn(super::run(
-            outbox_task_coordinator(queue.clone(), vec![format()]),
-            factory,
-            worker_config(2, 2, Duration::from_secs(3600)),
-            shutdown.clone(),
-        ));
+        let pool = tokio::spawn(
+            prepared_worker(queue.clone(), factory, worker_config(2, 2, Duration::from_secs(3600))).run(shutdown.clone()),
+        );
         wait_until(|| probe.active.load(Ordering::SeqCst) == 1 && queue.incoming.lock().unwrap().len() == 1).await;
         crash.add_permits(1);
         wait_until(|| built.load(Ordering::SeqCst) == 3).await;
@@ -1060,12 +1090,14 @@ mod tests {
         queue.incoming.lock().unwrap().extend([claimed(), claimed()]);
         let probe = Arc::new(IoProbe::default());
         let shutdown = CancellationToken::new();
-        let pool = tokio::spawn(super::run(
-            outbox_task_coordinator(queue.clone(), vec![format()]),
-            io_factory(probe.clone()),
-            worker_config(1, 1, Duration::from_secs(3600)),
-            shutdown.clone(),
-        ));
+        let pool = tokio::spawn(
+            prepared_worker(
+                queue.clone(),
+                io_factory(probe.clone()),
+                worker_config(1, 1, Duration::from_secs(3600)),
+            )
+            .run(shutdown.clone()),
+        );
         wait_until(|| probe.active.load(Ordering::SeqCst) == 1 && queue.incoming.lock().unwrap().is_empty()).await;
         pool.abort();
         assert!(pool.await.unwrap_err().is_cancelled());

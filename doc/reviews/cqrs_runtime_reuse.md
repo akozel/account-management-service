@@ -1,10 +1,10 @@
 # Review небизнес-кода и переиспользование cqrs-runtime
 
-Дата: 2026-10-11. Статус: этап 1 выполнен; этапы 2–6 — backlog.
+Дата: 2026-10-11. Статус: этапы 1–2 выполнены; этапы 3–6 — backlog.
 
 Под «сборкой» здесь рассматриваются composition root и запуск приложения.
 Cargo/CI рассмотрены в этапе 6. Бизнес-инварианты не являются предметом
-этого review. API этапа 1 реализованы; примеры этапов 2–5 остаются эскизами.
+этого review. API этапов 1–2 реализованы; примеры этапов 3–5 остаются эскизами.
 
 ## Вывод
 
@@ -23,11 +23,13 @@ helpers можно перенести после этих изменений. Co
 
 Работы выполняются последовательно. Полный план и результат первого этапа:
 [готовый командный путь PostgreSQL](../backlog/cqrs_runtime_command_factory.md).
+План и результат второго этапа:
+[подготовка outbox до запуска HTTP](../backlog/cqrs_runtime_outbox_preparation.md).
 
 | Этап | Результат и критерий завершения | Статус |
 | --- | --- | --- |
 | 1. Командный путь PostgreSQL | Checked config, готовая factory, CommandExecutor interface, два простых gateways; сохраняются retries, snapshot replay и atomic event/tasks. 159 tests passed; line coverage 97.97%; все обязательные проверки прошли. | Выполнено |
-| 2. Подготовка outbox | Runtime согласует queue/coordinator/budgets/registries до HTTP admission; первый registry используется worker, startup/restart ownership проверено тестами. | Backlog |
+| 2. Подготовка outbox | Checked OutboxRuntimeConfig, prepared registries и PostgreSQL helper; все C registries проверяются до HTTP и используются workers. 166 tests passed; line coverage 97.97%; обязательные и feature checks прошли. | Выполнено |
 | 3. Lifecycle процесса | Общий host наблюдает signals/token/component exits и drain; сохраняются error priority и текущая shutdown policy. Lifecycle tests перенесены. | Backlog |
 | 4. Типизированные tasks | Runtime проверяет format и декодирует payload; бизнес-handler получает DTO и выполняет свою операцию. Общие decode tests и бизнес-redelivery tests проходят. | Backlog |
 | 5. Конфигурация и диагностика | ServiceConfig, fallible pool connection, optional telemetry, private env helpers и safe storage categories; настройки валидируются до подключения БД. | Backlog |
@@ -105,7 +107,10 @@ fix. Ограничение описано в [known issue](../known_issues/cqrs
 
 ## Этап 2. Outbox: checked configuration и prepare до запуска
 
-Добавить `worker::OutboxRuntimeConfig`, объединяющий существующие coordinator
+Подробный план: [подготовка outbox](../backlog/cqrs_runtime_outbox_preparation.md).
+Реализация завершена; следующие API доступны через runtime facades.
+
+Реализован `worker::OutboxRuntimeConfig`, объединяющий существующие coordinator
 и worker configs. Он загружает настройки через `from_env`/`from_lookup` и
 проверяет combined lease budget. PostgreSQL statement timeout остается частью
 PostgreSQL-конфигурации; он не становится обязательным для других queue adapters.
@@ -117,7 +122,7 @@ let outbox = worker::prepare(queue, handler_factory, outbox_config)?;
 // outbox.run(shutdown) запускается только после успешной подготовки.
 ```
 
-Опциональный короткий PostgreSQL helper:
+Короткий PostgreSQL helper входит в этап; доступен при features postgres+worker:
 
 ```rust
 let outbox = postgres::prepare_outbox_worker(
@@ -128,11 +133,18 @@ let outbox = postgres::prepare_outbox_worker(
 Helper только собирает queue и передает ее в `worker::prepare`. Он не запускает
 background tasks, не читает env и не регистрирует бизнес-handlers сам.
 
-`prepare` проверяет registry formats, строит coordinator и валидирует budgets.
-Чтобы убрать лишнюю factory invocation, использовать первый registry как
-registry первого worker. Желательно подготовить остальные C−1 registries и
-проверить одинаковые formats до запуска HTTP; при restart проверка сохраняется.
-Prepared object владеет registries и factory и потребляется методом `run(self, ...)`.
+`OutboxRuntimeConfig` проверяет combined budget при создании/загрузке.
+`prepare` проверяет registry formats и строит coordinator.
+Первый registry используется как
+registry первого worker. Остальные C−1 registries тоже создаются и проверяются
+до открытия HTTP listener; ordered formats должны совпадать. При restart
+проверка сохраняется. `PreparedOutboxWorker` владеет registries и factory,
+не клонируется и потребляется методом `run(self, shutdown)`.
+
+Существующий low-level `worker::run` сохраняется для custom coordinators и
+использует тот же supervisor engine. Подготовка не принимает CancellationToken
+и не начинает storage work; cancellation/DropGuard относятся к начавшемуся run.
+Combined runtime config загружается и проверяется до подключения БД.
 
 Бизнес-код по-прежнему явно перечисляет handlers и создает отдельный mutable
 sender для каждого worker. Не заменять factory общим registry под mutex и не
@@ -283,7 +295,8 @@ build framework или `build.rs` для этой цели не требуетс
 ## Общие проверки этапов
 
 Clean-architecture skill обновлен вместе с этапом 1: main вызывает техническую
-factory, gateways получают ready executor. При реализации этапа 3 нужно отдельно
+factory, gateways получают ready executor. Этап 2 закрепляет runtime-owned
+preparation и раннюю проверку budgets/registries. При реализации этапа 3 нужно отдельно
 закрепить host ownership. DDD domain layout не меняется.
 
 Каждый этап меняющий Rust проходит fmt, workspace Clippy, workspace tests и
@@ -300,5 +313,6 @@ schema, event formats или task payloads.
 - `cargo check --locked -p cqrs-runtime --no-default-features --features worker`.
 
 При исходном review PostgreSQL suites и llvm-cov не запускались. Эти исходные
-checks не подтверждают реализацию; актуальные результаты этапа 1 записаны в
-[его документе](../backlog/cqrs_runtime_command_factory.md).
+checks не подтверждают реализацию; актуальные результаты реализации записаны в документах
+[этапа 1](../backlog/cqrs_runtime_command_factory.md) и
+[этапа 2](../backlog/cqrs_runtime_outbox_preparation.md).

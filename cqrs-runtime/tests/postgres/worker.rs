@@ -2,6 +2,11 @@ use cqrs_runtime::outbox::TaskDelivery;
 use std::sync::Mutex;
 
 use super::*;
+use cqrs_runtime::{
+    outbox::{OutboxTaskCoordinatorConfig, TaskHandlerRegistryError},
+    postgres::{PostgresOutboxPreparationError, PostgresOutboxQueueConfig, prepare_outbox_worker},
+    worker::{OutboxPreparationError, OutboxRuntimeConfig, WorkerPoolError},
+};
 
 struct DummyHandler(Arc<Mutex<Vec<(Uuid, String)>>>);
 
@@ -32,7 +37,6 @@ async fn two_live_workers_complete_every_supported_task_and_quarantine_bad_paylo
         let handled = handled.clone();
         move || TaskHandlerRegistry::try_new(vec![Box::new(DummyHandler(handled.clone()))])
     });
-    let service = outbox_task_coordinator(Arc::new(PostgresOutboxQueue::new(db.pool.clone())), vec![format()]);
     let shutdown = CancellationToken::new();
     let stop = shutdown.clone();
     let config = OutboxWorkerPoolConfig::new(
@@ -43,13 +47,37 @@ async fn two_live_workers_complete_every_supported_task_and_quarantine_bad_paylo
         OutboxWorkerPoolConfig::default().lease_duration(),
     )
     .unwrap();
-    let left = tokio::spawn(outbox_worker_pool::run(
-        service.clone(),
-        factory.clone(),
+    let config = OutboxRuntimeConfig::new(OutboxTaskCoordinatorConfig::default(), config).unwrap();
+    // A startup failure must leave existing durable work unclaimed.
+    let failed = prepare_outbox_worker(
+        db.pool.clone(),
+        Arc::new(|| Err(TaskHandlerRegistryError::Empty)),
+        PostgresOutboxQueueConfig::default(),
         config.clone(),
-        shutdown.clone(),
+    );
+    assert!(matches!(
+        failed,
+        Err(PostgresOutboxPreparationError::Preparation(OutboxPreparationError::Worker(
+            WorkerPoolError::RegistryBuild {
+                worker_index: 0,
+                source: TaskHandlerRegistryError::Empty,
+            }
+        )))
     ));
-    let right = tokio::spawn(outbox_worker_pool::run(service, factory, config, shutdown));
+    let left = prepare_outbox_worker(
+        db.pool.clone(),
+        factory.clone(),
+        PostgresOutboxQueueConfig::default(),
+        config.clone(),
+    )
+    .unwrap();
+    let right = prepare_outbox_worker(db.pool.clone(), factory, PostgresOutboxQueueConfig::default(), config).unwrap();
+    for task in [&first, &second, &bad] {
+        assert_worker_state(&db.pool, task.id(), "pending", 0, None).await;
+    }
+    assert!(handled.lock().unwrap().is_empty());
+    let left = tokio::spawn(left.run(shutdown.clone()));
+    let right = tokio::spawn(right.run(shutdown));
     tokio::time::timeout(Duration::from_secs(10), async {
         loop {
             let count: i64 = sqlx::query_scalar("SELECT count(*) FROM transactional_outbox WHERE finished_at IS NOT NULL")
@@ -112,25 +140,32 @@ async fn one_worker_pool_routes_two_registered_task_types() {
             ])
         }
     });
-    let service = outbox_task_coordinator(
-        Arc::new(PostgresOutboxQueue::new(db.pool.clone())),
-        factory().unwrap().formats(),
-    );
     let shutdown = CancellationToken::new();
     let stop = shutdown.clone();
-    let worker = tokio::spawn(outbox_worker_pool::run(
-        service,
+    let prepared = prepare_outbox_worker(
+        db.pool.clone(),
         factory,
-        OutboxWorkerPoolConfig::new(
-            2,
-            2,
-            Duration::from_millis(10),
-            OutboxWorkerPoolConfig::default().handler_timeout(),
-            OutboxWorkerPoolConfig::default().lease_duration(),
+        PostgresOutboxQueueConfig::default(),
+        OutboxRuntimeConfig::new(
+            OutboxTaskCoordinatorConfig::default(),
+            OutboxWorkerPoolConfig::new(
+                2,
+                2,
+                Duration::from_millis(10),
+                OutboxWorkerPoolConfig::default().handler_timeout(),
+                OutboxWorkerPoolConfig::default().lease_duration(),
+            )
+            .unwrap(),
         )
         .unwrap(),
-        shutdown,
-    ));
+    )
+    .unwrap();
+    for task in [&dummy, &audit, &unknown] {
+        assert_worker_state(&db.pool, task.id(), "pending", 0, None).await;
+    }
+    assert!(handled.lock().unwrap().is_empty());
+    assert_eq!(audited.load(Ordering::SeqCst), 0);
+    let worker = tokio::spawn(prepared.run(shutdown));
     tokio::time::timeout(Duration::from_secs(10), async {
         while row(&db.pool, dummy.id()).await.get::<String, _>("status") != "completed"
             || row(&db.pool, audit.id()).await.get::<String, _>("status") != "completed"

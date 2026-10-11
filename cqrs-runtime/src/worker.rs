@@ -1,5 +1,10 @@
 //! Inbound polling adapter: bounded async-channel delivery queue and permanent Tokio workers supervised by JoinSet.
 //!
+//! Prefer [`prepare`] before opening inbound listeners: checked [`OutboxRuntimeConfig`]
+//! and all C registries are assembled without storage work or background tasks.
+//! [`PreparedOutboxWorker::run`] consumes those same handlers. The low-level [`run`]
+//! accepts custom coordinators and shares the execution engine.
+//!
 //! Workers execute eligible tasks concurrently without serializing source
 //! aggregates or interpreting event sequence as delivery order. Aggregate
 //! phases and accepted transitions establish business prerequisites before
@@ -23,7 +28,11 @@
 //! aborts owned workers; graceful drain requires cancellation followed by await.
 
 mod config;
+mod preparation;
+mod runtime_config;
 mod supervisor;
 mod worker_task;
 pub use config::{OutboxWorkerPoolConfig, OutboxWorkerPoolConfigError};
+pub use preparation::{OutboxPreparationError, PreparedOutboxWorker, prepare};
+pub use runtime_config::{OutboxRuntimeConfig, OutboxRuntimeConfigError};
 pub use supervisor::{HandlerRegistryFactory, WorkerPoolError, run};

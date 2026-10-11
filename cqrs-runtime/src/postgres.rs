@@ -1,10 +1,14 @@
 mod command_factory;
 mod event_repository_with_outbox;
 mod outbox_queue;
+#[cfg(feature = "worker")]
+mod worker_factory;
 
 pub use command_factory::{PostgresCommandConfig, PostgresCommandConfigError, command_executor};
 pub use event_repository_with_outbox::PostgresEventRepositoryWithOutbox;
 pub use outbox_queue::{PostgresOutboxQueue, PostgresOutboxQueueConfig, PostgresOutboxQueueConfigError};
+#[cfg(feature = "worker")]
+pub use worker_factory::{PostgresOutboxPreparationError, prepare_outbox_worker};
 
 /// Canonical PostgreSQL event-store schema used by this runtime.
 pub const EVENT_STORE_SCHEMA: &str = include_str!("../sql/001-event-store.sql");

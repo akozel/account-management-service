@@ -277,8 +277,10 @@ Application owns versioned business task DTOs, handler implementations, and
 sender ports. `cqrs-runtime` owns the generic task, queue and handler traits,
 the `OutboxTaskCoordinator`, and `TaskHandlerRegistry`. The registry
 rejects empty and duplicate registrations and routes each type/version to one
-handler. The composition root builds a separate registry for every worker and
-derives the coordinator's claim formats from it. Unknown formats stay pending.
+handler. The composition root supplies a business handler factory; runtime
+preparation creates all C registries before binding HTTP. The first registry
+supplies the coordinator's ordered claim formats and becomes worker zero's
+registry; the remaining C−1 must match. Unknown formats stay pending.
 The runtime PostgreSQL adapter owns atomic claims, leases, token-checked settlements
 and expired-lease recovery. Concrete senders live under their infrastructure
 technology. Versioned wire DTOs are converted into current handler inputs.
@@ -319,9 +321,12 @@ The process runtime awaits HTTP and outbox before DB cleanup; preserve the first
 unexpected component failure, or signal/outbox/HTTP error priority for requested
 shutdown, and log secondary failures. Format JoinError only as task ID and
 panic/cancellation flags, including RuntimeError Debug used by termination.
-Recovery batches are capped at min(C, 32). `main` composes the runtime queue,
-coordinator, business handler factory, and supervisor alongside HTTP. Configuration parsing and validation
-stay in the runtime crate so they remain testable and covered.
+Recovery batches are capped at min(C, 32). `main` loads checked
+`OutboxRuntimeConfig` before DB connection, builds the business handler factory,
+and calls `postgres::prepare_outbox_worker` before binding HTTP. Queue/coordinator
+assembly and combined budget validation belong to runtime, with PostgreSQL statement
+cap kept separate. The helper is gated on both postgres and worker; neither feature
+implicitly enables the other. Configuration parsing/validation remains covered.
 
 ### Task handlers and workers
 
@@ -344,8 +349,14 @@ Sender ports and business outcome classification belong to
 application; delivery, storage deadlines, lease budgets, lock tokens, and
 monotonic claim deadlines belong to the runtime/queue adapter. Business handlers receive only immutable `TaskDelivery`, not queue ownership.
 `ClaimedTask` and `ClaimLease` remain platform context. Configuration parsing/validation
-stays in `cqrs-runtime`; `main` loads explicit configs and validates the combined
-lease budget before accepting traffic. Update the runtime guide and API rustdoc
+stays in `cqrs-runtime`; `main` loads the combined config before DB connection.
+Preparation builds/validates all registries before opening listeners, without
+storage operations or background tasks. `PreparedOutboxWorker` owns the same
+registries that workers receive and is consumed by run, without startup rebuild.
+Preparation owns no CancellationToken; Drop releases handlers. A polled run owns
+DropGuard, skips spawn/storage on pre-cancelled token, and retains restart/drain
+semantics. Low-level `worker::run` remains available for custom coordinators and
+shares the same engine, including actual-budget validation and startup cancellation. Update the runtime guide and API rustdoc
 together when changing this lasting contract.
 
 ## Presentation layout

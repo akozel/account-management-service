@@ -22,8 +22,8 @@ use account_managements_service::{
     presentation,
 };
 use cqrs_runtime::{
-    outbox::{OutboxTaskCoordinatorConfig, TaskHandlerRegistry, outbox_task_coordinator_with_config},
-    postgres::{PostgresCommandConfig, PostgresOutboxQueue, PostgresOutboxQueueConfig, command_executor},
+    outbox::TaskHandlerRegistry,
+    postgres::{PostgresCommandConfig, PostgresOutboxQueueConfig, command_executor, prepare_outbox_worker},
     worker,
 };
 use runtime::RuntimeError;
@@ -38,7 +38,7 @@ async fn main() -> Result<(), RuntimeError> {
     LogingConfig::default_setup(level_filter);
     let database_url = std::env::var("DATABASE_URL").expect("DATABASE_URL must be set");
     let bind_address = std::env::var("BIND_ADDRESS").expect("BIND_ADDRESS must be set");
-    let coordinator_config = OutboxTaskCoordinatorConfig::from_env().expect("valid outbox storage timeout");
+    let outbox_config = worker::OutboxRuntimeConfig::from_env().expect("valid outbox runtime configuration");
     let postgres_queue_config = PostgresOutboxQueueConfig::from_env().expect("valid PostgreSQL outbox timeout");
 
     let pool = postgres_es::default_postgress_pool(&database_url).await;
@@ -47,9 +47,6 @@ async fn main() -> Result<(), RuntimeError> {
         pool.clone(),
         command_config.clone(),
     )));
-    let queue = Arc::new(
-        PostgresOutboxQueue::with_config(pool.clone(), postgres_queue_config).expect("valid PostgreSQL outbox configuration"),
-    );
     let account_gateway = Arc::new(CqrsUserAccountGateway::new(command_executor::<UserAccount>(
         pool.clone(),
         command_config,
@@ -63,23 +60,15 @@ async fn main() -> Result<(), RuntimeError> {
             record_account_created_task_handler(registration.clone())?,
         ])
     });
-    let outbox = outbox_task_coordinator_with_config(
-        queue,
-        handler_factory().expect("valid handler registry").formats(),
-        coordinator_config,
-    )
-    .expect("valid outbox coordinator configuration");
-    let worker_config = worker::OutboxWorkerPoolConfig::from_env().expect("valid worker configuration");
-    worker_config
-        .validate_for_storage_timeout(outbox.storage_timeout())
-        .expect("outbox lease must cover claim, handler, settlement, and safety margin");
+    let outbox = prepare_outbox_worker(pool.clone(), handler_factory, postgres_queue_config, outbox_config)
+        .expect("valid outbox preparation");
     let email_reservation = email_reservation_service(gateway, Arc::new(RandomRegistrationMaterialGenerator));
     let app = presentation::http::router(email_reservation, http_registration);
     let listener = TcpListener::bind(&bind_address).await.expect("unable to bind HTTP listener");
     info!(address = %bind_address, "HTTP server is listening");
 
     let shutdown = CancellationToken::new();
-    let worker = tokio::spawn(worker::run(outbox, handler_factory, worker_config, shutdown.clone()));
+    let worker = tokio::spawn(outbox.run(shutdown.clone()));
     let http_shutdown = shutdown.clone();
     let serve = async move {
         axum::serve(listener, app)

@@ -150,7 +150,10 @@ includes both rescheduled work and confirmed terminal failures; use
 | `OUTBOX_STORAGE_TIMEOUT_MS` | `6000` | Coordinator deadline for the whole multi-format claim batch, or one recovery/settlement call. |
 | `OUTBOX_POSTGRES_STATEMENT_TIMEOUT_MS` | `4000` | PostgreSQL deadline for each statement in queue transactions, including lock waiting. |
 
-Use the configuration types' `from_env` methods to load these settings.
+Use `worker::OutboxRuntimeConfig::from_env` to load and validate coordinator/worker
+settings together, before connecting the database. PostgreSQL statement timeout
+is loaded separately with `PostgresOutboxQueueConfig::from_env`. Existing low-level
+config loaders remain available.
 Constructors without explicit configuration use defaults; they do not read
 environment variables automatically. Positive values are required. Queue capacity must fit the runtime's validated range;
 zero-capacity rendezvous is not supported. Defaults for concurrency and queue
@@ -221,14 +224,38 @@ exit removes one Tokio task ID and recreates one checked registry/task for that
 worker index. An in-progress bounded storage await may delay this observation.
 Panic payloads are not logged by supervision; panic=abort ends the process.
 
-`worker::run` takes a `tokio_util::sync::CancellationToken`. Its clones share
+Prepare startup handlers before opening inbound listeners with
+`worker::prepare(queue, factory, OutboxRuntimeConfig)` or, for PostgreSQL,
+`postgres::prepare_outbox_worker(pool, factory, queue_config, runtime_config)`.
+Both functions are synchronous and perform no storage work or background spawn.
+The first registry defines ordered formats and is retained for worker zero;
+all remaining C−1 registries must match before preparation succeeds. There is
+no extra disposable registry. Preparation errors free already built handlers.
+
+`PreparedOutboxWorker` owns the coordinator, restart factory, worker config and
+C registries. It cannot be cloned and is consumed by `run(shutdown)`. Before run,
+Drop just releases its handlers; there is no owned cancellation token or work to
+drain. A run future binds the supplied token and installs a DropGuard at first
+poll. A pre-cancelled token releases prepared handlers without spawning workers,
+calling the factory again, or accessing storage. Each worker receives its same
+prepared mutable registry; only replacement workers invoke the factory anew.
+
+The retained low-level `worker::run(coordinator, factory, config, shutdown)`
+validates against the actual coordinator budget and builds registries when polled.
+Both APIs share the same supervisor engine. In the low-level path, a pre-cancelled
+token skips registry creation; startup errors or panics cancel it through DropGuard.
+
+`PreparedOutboxWorker::run` and `worker::run` take a
+`tokio_util::sync::CancellationToken`. Its clones share
 one cancellation request between the host, supervisor, and permanent workers.
 Cancellation stops claims and dequeue, including while the supervisor awaits
 storage. Workers prioritize cancellation over recv and check it again before
 execution. A ready claim batch is discarded if cancellation has been observed;
 its already-committed ownership remains for lease recovery.
 
-Startup configuration/registry errors cancel the supplied token before returning.
+Pure preparation has no supplied token and returns indexed startup errors before
+any runtime is started. Low-level startup configuration/registry errors cancel
+the supplied token before returning.
 Restart-factory errors and format mismatches cancel it **before** draining healthy
 workers, notifying the host immediately, and return the original `WorkerPoolError`
 after drain. A worker panic alone does not cancel it: the supervisor restarts that
@@ -309,18 +336,20 @@ accepted by a receiver. There is no heartbeat/renewal or exactly-once guarantee.
    no I/O or environment lookup. Use `CqrsCommandExecutor::new` for custom
    framework factories. Current upstream snapshots require repeat-tolerant
    event application; see the [snapshot issue](../../doc/known_issues/cqrs_snapshot_event_reapplication.md).
-4. Implement handlers/sender ports, then build a `TaskHandlerRegistry` per
-   permanent Tokio worker. It rejects empty and duplicate registrations. Each fallible `HandlerRegistryFactory` invocation
-   must expose the same ordered format list as the coordinator.
-   Use `#[async_trait::async_trait]` for the async handler/queue implementations.
-5. `OutboxWorkerPoolConfig::new(concurrency, queue_capacity, poll_interval,
-   handler_timeout, lease_duration)` requires both independent limits. Load and validate `PostgresOutboxQueueConfig`,
-   `OutboxTaskCoordinatorConfig`, and `OutboxWorkerPoolConfig`. Compose the
-   queue/coordinator and validate the full lease budget before accepting traffic.
-   Start `worker::run` with a cancellation token; the host owns process lifecycle
-   and may share that token with its other critical adapters. Fatal supervisor
-   errors cancel the token before draining; await its result to obtain the error.
-   Handle `WorkerPoolError` separately from configuration validation errors.
+4. Implement handlers/sender ports and supply a synchronous fallible
+   `HandlerRegistryFactory` returning fresh mutable registries. `TaskHandlerRegistry`
+   rejects empty/duplicate formats; every factory invocation must expose the same
+   ordered format list. Preparation uses the first registry and builds the other
+   C−1 before admission; factories only construct handlers and must return promptly.
+   Use `#[async_trait::async_trait]` for handler/queue implementations.
+5. Load `OutboxRuntimeConfig::from_env` and the separate PostgreSQL queue config
+   before connecting the database. The combined config checks independent C/Q and
+   the full queued-wave lease budget. After business dependencies and handler
+   factory are ready, call `prepare_outbox_worker` (or `worker::prepare` for another
+   queue) before binding listeners. Start `prepared.run(token)` and share its token
+   with critical inbound adapters. Observe configuration, preparation and runtime
+   errors at their respective boundaries. Custom coordinators can retain low-level
+   `worker::run`; lifecycle and restart behavior use the same execution engine.
 6. For another queue adapter, enforce atomic claims, attempt limits, durable
    schedules, conditional token/expiry settlement, and expired ownership
    recovery. Supply a conservative monotonic deadline for every claim and

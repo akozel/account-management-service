@@ -78,40 +78,27 @@ order. Redelivery is expected, including after a successful effect.
 The host applies [event-store SQL](sql/001-event-store.sql) and
 [outbox SQL](sql/002-transactional-outbox.sql), supplies handler factories and
 a database pool, and owns process signals and inbound-adapter draining.
-The following composition function requires the `postgres` and `worker`
-features and direct host dependencies on SQLx 0.8, Tokio, and tokio-util 0.7:
+Load runtime and queue configs before connecting the pool. The following
+preparation function requires the `postgres` and `worker` features and a host
+dependency on SQLx 0.8. Start its returned object only after binding listeners,
+using Tokio and tokio-util 0.7:
 
 ```rust
-use std::{error::Error, sync::Arc};
-
 use cqrs_runtime::{
-    outbox::{OutboxTaskCoordinatorConfig, outbox_task_coordinator_with_config},
-    postgres::{PostgresOutboxQueue, PostgresOutboxQueueConfig},
-    worker::{self, OutboxWorkerPoolConfig, HandlerRegistryFactory},
+    postgres::{PostgresOutboxQueueConfig, PostgresOutboxPreparationError, prepare_outbox_worker},
+    worker::{OutboxRuntimeConfig, HandlerRegistryFactory, PreparedOutboxWorker},
 };
 use sqlx::PgPool;
-use tokio_util::sync::CancellationToken;
 
-pub async fn run_tasks(
+pub fn prepare_tasks(
     pool: PgPool,
     factory: HandlerRegistryFactory,
-    shutdown: CancellationToken,
-) -> Result<(), Box<dyn Error + Send + Sync>> {
-    let queue = Arc::new(PostgresOutboxQueue::with_config(
-        pool,
-        PostgresOutboxQueueConfig::from_env()?,
-    )?);
-    let coordinator = outbox_task_coordinator_with_config(
-        queue,
-        factory()?.formats(),
-        OutboxTaskCoordinatorConfig::from_env()?,
-    )?;
-    let config = OutboxWorkerPoolConfig::from_env()?;
-    config.validate_for_storage_timeout(coordinator.storage_timeout())?;
-
-    worker::run(coordinator, factory, config, shutdown).await?;
-    Ok(())
+    queue_config: PostgresOutboxQueueConfig,
+    runtime_config: OutboxRuntimeConfig,
+) -> Result<PreparedOutboxWorker, PostgresOutboxPreparationError> {
+    prepare_outbox_worker(pool, factory, queue_config, runtime_config)
 }
+
 ```
 
 The host shares a `CancellationToken` with HTTP and the outbox supervisor. Call
@@ -120,10 +107,29 @@ cancel the supplied token before drain, so HTTP can stop admission immediately.
 Pass a `child_token()` for an isolated pool. Dropping a token handle does not
 cancel it; a lifecycle owner can hold `shutdown.clone().drop_guard()`.
 
-Every fallible factory invocation must return a fresh registry with the same ordered
+Prepare before binding inbound listeners. `worker::prepare(queue, factory, config)`
+works with any queue; `postgres::prepare_outbox_worker` assembles the PostgreSQL
+adapter when both `postgres` and `worker` features are enabled. Neither function
+performs storage I/O or starts background tasks. Preparation calls the factory
+exactly C times, freezes ordered formats, and keeps the first registry for worker
+zero. Every fallible factory invocation must return a fresh registry with the same ordered
 format list. Defaults do not read environment variables automatically: call
 `from_env` or pass explicit configurations as above. The guide lists every
 setting, its units/default, and the full lease-budget formula.
+
+`OutboxRuntimeConfig` combines the existing coordinator and worker configs,
+checks the complete lease budget at construction/load time, and keeps PostgreSQL
+statement timeout separate. The service loads configs before connecting to the
+database. `PreparedOutboxWorker` is consumed by `run`; it rebuilds registries only
+on restart, preserving each worker's mutable state. Dropping the prepared object
+releases handlers without cancellation. A polled run owns a cancellation DropGuard;
+a pre-cancelled token starts no tasks or storage operations.
+
+Configuration errors (`OutboxRuntimeConfigError`), preparation errors
+(`OutboxPreparationError` / `PostgresOutboxPreparationError`) and runtime exits
+(`WorkerPoolError`) remain distinct. Low-level `worker::run` is retained for
+custom coordinators; it uses the same supervisor engine and preserves cancelled
+startup and actual-coordinator budget validation.
 
 Generate local API documentation with:
 
@@ -159,7 +165,7 @@ receiver's idempotency window.
 The public namespaces are `command`, `outbox`, `postgres`, and `worker`;
 their child modules are private implementation details. Command execution and
 conflict retry are separate. Outbox modules group wire data, delivery/ownership,
-handler routing, queue transitions, and coordination. The worker groups config,
+handler routing, queue transitions, and coordination. The worker groups combined config, startup preparation,
 supervision, and permanent worker lifecycle. PostgreSQL keeps queue SQL separate from the
 single-event write plan and its atomic CTE compiler.
 
@@ -181,8 +187,9 @@ provides fixed safe log reasons, independent of persisted handler error text.
 `LeaseRecoveryReport` derives its total from retries and confirmed failures.
 
 `HandlerRegistryFactory` returns `Result<TaskHandlerRegistry, TaskHandlerRegistryError>`.
-`worker::run` reports `WorkerPoolError`, distinguishing configuration, registry
-construction, and format mismatch on startup or restart. It still supervises
+`PreparedOutboxWorker::run` reports `WorkerPoolError` for runtime failures.
+Low-level `worker::run` also reports configuration and registry errors on startup.
+Preparation reports typed errors before any workers start. It still supervises
 one mutable registry per permanent Tokio task and leaves interrupted work for recovery.
 Defaults are 128 concurrent deliveries, 128 queued deliveries, and a 60-second
 lease. `OUTBOX_QUEUE_CAPACITY` and `OUTBOX_WORKER_CONCURRENCY` are independent.
