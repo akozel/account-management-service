@@ -44,7 +44,10 @@ use cqrs_es::persist::PersistedEventRepository;
 use cqrs_runtime::{
     command::{AggregateConflictRetryPolicy, CommandGatewayError},
     outbox::{ClaimedTask, NewOutboxTask, TaskFormat, TaskPayload, outbox_task_coordinator},
-    postgres::{EVENT_STORE_SCHEMA, PostgresEventRepositoryWithOutbox, PostgresOutboxQueue, TRANSACTIONAL_OUTBOX_SCHEMA},
+    postgres::{
+        EVENT_STORE_SCHEMA, PostgresCommandConfig, PostgresEventRepositoryWithOutbox, PostgresOutboxQueue,
+        TRANSACTIONAL_OUTBOX_SCHEMA, command_executor,
+    },
 };
 use serde_json::{Value, json};
 use sha2::{Digest, Sha256};
@@ -155,20 +158,10 @@ impl RegistrationMaterialGenerator for NextGenerator {
 }
 
 fn email_gateway(pool: &PgPool) -> Arc<dyn EmailReservationGateway> {
-    let pool = pool.clone();
-    Arc::new(CqrsEmailReservationGateway::new(
-        move |tasks| {
-            cqrs_es::CqrsFramework::new(
-                cqrs_es::persist::PersistedEventStore::new_snapshot_store(
-                    PostgresEventRepositoryWithOutbox::new(pool.clone()).with_outbox(tasks),
-                    3,
-                ),
-                vec![],
-                (),
-            )
-        },
-        AggregateConflictRetryPolicy::default(),
-    ))
+    Arc::new(CqrsEmailReservationGateway::new(command_executor::<EmailReservation>(
+        pool.clone(),
+        PostgresCommandConfig::new(3, AggregateConflictRetryPolicy::default()).unwrap(),
+    )))
 }
 
 fn registration(pool: &PgPool, clock: Arc<TestClock>) -> Arc<dyn RegistrationService> {
@@ -176,20 +169,10 @@ fn registration(pool: &PgPool, clock: Arc<TestClock>) -> Arc<dyn RegistrationSer
 }
 
 fn account_gateway(pool: &PgPool) -> Arc<dyn UserAccountGateway> {
-    let account_pool = pool.clone();
-    Arc::new(CqrsUserAccountGateway::new(
-        move |tasks| {
-            cqrs_es::CqrsFramework::new(
-                cqrs_es::persist::PersistedEventStore::new_snapshot_store(
-                    PostgresEventRepositoryWithOutbox::new(account_pool.clone()).with_outbox(tasks),
-                    1,
-                ),
-                vec![],
-                (),
-            )
-        },
-        AggregateConflictRetryPolicy::default(),
-    ))
+    Arc::new(CqrsUserAccountGateway::new(command_executor::<UserAccount>(
+        pool.clone(),
+        PostgresCommandConfig::new(1, AggregateConflictRetryPolicy::default()).unwrap(),
+    )))
 }
 
 struct RecordingAccountGateway {

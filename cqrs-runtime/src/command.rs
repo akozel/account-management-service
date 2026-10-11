@@ -1,9 +1,31 @@
 //! Command gateways with bounded optimistic-conflict retry.
+use crate::outbox::NewOutboxTask;
+use async_trait::async_trait;
+use cqrs_es::Aggregate;
 use thiserror::Error;
 mod executor;
 mod retry;
 pub use executor::CqrsCommandExecutor;
 pub use retry::{AggregateConflictRetryPolicy, AggregateConflictRetryPolicyError};
+
+/// Technical command boundary; the application gateway selects the aggregate ID.
+///
+/// Implementations own persistence and retry policy without interpreting domain
+/// rejections. Tasks belong to this invocation and must not leak into other calls.
+#[async_trait]
+pub trait CommandExecutor<A>: Send + Sync
+where
+    A: Aggregate,
+    A::Command: Send,
+{
+    async fn execute(
+        &self,
+        aggregate_id: &str,
+        command: A::Command,
+        tasks: Vec<NewOutboxTask>,
+    ) -> Result<(), CommandGatewayError<A::Error>>;
+}
+
 /// Expected domain rejection, exhausted optimistic conflict, or unavailable storage.
 #[derive(Clone, Debug, Error, Eq, PartialEq)]
 pub enum CommandGatewayError<D> {
@@ -146,13 +168,48 @@ mod tests {
         AggregateConflictRetryPolicy::new(max_attempts, Duration::ZERO, Duration::ZERO, 0.0).unwrap()
     }
 
+    #[derive(Default, Serialize, Deserialize)]
+    struct SendOnlyAggregate;
+
+    impl Aggregate for SendOnlyAggregate {
+        const TYPE: &'static str = "send_only";
+        type Command = std::cell::Cell<u32>;
+        type Event = DummyEvent;
+        type Error = DummyError;
+        type Services = ();
+
+        async fn handle(
+            &mut self,
+            command: Self::Command,
+            _: &(),
+            sink: &cqrs_es::event_sink::EventSink<Self>,
+        ) -> Result<(), DummyError> {
+            sink.write(DummyEvent::Recorded(command.get().to_string()), self).await;
+            Ok(())
+        }
+
+        fn apply(&mut self, _: DummyEvent) {}
+    }
+
+    #[tokio::test]
+    async fn executor_accepts_send_commands_without_requiring_sync() {
+        let executor: Arc<dyn CommandExecutor<SendOnlyAggregate>> = Arc::new(CqrsCommandExecutor::new(
+            |_| CqrsFramework::new(cqrs_es::mem_store::MemStore::<SendOnlyAggregate>::default(), vec![], ()),
+            no_delay_policy(1),
+        ));
+        let result = tokio::spawn(async move { executor.execute("send-only", std::cell::Cell::new(7), vec![]).await })
+            .await
+            .unwrap();
+        assert_eq!(result, Ok(()));
+    }
+
     #[tokio::test]
     async fn executor_builds_once_and_retries_the_unchanged_command_and_tasks() {
         let builds = Arc::new(AtomicUsize::new(0));
         let commits = Arc::new(AtomicUsize::new(0));
         let commands = Arc::new(Mutex::new(Vec::new()));
         let captured_tasks = Arc::new(Mutex::new(Vec::new()));
-        let executor = CqrsCommandExecutor::<DummyAggregate, _>::new(
+        let executor: Arc<dyn CommandExecutor<DummyAggregate>> = Arc::new(CqrsCommandExecutor::<DummyAggregate, _>::new(
             {
                 let builds = builds.clone();
                 let commits = commits.clone();
@@ -173,7 +230,7 @@ mod tests {
                 }
             },
             no_delay_policy(3),
-        );
+        ));
         let task = NewOutboxTask::new(DummyTask { value: "same" }).unwrap();
 
         executor
@@ -196,7 +253,7 @@ mod tests {
 
     #[tokio::test]
     async fn executor_maps_domain_conflict_and_technical_errors_without_wrong_retries() {
-        let domain_executor = CqrsCommandExecutor::<DummyAggregate, _>::new(
+        let domain_executor: Arc<dyn CommandExecutor<DummyAggregate>> = Arc::new(CqrsCommandExecutor::<DummyAggregate, _>::new(
             |_| {
                 CqrsFramework::new(
                     DummyStore {
@@ -209,30 +266,31 @@ mod tests {
                 )
             },
             no_delay_policy(3),
-        );
+        ));
         assert_eq!(
             domain_executor.execute("aggregate", DummyCommand::Reject, vec![]).await,
             Err(CommandGatewayError::Domain(DummyError))
         );
 
         let commits = Arc::new(AtomicUsize::new(0));
-        let conflict_executor = CqrsCommandExecutor::<DummyAggregate, _>::new(
-            {
-                let commits = commits.clone();
-                move |_| {
-                    CqrsFramework::new(
-                        DummyStore {
-                            commits: commits.clone(),
-                            conflicts: usize::MAX,
-                            load_error: None,
-                        },
-                        vec![],
-                        Arc::default(),
-                    )
-                }
-            },
-            no_delay_policy(3),
-        );
+        let conflict_executor: Arc<dyn CommandExecutor<DummyAggregate>> =
+            Arc::new(CqrsCommandExecutor::<DummyAggregate, _>::new(
+                {
+                    let commits = commits.clone();
+                    move |_| {
+                        CqrsFramework::new(
+                            DummyStore {
+                                commits: commits.clone(),
+                                conflicts: usize::MAX,
+                                load_error: None,
+                            },
+                            vec![],
+                            Arc::default(),
+                        )
+                    }
+                },
+                no_delay_policy(3),
+            ));
         assert_eq!(
             conflict_executor
                 .execute("aggregate", DummyCommand::Record("value".to_owned()), vec![])
@@ -246,7 +304,7 @@ mod tests {
             || AggregateError::DeserializationError(Box::new(io::Error::other("json"))),
             || AggregateError::UnexpectedError(Box::new(io::Error::other("unexpected"))),
         ] {
-            let executor = CqrsCommandExecutor::<DummyAggregate, _>::new(
+            let executor: Arc<dyn CommandExecutor<DummyAggregate>> = Arc::new(CqrsCommandExecutor::<DummyAggregate, _>::new(
                 move |_| {
                     CqrsFramework::new(
                         DummyStore {
@@ -259,7 +317,7 @@ mod tests {
                     )
                 },
                 no_delay_policy(3),
-            );
+            ));
             assert_eq!(
                 executor
                     .execute("aggregate", DummyCommand::Record("value".to_owned()), vec![])

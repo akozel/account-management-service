@@ -113,7 +113,7 @@ cross-layer enum.
 
 ## Retry ownership
 
-- `cqrs-runtime::CqrsCommandExecutor` owns the short optimistic-conflict retry.
+- `cqrs_runtime::command::CqrsCommandExecutor` owns the short optimistic-conflict retry.
   An aggregate-specific gateway computes the aggregate ID and delegates the
   unchanged command and prebuilt tasks. The executor builds one framework per
   command and reloads aggregate state for each attempt. `max_attempts` counts
@@ -162,7 +162,7 @@ account-managements-service/src/
   owns system clocks, and `console` owns development console output adapters.
 - `infrastructure/cqrs/{feature}_gateway.rs` implements the feature gateway. It accepts
   the domain command created by application, derives any framework aggregate id,
-  delegates it to `cqrs_runtime::command::CqrsCommandExecutor`, and follows
+  delegates it to an injected `Arc<dyn cqrs_runtime::command::CommandExecutor<A>>`, and follows
   [Error boundaries](#error-boundaries).
   It must not map a domain rejection or conflict to a service error.
   Command gateways do not expose reconstructed aggregate state to the
@@ -181,10 +181,11 @@ account-managements-service/src/
   it. The default level is `info`, configurable through `RUST_LOG`. Keep domain
   code free of logging and never include outbox payloads or secrets in failure
   events.
-- `main` is the only composition root. It constructs the runtime PostgreSQL adapter,
-  event store, CQRS framework, feature gateway, feature service, and router in
-  that order. Infrastructure modules must not provide factories that compose
-  several technologies.
+- `main` is the only composition root. It calls the runtime's checked PostgreSQL
+  command factory, then constructs the feature gateway, feature service and
+  router. Technical repository/store/framework construction belongs to
+  `cqrs-runtime`; service infrastructure must not provide factories that compose
+  several technologies or duplicate that runtime assembly.
 
 ### Explicit transactional outbox
 
@@ -250,21 +251,27 @@ an event before issuing SQL. The one event, optional snapshot, and tasks are
 then committed by one atomic statement. Supporting multi-event commands
 requires a separate snapshot-contract change.
 
-`main` injects a `build_framework` closure into each CQRS gateway. For each
-command, it creates a PostgreSQL repository carrying that call's immutable
-task list, then the standard event store and CQRS framework. This keeps
-construction of multiple technologies in the composition root while
-preserving `cqrs-es` snapshot and replay behavior. Share pools, never mutable
-per-command task buffers.
+`main` injects a ready `CommandExecutor<A>` into each CQRS gateway. The standard
+`postgres::command_executor` factory uses unit services and no queries. Its
+checked `PostgresCommandConfig` has a positive snapshot interval (default 25)
+and the existing conflict retry policy. For each command, the factory creates
+a repository carrying that call's immutable tasks, then the snapshot store and
+framework. It performs no I/O and reads no environment variables. Share pools,
+never mutable per-command task buffers. Keep `CqrsCommandExecutor::new` for custom
+stores/services/queries in tests or nonstandard integrations; gateways themselves
+do not own factory or retry configuration.
 
 ```rust
-let gateway = CqrsInvoiceGateway::new(move |tasks| {
-    let repository = PostgresEventRepositoryWithOutbox::new(pool.clone())
-        .with_outbox(tasks);
-    let store = PersistedEventStore::new_snapshot_store(repository, 25);
-    CqrsFramework::new(store, vec![], ())
-}, AggregateConflictRetryPolicy::default());
+let executor = cqrs_runtime::postgres::command_executor::<Invoice>(
+    pool.clone(), cqrs_runtime::postgres::PostgresCommandConfig::default(),
+);
+let gateway = CqrsInvoiceGateway::new(executor);
 ```
+
+The current cqrs-es snapshot path reapplies accepted events to already changed
+aggregate state. `apply` must tolerate the repeat (the service assigns accepted
+state); increment/append models require a separate snapshot-contract fix. See
+[snapshot reapplication](../../../doc/known_issues/cqrs_snapshot_event_reapplication.md).
 
 Application owns versioned business task DTOs, handler implementations, and
 sender ports. `cqrs-runtime` owns the generic task, queue and handler traits,

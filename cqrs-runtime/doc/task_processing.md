@@ -301,8 +301,14 @@ accepted by a receiver. There is no heartbeat/renewal or exactly-once guarantee.
    do not make the worker rebuild the source aggregate from its event history.
 3. Apply [001-event-store.sql](../sql/001-event-store.sql) and
    [002-transactional-outbox.sql](../sql/002-transactional-outbox.sql) to the
-   adapter's database. Compose repositories, event stores, and command gateways
-   in the host's composition root.
+   adapter's database. In the host's composition root, build
+   `postgres::command_executor::<A>(pool, PostgresCommandConfig)` and inject the
+   returned `Arc<dyn command::CommandExecutor<A>>` into the aggregate gateway.
+   The gateway selects the aggregate ID. The factory uses unit services, no
+   queries, and a checked positive snapshot interval (default 25); it performs
+   no I/O or environment lookup. Use `CqrsCommandExecutor::new` for custom
+   framework factories. Current upstream snapshots require repeat-tolerant
+   event application; see the [snapshot issue](../../doc/known_issues/cqrs_snapshot_event_reapplication.md).
 4. Implement handlers/sender ports, then build a `TaskHandlerRegistry` per
    permanent Tokio worker. It rejects empty and duplicate registrations. Each fallible `HandlerRegistryFactory` invocation
    must expose the same ordered format list as the coordinator.

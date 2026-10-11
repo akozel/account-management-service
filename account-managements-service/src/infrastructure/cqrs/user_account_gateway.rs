@@ -1,7 +1,8 @@
+use std::sync::Arc;
+
 use async_trait::async_trait;
-use cqrs_es::{CqrsFramework, EventStore};
 use cqrs_runtime::{
-    command::{AggregateConflictRetryPolicy, CommandGatewayError, CqrsCommandExecutor},
+    command::{CommandExecutor, CommandGatewayError},
     outbox::NewOutboxTask,
 };
 
@@ -10,25 +11,18 @@ use crate::{
     domain::{UserAccount, UserAccountCommand, UserAccountError},
 };
 
-pub struct CqrsUserAccountGateway<BuildFramework> {
-    executor: CqrsCommandExecutor<UserAccount, BuildFramework>,
+pub struct CqrsUserAccountGateway {
+    executor: Arc<dyn CommandExecutor<UserAccount>>,
 }
 
-impl<BuildFramework> CqrsUserAccountGateway<BuildFramework> {
-    pub fn new(build_framework: BuildFramework, retry_policy: AggregateConflictRetryPolicy) -> Self {
-        Self {
-            executor: CqrsCommandExecutor::new(build_framework, retry_policy),
-        }
+impl CqrsUserAccountGateway {
+    pub fn new(executor: Arc<dyn CommandExecutor<UserAccount>>) -> Self {
+        Self { executor }
     }
 }
 
 #[async_trait]
-impl<BuildFramework, ES> UserAccountGateway for CqrsUserAccountGateway<BuildFramework>
-where
-    BuildFramework: Fn(Vec<NewOutboxTask>) -> CqrsFramework<UserAccount, ES> + Send + Sync,
-    ES: EventStore<UserAccount> + 'static,
-    ES::AC: Send,
-{
+impl UserAccountGateway for CqrsUserAccountGateway {
     async fn execute_with_outbox(
         &self,
         command: UserAccountCommand,

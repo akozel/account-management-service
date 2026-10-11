@@ -1,7 +1,8 @@
+use std::sync::Arc;
+
 use async_trait::async_trait;
-use cqrs_es::{CqrsFramework, EventStore};
 use cqrs_runtime::{
-    command::{AggregateConflictRetryPolicy, CommandGatewayError, CqrsCommandExecutor},
+    command::{CommandExecutor, CommandGatewayError},
     outbox::NewOutboxTask,
 };
 
@@ -10,25 +11,18 @@ use crate::{
     domain::{EmailReservation, EmailReservationCommand, EmailReservationError},
 };
 
-pub struct CqrsEmailReservationGateway<BuildFramework> {
-    executor: CqrsCommandExecutor<EmailReservation, BuildFramework>,
+pub struct CqrsEmailReservationGateway {
+    executor: Arc<dyn CommandExecutor<EmailReservation>>,
 }
 
-impl<BuildFramework> CqrsEmailReservationGateway<BuildFramework> {
-    pub fn new(build_framework: BuildFramework, retry_policy: AggregateConflictRetryPolicy) -> Self {
-        Self {
-            executor: CqrsCommandExecutor::new(build_framework, retry_policy),
-        }
+impl CqrsEmailReservationGateway {
+    pub fn new(executor: Arc<dyn CommandExecutor<EmailReservation>>) -> Self {
+        Self { executor }
     }
 }
 
 #[async_trait]
-impl<BuildFramework, ES> EmailReservationGateway for CqrsEmailReservationGateway<BuildFramework>
-where
-    BuildFramework: Fn(Vec<NewOutboxTask>) -> CqrsFramework<EmailReservation, ES> + Send + Sync,
-    ES: EventStore<EmailReservation> + 'static,
-    ES::AC: Send,
-{
+impl EmailReservationGateway for CqrsEmailReservationGateway {
     async fn execute(&self, command: EmailReservationCommand) -> Result<(), CommandGatewayError<EmailReservationError>> {
         self.execute_with_outbox(command, Vec::new()).await
     }

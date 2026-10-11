@@ -1,6 +1,8 @@
+mod command_factory;
 mod event_repository_with_outbox;
 mod outbox_queue;
 
+pub use command_factory::{PostgresCommandConfig, PostgresCommandConfigError, command_executor};
 pub use event_repository_with_outbox::PostgresEventRepositoryWithOutbox;
 pub use outbox_queue::{PostgresOutboxQueue, PostgresOutboxQueueConfig, PostgresOutboxQueueConfigError};
 

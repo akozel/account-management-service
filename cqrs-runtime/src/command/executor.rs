@@ -1,9 +1,10 @@
-use super::{AggregateConflictRetryPolicy, CommandGatewayError, retry::retry_on_aggregate_conflict};
+use super::{AggregateConflictRetryPolicy, CommandExecutor, CommandGatewayError, retry::retry_on_aggregate_conflict};
 use crate::outbox::NewOutboxTask;
+use async_trait::async_trait;
 use cqrs_es::{Aggregate, AggregateError, CqrsFramework, EventStore};
 use std::{error::Error, marker::PhantomData};
 /// Executes commands for one aggregate type through frameworks supplied by the
-/// composition root.
+/// composition root or a runtime adapter factory.
 ///
 /// The framework is built exactly once per [`execute`](Self::execute) call.
 /// Every optimistic-conflict attempt reloads aggregate state through that same
@@ -43,9 +44,32 @@ where
         ES::AC: Send,
     {
         let framework = (self.build_framework)(tasks);
-        retry_on_aggregate_conflict(self.retry_policy, || framework.execute(aggregate_id, command.clone()))
-            .await
-            .map_err(map_aggregate_error)
+        let framework_ref = &framework;
+        retry_on_aggregate_conflict(self.retry_policy, move || {
+            framework_ref.execute(aggregate_id, command.clone())
+        })
+        .await
+        .map_err(map_aggregate_error)
+    }
+}
+
+#[async_trait]
+impl<A, BuildFramework, ES> CommandExecutor<A> for CqrsCommandExecutor<A, BuildFramework>
+where
+    A: Aggregate + 'static,
+    A::Command: Clone + Send + 'static,
+    A::Error: Send + 'static,
+    BuildFramework: Fn(Vec<NewOutboxTask>) -> CqrsFramework<A, ES> + Send + Sync,
+    ES: EventStore<A> + 'static,
+    ES::AC: Send,
+{
+    async fn execute(
+        &self,
+        aggregate_id: &str,
+        command: A::Command,
+        tasks: Vec<NewOutboxTask>,
+    ) -> Result<(), CommandGatewayError<A::Error>> {
+        CqrsCommandExecutor::execute(self, aggregate_id, command, tasks).await
     }
 }
 

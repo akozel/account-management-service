@@ -11,6 +11,7 @@ use account_managements_service::{
             tasks::{create_account::create_account_task_handler, record_account_created::record_account_created_task_handler},
         },
     },
+    domain::{EmailReservation, UserAccount},
     infrastructure::{
         console::ConsoleVerificationCodeSender,
         cqrs::{email_reservation_gateway::CqrsEmailReservationGateway, user_account_gateway::CqrsUserAccountGateway},
@@ -20,11 +21,9 @@ use account_managements_service::{
     },
     presentation,
 };
-use cqrs_es::{CqrsFramework, persist::PersistedEventStore};
 use cqrs_runtime::{
-    command::AggregateConflictRetryPolicy,
     outbox::{OutboxTaskCoordinatorConfig, TaskHandlerRegistry, outbox_task_coordinator_with_config},
-    postgres::{PostgresEventRepositoryWithOutbox, PostgresOutboxQueue, PostgresOutboxQueueConfig},
+    postgres::{PostgresCommandConfig, PostgresOutboxQueue, PostgresOutboxQueueConfig, command_executor},
     worker,
 };
 use runtime::RuntimeError;
@@ -43,28 +42,18 @@ async fn main() -> Result<(), RuntimeError> {
     let postgres_queue_config = PostgresOutboxQueueConfig::from_env().expect("valid PostgreSQL outbox timeout");
 
     let pool = postgres_es::default_postgress_pool(&database_url).await;
-    let aggregate_conflict_retry = AggregateConflictRetryPolicy::default();
-    let command_pool = pool.clone();
-    let gateway = Arc::new(CqrsEmailReservationGateway::new(
-        move |tasks| {
-            let repository = PostgresEventRepositoryWithOutbox::new(command_pool.clone()).with_outbox(tasks);
-            let store = PersistedEventStore::new_snapshot_store(repository, 25);
-            CqrsFramework::new(store, Vec::new(), ())
-        },
-        aggregate_conflict_retry,
-    ));
+    let command_config = PostgresCommandConfig::default();
+    let gateway = Arc::new(CqrsEmailReservationGateway::new(command_executor::<EmailReservation>(
+        pool.clone(),
+        command_config.clone(),
+    )));
     let queue = Arc::new(
         PostgresOutboxQueue::with_config(pool.clone(), postgres_queue_config).expect("valid PostgreSQL outbox configuration"),
     );
-    let account_pool = pool.clone();
-    let account_gateway = Arc::new(CqrsUserAccountGateway::new(
-        move |tasks| {
-            let repository = PostgresEventRepositoryWithOutbox::new(account_pool.clone()).with_outbox(tasks);
-            let store = PersistedEventStore::new_snapshot_store(repository, 25);
-            CqrsFramework::new(store, Vec::new(), ())
-        },
-        aggregate_conflict_retry,
-    ));
+    let account_gateway = Arc::new(CqrsUserAccountGateway::new(command_executor::<UserAccount>(
+        pool.clone(),
+        command_config,
+    )));
     let registration = registration_service(gateway.clone(), account_gateway, Arc::new(SystemRegistrationClock));
     let http_registration = registration.clone();
     let handler_factory: worker::HandlerRegistryFactory = Arc::new(move || {

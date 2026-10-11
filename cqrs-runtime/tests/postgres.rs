@@ -43,6 +43,8 @@ use testcontainers::{
 use tokio_util::sync::CancellationToken;
 use uuid::Uuid;
 
+#[path = "postgres/command_factory.rs"]
+mod command_factory;
 #[path = "postgres/persistence.rs"]
 mod persistence;
 #[path = "postgres/processing.rs"]

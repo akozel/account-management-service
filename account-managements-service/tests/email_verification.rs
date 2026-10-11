@@ -37,9 +37,12 @@ use cqrs_es::{
     persist::{EventStoreAggregateContext, PersistedEventRepository, PersistedEventStore},
 };
 use cqrs_runtime::{
-    command::AggregateConflictRetryPolicy,
+    command::{AggregateConflictRetryPolicy, CqrsCommandExecutor},
     outbox::{OutboxQueue, TaskFormat, TaskHandlerError},
-    postgres::{EVENT_STORE_SCHEMA, PostgresEventRepositoryWithOutbox, PostgresOutboxQueue, TRANSACTIONAL_OUTBOX_SCHEMA},
+    postgres::{
+        EVENT_STORE_SCHEMA, PostgresCommandConfig, PostgresEventRepositoryWithOutbox, PostgresOutboxQueue,
+        TRANSACTIONAL_OUTBOX_SCHEMA, command_executor,
+    },
 };
 use serde_json::{Value, json};
 use sha2::{Digest, Sha256};
@@ -106,14 +109,10 @@ fn store(pool: &PgPool) -> Store {
 }
 
 fn gateway(pool: &PgPool) -> Arc<dyn EmailReservationGateway> {
-    let command_pool = pool.clone();
-    Arc::new(CqrsEmailReservationGateway::new(
-        move |messages| {
-            let repository = PostgresEventRepositoryWithOutbox::new(command_pool.clone()).with_outbox(messages);
-            cqrs_es::CqrsFramework::new(PersistedEventStore::new_snapshot_store(repository, 3), vec![], ())
-        },
-        AggregateConflictRetryPolicy::default(),
-    ))
+    Arc::new(CqrsEmailReservationGateway::new(command_executor::<EmailReservation>(
+        pool.clone(),
+        PostgresCommandConfig::new(3, AggregateConflictRetryPolicy::default()).unwrap(),
+    )))
 }
 
 struct TestGenerator {
@@ -629,7 +628,7 @@ fn gated_app(pool: &PgPool, gate: Arc<RaceGate>, first: bool, first_id: u64, cod
     let command_pool = pool.clone();
     let gate_once = Arc::new(AtomicBool::new(true));
     let wait_once = Arc::new(AtomicBool::new(true));
-    let gateway = Arc::new(CqrsEmailReservationGateway::new(
+    let gateway = Arc::new(CqrsEmailReservationGateway::new(Arc::new(CqrsCommandExecutor::new(
         move |messages| {
             let repository = PostgresEventRepositoryWithOutbox::new(command_pool.clone()).with_outbox(messages);
             let gated = GatedStore {
@@ -642,7 +641,7 @@ fn gated_app(pool: &PgPool, gate: Arc<RaceGate>, first: bool, first_id: u64, cod
             cqrs_es::CqrsFramework::new(gated, vec![], ())
         },
         AggregateConflictRetryPolicy::default(),
-    ));
+    ))));
     presentation::http::router(
         email_reservation_service(gateway, Arc::new(TestGenerator::new(first_id, code))),
         Arc::new(UnusedRegistrationService),

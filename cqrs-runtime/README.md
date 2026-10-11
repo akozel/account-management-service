@@ -13,11 +13,55 @@ responsibilities and Mermaid diagrams of command publication and task delivery.
 
 - Base: command execution, optimistic-conflict retry, durable task DTOs,
   handler routing, and task coordination.
-- `postgres`: event repository, queue, and canonical SQL assets.
+- `postgres`: checked command factory, event repository, queue, and canonical SQL assets.
 - `worker`: JoinSet-supervised permanent Tokio workers, a bounded async-channel queue, and shutdown draining.
 
 Both optional features are enabled by default. Use
 `default-features = false` when only the base contracts are needed.
+
+## Command integration
+
+The host's aggregate gateway selects the aggregate ID and delegates to
+`Arc<dyn command::CommandExecutor<A>>`. With the `postgres` feature, assemble
+the standard snapshot-backed executor through `postgres::command_executor`:
+
+```rust
+use std::sync::Arc;
+use cqrs_es::Aggregate;
+use cqrs_runtime::{
+    command::CommandExecutor,
+    postgres::{PostgresCommandConfig, command_executor},
+};
+use sqlx::PgPool;
+
+fn executor_for<A>(pool: PgPool) -> Arc<dyn CommandExecutor<A>>
+where
+    A: Aggregate<Services = ()> + 'static,
+    A::Command: Clone + Send + 'static,
+    A::Error: Send + 'static,
+{
+    command_executor::<A>(pool, PostgresCommandConfig::default())
+}
+```
+
+The default snapshot interval is 25 and the existing optimistic-conflict policy
+allows three total attempts. `PostgresCommandConfig::new(interval, policy)`
+rejects a zero interval; fields are private and exposed through getters.
+Neither configuration nor factory reads the environment. The factory performs
+no I/O, so it returns the executor directly, without `Result`.
+
+Each command creates one framework and a fresh repository carrying only that
+call's immutable tasks. Conflict retries reuse the framework and reload state;
+concurrent calls share only the pool. The ready-made factory uses unit services
+and no queries. For custom stores, services, or queries, retain
+`CqrsCommandExecutor::new(build_framework, retry_policy)` and inject that executor
+through the same trait. The host still chooses business dependencies explicitly.
+
+The current cqrs-es snapshot path reapplies accepted events to already changed
+state. Aggregate `apply` must tolerate that repeat, as the service's state
+assignments do. Increment/append aggregates need a separate snapshot-contract
+fix before using this factory; see the
+[snapshot reapplication issue](../doc/known_issues/cqrs_snapshot_event_reapplication.md).
 
 ## Task integration
 

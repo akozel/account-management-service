@@ -16,20 +16,20 @@ use account_managements_service::{
 };
 use cqrs_es::{AggregateError, CqrsFramework, EventEnvelope, EventStore, mem_store::MemStore};
 use cqrs_runtime::{
-    command::{AggregateConflictRetryPolicy, CommandGatewayError},
+    command::{AggregateConflictRetryPolicy, CommandGatewayError, CqrsCommandExecutor},
     outbox::NewOutboxTask,
 };
 
 #[tokio::test]
 async fn executes_command_and_preserves_domain_rejection() {
     let store = MemStore::<EmailReservation>::default();
-    let gateway = CqrsEmailReservationGateway::new(
+    let gateway = CqrsEmailReservationGateway::new(Arc::new(CqrsCommandExecutor::new(
         move |tasks: Vec<NewOutboxTask>| {
             assert!(tasks.is_empty());
             CqrsFramework::new(store.clone(), Vec::new(), ())
         },
         AggregateConflictRetryPolicy::default(),
-    );
+    )));
     let email = Email::parse("alice@example.com").expect("test email must be valid");
     let account_id: UserAccountId = "26e91668-f9fc-4be4-bd9d-321fba42e18b".parse().unwrap();
 
@@ -115,14 +115,14 @@ async fn conflict_retry_reuses_one_framework_and_reloads_before_returning_domain
     };
     let built = builds.clone();
     let observed_task_ids = task_ids.clone();
-    let gateway = CqrsEmailReservationGateway::new(
+    let gateway = CqrsEmailReservationGateway::new(Arc::new(CqrsCommandExecutor::new(
         move |tasks: Vec<NewOutboxTask>| {
             built.fetch_add(1, Ordering::SeqCst);
             observed_task_ids.lock().unwrap().extend(tasks.iter().map(|task| task.id()));
             CqrsFramework::new(store.clone(), Vec::new(), ())
         },
         AggregateConflictRetryPolicy::new(3, Duration::ZERO, Duration::ZERO, 0.0).unwrap(),
-    );
+    )));
     let command = EmailReservationCommand::ReserveEmail {
         email: email.clone(),
         account_id,
