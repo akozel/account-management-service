@@ -31,7 +31,7 @@ helpers можно перенести после этих изменений. Co
 | 1. Командный путь PostgreSQL | Checked config, готовая factory, CommandExecutor interface, два простых gateways; сохраняются retries, snapshot replay и atomic event/tasks. 159 tests passed; line coverage 97.97%; все обязательные проверки прошли. | Выполнено |
 | 2. Подготовка outbox | Checked OutboxRuntimeConfig, prepared registries и PostgreSQL helper; все C registries проверяются до HTTP и используются workers. 166 tests passed; line coverage 97.97%; обязательные и feature checks прошли. | Выполнено |
 | 3. Lifecycle процесса | [План и реализация](../backlog/cqrs_runtime_host_lifecycle.md): optional host владеет signals/token/spawn/drain; lifecycle tests в runtime, Axum test в сервисе. 176 tests passed; line coverage 97.79%; обязательные и feature checks прошли. | Выполнено |
-| 4. Типизированные tasks | Runtime проверяет format и декодирует payload; бизнес-handler получает DTO и выполняет свою операцию. Общие decode tests и бизнес-redelivery tests проходят. | Backlog |
+| 4. Типизированные tasks | [План и реализация](../backlog/cqrs_runtime_typed_task_adapter.md): boxed typed adapter, три бизнес-handler и borrowed sender context. 187 tests passed; line coverage 97.91%; обязательные и feature checks прошли. | Выполнено |
 | 5. Конфигурация и диагностика | ServiceConfig, fallible pool connection, optional telemetry, private env helpers и safe storage categories; настройки валидируются до подключения БД. | Backlog |
 | 6. Workspace и CI | Общие dependency versions с сохранением features/optional; compile matrix покрывает независимые runtime features. | Backlog |
 
@@ -192,6 +192,12 @@ tests перенести в host.
 
 ## Этап 4. Typed task adapter
 
+[Сохраненный план и результаты реализации](../backlog/cqrs_runtime_typed_task_adapter.md).
+Public helper возвращает `Result<Box<dyn TaskHandler>, TaskFormatError>`;
+конкретный adapter приватный. Три сервисных factories сохраняют сигнатуры и
+используют typed handlers. По согласованному расширению этапа sender-порт теперь
+принимает `&TaskDelivery`, а owned `DeliveryContext` удален без compatibility alias.
+
 В `outbox` добавить адаптер `typed_task_handler::<P, H>(handler)`, где
 `P: TaskPayload + DeserializeOwned + Send + 'static`. Он реализует существующий
 `TaskHandler`, регистрирует проверенный `TaskFormat::of::<P>()`, проверяет format
@@ -224,9 +230,11 @@ reason содержит безопасные type/version, но не payload и 
 принадлежит приложению. `delivery_error` и классификация exact repeat остаются
 бизнес-решениями. В адаптер не добавляются retry, settlement или successor tasks.
 
-Для контекста достаточно существующего `&TaskDelivery`; еще один универсальный
-`DeliveryContext` не обязателен. Удаление локального owned context sender-порта
-можно решать отдельно, если его использование действительно станет избыточным.
+Контекст handler и sender — исходный `&TaskDelivery`; ID, attempt и metadata
+доступны через getters на протяжении async invocation. Metadata не клонируется
+для передачи sender. Console сохраняет прежний output и write/flush error mapping.
+Application handler tests и их фейки перенесены в service integration suite;
+общие format/decode tests принадлежат runtime.
 
 ## Этап 5. Конфигурация, logging, диагностика и небольшие helpers
 
@@ -320,6 +328,7 @@ schema, event formats или task payloads.
 
 При исходном review PostgreSQL suites и llvm-cov не запускались. Эти исходные
 checks не подтверждают реализацию; актуальные результаты реализации записаны в документах
-[этапа 1](../backlog/cqrs_runtime_command_factory.md) и
-[этапа 2](../backlog/cqrs_runtime_outbox_preparation.md) и
-[этапа 3](../backlog/cqrs_runtime_host_lifecycle.md).
+[этапа 1](../backlog/cqrs_runtime_command_factory.md),
+[этапа 2](../backlog/cqrs_runtime_outbox_preparation.md),
+[этапа 3](../backlog/cqrs_runtime_host_lifecycle.md) и
+[этапа 4](../backlog/cqrs_runtime_typed_task_adapter.md).

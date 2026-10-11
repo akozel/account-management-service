@@ -139,4 +139,55 @@ mod tests {
         let error = TaskHandlerRegistryError::from(crate::outbox::TaskFormatError::EmptyType);
         assert!(matches!(error, TaskHandlerRegistryError::InvalidFormat(_)));
     }
+
+    #[tokio::test]
+    async fn typed_adapters_route_versions_separately_and_reject_duplicate_formats() {
+        use crate::outbox::{TaskPayload, TypedTaskHandler, typed_task_handler};
+        use serde::{Deserialize, Serialize};
+        use serde_json::json;
+
+        #[derive(Serialize, Deserialize)]
+        struct Payload<const VERSION: i32> {
+            value: String,
+        }
+        impl<const VERSION: i32> TaskPayload for Payload<VERSION> {
+            const TASK_TYPE: &'static str = "versioned_operation";
+            const TASK_VERSION: i32 = VERSION;
+        }
+        struct Handler(Arc<Mutex<Vec<(i32, String)>>>);
+        #[async_trait]
+        impl<const VERSION: i32> TypedTaskHandler<Payload<VERSION>> for Handler {
+            async fn handle(&mut self, payload: Payload<VERSION>, _: &TaskDelivery) -> Result<(), TaskHandlerError> {
+                self.0.lock().unwrap().push((VERSION, payload.value));
+                Ok(())
+            }
+        }
+        let calls = Arc::new(Mutex::new(Vec::new()));
+        let first = TaskFormat::of::<Payload<1>>().unwrap();
+        let second = TaskFormat::of::<Payload<2>>().unwrap();
+        let mut registry = TaskHandlerRegistry::try_new(vec![
+            typed_task_handler::<Payload<1>, _>(Handler(calls.clone())).unwrap(),
+            typed_task_handler::<Payload<2>, _>(Handler(calls.clone())).unwrap(),
+        ])
+        .unwrap();
+        assert_eq!(registry.formats(), vec![first.clone(), second.clone()]);
+        let base = claimed();
+        for format in [second, first.clone()] {
+            let task = TaskDelivery::new(
+                base.delivery().id(),
+                format,
+                json!({"value":"decoded"}),
+                base.delivery().metadata().clone(),
+                1,
+            )
+            .unwrap();
+            registry.handle(&task).await.unwrap();
+        }
+        assert_eq!(*calls.lock().unwrap(), vec![(2, "decoded".into()), (1, "decoded".into())]);
+        assert!(matches!(TaskHandlerRegistry::try_new(vec![
+            typed_task_handler::<Payload<1>, _>(Handler(calls.clone())).unwrap(),
+            typed_task_handler::<Payload<1>, _>(Handler(calls.clone())).unwrap(),
+        ]), Err(TaskHandlerRegistryError::DuplicateFormat(format)) if format == first));
+        assert_eq!(calls.lock().unwrap().len(), 2);
+    }
 }

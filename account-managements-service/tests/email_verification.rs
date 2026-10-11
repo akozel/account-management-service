@@ -13,7 +13,7 @@ use account_managements_service::{
             gateway::EmailReservationGateway,
             service::{RegistrationMaterialGenerator, email_reservation_service},
             tasks::send_verification_code::{
-                DeliveryContext, VerificationCodeDelivery, VerificationCodeSender, send_verification_code_task_handler,
+                VerificationCodeDelivery, VerificationCodeSender, send_verification_code_task_handler,
                 v1::SendVerificationCodeTaskV1,
             },
         },
@@ -509,7 +509,11 @@ struct RecordingSender(Arc<Mutex<Vec<VerificationCodeDelivery>>>);
 
 #[async_trait]
 impl VerificationCodeSender for RecordingSender {
-    async fn send(&mut self, message: VerificationCodeDelivery, _: DeliveryContext) -> Result<(), TaskHandlerError> {
+    async fn send(
+        &mut self,
+        message: VerificationCodeDelivery,
+        _: &cqrs_runtime::outbox::TaskDelivery,
+    ) -> Result<(), TaskHandlerError> {
         self.0.lock().unwrap().push(message);
         Ok(())
     }

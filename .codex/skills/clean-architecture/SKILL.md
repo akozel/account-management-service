@@ -72,7 +72,8 @@ account-managements-service/src/
   samples randomness again.
 - Versioned durable task DTOs live under `{capability}/tasks/{task}/v1.rs` and
   implement `cqrs_runtime::outbox::TaskPayload`; `{task}.rs` owns the current
-  `TaskHandler` implementation and any business sender port. Keep persisted
+  `TypedTaskHandler<P>` implementation and any business sender port. Wrap it
+  with `outbox::typed_task_handler` in the feature factory. Keep persisted
   DTOs readable while queued work can still be retried.
 - Presentation imports only `application::{capability}::service::{FeatureService,
   FeatureServiceError}`. Infrastructure implements the feature's
@@ -279,12 +280,28 @@ state); increment/append models require a separate snapshot-contract fix. See
 
 Application owns versioned business task DTOs, handler implementations, and
 sender ports. `cqrs-runtime` owns the generic task, queue and handler traits,
-the `OutboxTaskCoordinator`, and `TaskHandlerRegistry`. The registry
+the checked `typed_task_handler` adapter, `OutboxTaskCoordinator`, and
+`TaskHandlerRegistry`. The registry
 rejects empty and duplicate registrations and routes each type/version to one
 handler. The composition root supplies a business handler factory; runtime
 preparation creates all C registries before binding HTTP. The first registry
 supplies the coordinator's ordered claim formats and becomes worker zero's
 registry; the remaining C−1 must match. Unknown formats stay pending.
+Typed handlers receive an owned versioned DTO and the original `&TaskDelivery`.
+The base runtime adapter returns `Result<Box<dyn TaskHandler>, TaskFormatError>`,
+checks format on construction and delivery, and decodes borrowed JSON before
+calling business code. Payload/handler need Send, without Clone/Sync requirements.
+Format/decode failures are Permanent with safe expected type/version; type names
+outside ASCII letters/digits/underscore become `unknown` only in diagnostics.
+Never include payload, metadata, actual arbitrary type or serde error text.
+Business results and retry_after pass unchanged. Application keeps semantic
+validation, wire-to-current-input conversion and exact-repeat classification.
+One adapter handles one DTO version; raw TaskHandler supports custom multi-version
+handlers. Registry duplicate checks and claim formats remain unchanged.
+Application sender ports borrow the same TaskDelivery for ID/attempt/metadata;
+do not recreate an owned DeliveryContext or clone metadata just to pass context.
+Handler boundary tests and their fakes belong in the service integration suite;
+runtime adapter tests use local dummy DTOs and handlers in its private module.
 The runtime PostgreSQL adapter owns atomic claims, leases, token-checked settlements
 and expired-lease recovery. Concrete senders live under their infrastructure
 technology. Versioned wire DTOs are converted into current handler inputs.

@@ -19,6 +19,7 @@ mod queue;
 mod registry;
 mod retry;
 mod task;
+mod typed_handler;
 
 pub use coordinator::{
     OutboxTaskCoordinator, OutboxTaskCoordinatorConfig, OutboxTaskCoordinatorConfigError, outbox_task_coordinator,
@@ -33,5 +34,6 @@ pub use queue::{
 pub use registry::{TaskHandlerRegistry, TaskHandlerRegistryError};
 pub use retry::redelivery_backoff;
 pub use task::{NewOutboxTask, TaskFormat, TaskFormatError, TaskPayload, TaskSchedule, TaskValidationError};
+pub use typed_handler::{TypedTaskHandler, typed_task_handler};
 #[cfg(test)]
 pub(crate) mod test_support;

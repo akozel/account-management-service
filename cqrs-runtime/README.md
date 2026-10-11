@@ -12,7 +12,7 @@ responsibilities and Mermaid diagrams of command publication and task delivery.
 ## Features
 
 - Base: command execution, optimistic-conflict retry, durable task DTOs,
-  handler routing, and task coordination.
+  typed handler adaptation, handler routing, and task coordination.
 - `postgres`: checked command factory, event repository, queue, and canonical SQL assets.
 - `worker`: JoinSet-supervised permanent Tokio workers, a bounded async-channel queue, and shutdown draining.
 - `host`: process signals, shared cancellation and inbound/outbox draining; enables `worker` and `tokio/signal`, with no HTTP framework dependency.
@@ -75,6 +75,57 @@ result with `TaskHandlerError`. They cannot access the queue's `ClaimLease`.
 `ClaimedTask` is reserved for queue/coordinator ownership and settlement. Aggregates establish business
 prerequisites; workers may execute published tasks concurrently and out of
 order. Redelivery is expected, including after a successful effect.
+
+Use `outbox::TypedTaskHandler<P>` for one durable DTO version and adapt it through
+`outbox::typed_task_handler::<P, _>(handler)`. The helper returns
+`Result<Box<dyn TaskHandler>, TaskFormatError>` for the existing registry. It is
+part of the base API, with no optional feature requirement.
+
+```rust
+use async_trait::async_trait;
+use cqrs_runtime::outbox::{
+    TaskDelivery, TaskFormatError, TaskHandler, TaskHandlerError, TaskPayload,
+    TypedTaskHandler, typed_task_handler,
+};
+use serde::{Deserialize, Serialize};
+
+#[derive(Serialize, Deserialize)]
+struct InvoiceTaskV1 { invoice_id: String }
+impl TaskPayload for InvoiceTaskV1 {
+    const TASK_TYPE: &'static str = "process_invoice";
+    const TASK_VERSION: i32 = 1;
+}
+
+struct InvoiceHandler;
+#[async_trait]
+impl TypedTaskHandler<InvoiceTaskV1> for InvoiceHandler {
+    async fn handle(&mut self, payload: InvoiceTaskV1, delivery: &TaskDelivery)
+        -> Result<(), TaskHandlerError>
+    {
+        // Invoke one replay-safe business operation using payload.invoice_id.
+        // delivery.id()/metadata() carry any required stable operation context.
+        let _ = (payload.invoice_id, delivery.id());
+        Ok(())
+    }
+}
+
+fn handler() -> Result<Box<dyn TaskHandler>, TaskFormatError> {
+    typed_task_handler::<InvoiceTaskV1, _>(InvoiceHandler)
+}
+```
+
+The adapter checks the expected format at construction, then compares format and
+decodes an owned DTO from borrowed JSON before each invocation. Payloads and
+handlers need `Send`, not `Clone` or `Sync`; the original `&TaskDelivery` and
+mutable handler state are preserved. Format/decode failures are `Permanent`
+with sanitized expected type/version, without payload, metadata or serde error
+text. Business errors, including backoff, pass unchanged. Additional fields
+follow the DTO's serde policy; current service v1 DTOs keep accepting them.
+Use separate adapters for v1/v2 or implement `TaskHandler` for a multi-version
+handler. Business validation, DTO conversion and exact-repeat classification
+remain application responsibilities. Sender ports may borrow `&TaskDelivery`
+throughout async work instead of constructing an owned context or cloning
+metadata; lease credentials remain inaccessible.
 
 The host applies [event-store SQL](sql/001-event-store.sql) and
 [outbox SQL](sql/002-transactional-outbox.sql), supplies handler factories and

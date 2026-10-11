@@ -13,7 +13,7 @@ For component boundaries, relationships, and the order of calls, see
 | --- | --- |
 | Domain/application | Check aggregate phases, publish dependent work with the event that establishes its prerequisite, and define completion of the operation. |
 | Business handler/sender | Perform one operation, classify its result, and make repeated or concurrent execution safe. |
-| Runtime coordinator/worker | Route supported formats, bound execution and storage waits, settle outcomes, and recover expired ownership. |
+| Runtime adapter/coordinator/worker | Check and decode typed task formats, route supported formats, bound execution and storage waits, settle outcomes, and recover expired ownership. |
 | Queue adapter | Atomically claim tasks, count attempts, provide a conservative local lease deadline, and fence settlement in storage. |
 
 An accepted event, its optional snapshot, and explicit tasks are committed
@@ -84,11 +84,51 @@ Domain events do not contain delivery controls.
 `TaskFormat`, `NewOutboxTask`, and `TaskDelivery` have checked constructors and
 private fields. Format names are nonempty, versions/attempt limits are positive,
 and payload/metadata must be JSON objects. This structural validation does not
-validate a version's business schema: the handler must decode and classify it.
+validate a version's business schema: the typed adapter decodes it, and the
+business handler validates and classifies its operation.
 `NewOutboxTask::scheduled`, `with_metadata`, and `with_max_attempts` are fallible
 builders that preserve the generated task ID. Defaults remain now/empty metadata/
 ten total claims. Invalid DTOs fail before SQL; database constraints still fence
 direct writers and enforce durable lifecycle invariants.
+
+### Typed task operations
+
+Implement `#[async_trait] TypedTaskHandler<P>` for one DTO version. Its method is
+`handle(&mut self, payload: P, delivery: &TaskDelivery) -> Result<(), TaskHandlerError>`.
+`P` implements `TaskPayload + DeserializeOwned + Send + 'static`; the handler is
+`Send`. Neither requires `Clone` or `Sync`. The base helper
+`typed_task_handler::<P, H>(handler)` accepts an owned `'static` handler and returns
+`Result<Box<dyn TaskHandler>, TaskFormatError>` for the existing registry.
+
+Construction validates `TaskFormat::of::<P>()` before registration and exposes
+only that format. Handling compares the complete format before decoding an owned
+DTO directly from borrowed JSON; the original `&TaskDelivery` reaches the business
+operation unchanged. Mutable handler state survives between deliveries. Serde
+settings remain on the DTO: extra fields are accepted by the current v1 DTOs,
+and a DTO with `deny_unknown_fields` retains that restriction.
+
+Wrong format returns `Permanent` with reason
+`unsupported task format for {type} v{version}`; decode failure returns
+`invalid {type} v{version} task payload`. Type/version identify the expected DTO.
+Only ASCII letters/digits/underscore are emitted for the type; other names become
+`unknown`, without changing the routing format. Actual arbitrary type names,
+payload, metadata and serde error text are omitted. Invalid inputs never invoke
+the business handler. Business success/errors, reasons and `retry_after` pass
+unchanged; the adapter adds no retries, settlement or successor task publication.
+
+Business handlers keep semantic validation, DTO-to-current-input conversion,
+and exact-redelivery classification. The verification handler still enforces a
+seven-digit code and converts v1 into `VerificationCodeDelivery`. Its sender now
+borrows the same `&TaskDelivery` throughout `send`; ID, attempt and metadata come
+from getters without an owned `DeliveryContext` or a metadata clone. Sender ports
+remain application-owned. A sender retaining data beyond the invocation must
+explicitly own the fields it needs.
+
+Register one adapter per supported DTO version. The registry rejects duplicate
+formats as before. Custom multi-version handlers can still implement `TaskHandler`;
+unsupported durable formats remain pending until a compatible worker claims them.
+See [typed adapter](../src/outbox/typed_handler.rs) and the
+[implementation plan](../../doc/backlog/cqrs_runtime_typed_task_adapter.md).
 
 ## Retry and task lifecycle
 
@@ -351,7 +391,9 @@ accepted by a receiver. There is no heartbeat/renewal or exactly-once guarantee.
    no I/O or environment lookup. Use `CqrsCommandExecutor::new` for custom
    framework factories. Current upstream snapshots require repeat-tolerant
    event application; see the [snapshot issue](../../doc/known_issues/cqrs_snapshot_event_reapplication.md).
-4. Implement handlers/sender ports and supply a synchronous fallible
+4. Implement typed handlers and application sender ports, adapting each DTO
+   version with `typed_task_handler` (or use `TaskHandler` for custom routing).
+   Supply a synchronous fallible
    `HandlerRegistryFactory` returning fresh mutable registries. `TaskHandlerRegistry`
    rejects empty/duplicate formats; every factory invocation must expose the same
    ordered format list. Preparation uses the first registry and builds the other
@@ -378,7 +420,7 @@ accepted by a receiver. There is no heartbeat/renewal or exactly-once guarantee.
    Retain failed work required for recovery.
 
 The APIs and their implementer contracts are documented beside
-[TaskHandler](../src/outbox/handler.rs),
+[TaskHandler](../src/outbox/handler.rs), [TypedTaskHandler](../src/outbox/typed_handler.rs),
 [OutboxQueue](../src/outbox/queue.rs),
 [delivery/lease](../src/outbox/delivery.rs),
 [coordinator](../src/outbox/coordinator.rs), and [worker](../src/worker.rs).

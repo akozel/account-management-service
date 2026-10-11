@@ -22,7 +22,7 @@ flowchart TB
         Gateway["Application / command gateway<br/>command and explicit NewOutboxTask list"]
         Aggregate["Aggregate<br/>business invariants and workflow phases"]
         Factory["HandlerRegistryFactory<br/>fresh handlers and sender state"]
-        Handler["Business TaskHandler<br/>one replay-safe operation"]
+        Handler["Business TypedTaskHandler&lt;P&gt;<br/>one replay-safe operation"]
         Sender["Sender port / adapter<br/>external-effect contract"]
     end
 
@@ -36,6 +36,7 @@ flowchart TB
         JoinSet["JoinSet<br/>worker lifecycle, restart and abort"]
         Coordinator["OutboxTaskCoordinator<br/>formats, execution budget, settlement"]
         Registry["TaskHandlerRegistry<br/>route by TaskFormat"]
+        TypedAdapter["typed_task_handler<br/>checked format and owned DTO decode"]
         QueuePort["OutboxQueue<br/>durable ownership port"]
     end
 
@@ -85,14 +86,25 @@ flowchart TB
     Slot -.->|"owns mutable registry"| Registry
     Slot -->|"execute_and_settle"| Coordinator
     Coordinator -->|"handle TaskDelivery"| Registry
-    Registry -->|"select handler"| Handler
+    Registry -->|"select single-version adapter"| TypedAdapter
+    TypedAdapter -->|"owned DTO and original TaskDelivery"| Handler
+    Registry -->|"custom multi-version TaskHandler"| Handler
     Handler -->|"target-aggregate command"| Gateway
-    Handler -->|"or one external effect"| Sender
+    Handler -->|"or one external effect with borrowed TaskDelivery"| Sender
     Sender -->|"stable operation key when required"| Receiver
     Coordinator -->|"claim / settle / recover"| QueuePort
     Queue -.->|"implements"| QueuePort
     Queue -->|"separate queue transactions"| Database
 ```
+
+The base typed adapter owns checked format registration and JSON decoding.
+Application owns versioned DTOs, semantic validation and business outcome
+classification. One adapter per DTO version joins the existing registry; custom
+multi-version `TaskHandler` implementations remain supported. Format/decode
+failures never call business code, and expose only sanitized expected type/version.
+The application verification sender borrows the original `TaskDelivery`; context
+metadata is not cloned for delivery. See the
+[typed task adapter plan](../../doc/backlog/cqrs_runtime_typed_task_adapter.md).
 
 `OutboxRuntimeConfig` checks coordinator/worker budgets at construction or env
 load time. PostgreSQL statement timeout remains adapter configuration.
@@ -211,6 +223,7 @@ sequenceDiagram
     box cqrs-runtime outbox
         participant Coordinator as Coordinator
         participant Registry as Worker registry
+        participant TypedAdapter as Typed task adapter
     end
     box cqrs-runtime postgres
         participant Queue as Queue adapter
@@ -253,17 +266,24 @@ sequenceDiagram
     alt Run or RetryOnly
         alt Run: full handler and settlement budgets fit
             Coordinator->>Registry: handle(task.delivery())
-            Registry->>Handler: Route by type/version, handle(TaskDelivery)
-            Note over Registry,Handler: No lock token or lease deadline crosses this boundary
-            Handler->>Operation: One replay-safe operation, with bounded local retries
-            alt Target-aggregate command
-                Operation->>Operation: Follow the command publication path above
-            else External effect
-                Operation->>Receiver: Send with the stable operation key when required
-                Receiver-->>Operation: Receiver result
+            Registry->>TypedAdapter: Route by type/version, handle(TaskDelivery)
+            TypedAdapter->>TypedAdapter: Compare format, decode owned DTO from borrowed JSON
+            Note over TypedAdapter,Handler: No lock token or lease deadline crosses this boundary
+            alt Invalid format or DTO schema
+                TypedAdapter-->>Registry: Permanent with safe expected type/version
+            else Valid DTO
+                TypedAdapter->>Handler: handle(owned DTO, original TaskDelivery)
+                Handler->>Operation: One replay-safe operation; sender borrows TaskDelivery
+                alt Target-aggregate command
+                    Operation->>Operation: Follow the command publication path above
+                else External effect
+                    Operation->>Receiver: Send with the stable operation key when required
+                    Receiver-->>Operation: Receiver result
+                end
+                Operation-->>Handler: Operation result
+                Handler-->>TypedAdapter: Ok / Retry / Permanent
+                TypedAdapter-->>Registry: Business result unchanged
             end
-            Operation-->>Handler: Operation result
-            Handler-->>Registry: Ok / Retry / Permanent
             Registry-->>Coordinator: Handler result
             Coordinator->>Coordinator: Classify SettlementRequest
             Note over Coordinator,Receiver: Handler timeout requests retry, accepted remote work may still finish
