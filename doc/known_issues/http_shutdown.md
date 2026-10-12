@@ -69,7 +69,8 @@ preStop и TERM доставлен своевременно. HTTP/observation/DB
 не реализованы как host deadlines; это план для обсуждения решения №10.
 См. [timeline в README](../../README.md#graceful-shutdown-timeline).
 
-Область: [composition root](../../account-managements-service/src/main.rs),
+Область: [владелец ресурсов Service](../../account-managements-service/src/startup/service.rs),
+[сборка приложения](../../account-managements-service/src/startup/wiring.rs),
 [runtime host](../../cqrs-runtime/src/host.rs) и
 [portable runtime guide](../../cqrs-runtime/doc/task_processing.md).
 Перенос host и согласованная семантика Drop/abort описаны в

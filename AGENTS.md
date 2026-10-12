@@ -29,7 +29,8 @@ account-managements-service/
   src/application/    Use cases and ports
   src/presentation/   Inbound adapters
   src/infrastructure/ Service-specific outbound adapters
-  src/main.rs         Composition root
+  src/startup/        Executable composition and service resource ownership
+  src/main.rs         Configuration → Service::prepare → Service::run entry point
 cqrs-runtime/         Generic command, outbox, PostgreSQL, and worker runtime
 ```
 
@@ -41,7 +42,7 @@ cqrs-runtime/         Generic command, outbox, PostgreSQL, and worker runtime
   `cargo test --workspace --all-features`.
 - After every change to Rust production code or tests, run
   `cargo llvm-cov --workspace --all-features --color never --ignore-filename-regex '(^|/)main\.rs$'
-  --fail-under-lines 90`. The composition root
+  --fail-under-lines 90`. The minimal entry point
   `account-managements-service/src/main.rs` is intentionally excluded from the
   report; all other production code remains in scope. The
   command fails automatically when total line coverage is below `90%`; add

@@ -285,6 +285,37 @@ pool before reporting the original failure. Startup diagnostics redact secrets
 and preserve sources. See the
 [startup plan and checks](doc/backlog/cqrs_runtime_configuration_logging.md).
 
+The executable entry point only loads configuration, prepares an owned service
+and runs it:
+
+```rust
+#[tokio::main]
+async fn main() -> Result<(), ServiceError> {
+    let config = ServiceConfig::load()?;
+    let service = Service::prepare(config).await?;
+    service.run().await
+}
+```
+
+The private [Service](account-managements-service/src/startup/service.rs) owns
+the PostgreSQL pool, HTTP listener/router and prepared task runtime.
+`prepare` installs the checked logger, connects the pool, assembles dependencies,
+retains every worker's dispatcher, then binds HTTP. It starts no workers or HTTP
+receive loop. `run(self)` delegates coordinated shutdown to the runtime host and
+closes the pool after both components finish, before reporting the original
+result. Failed preparation closes its connected pool before returning.
+
+[Wiring](account-managements-service/src/startup/wiring.rs) contains business
+services, routes and the factory that constructs fresh handlers/senders for each
+worker and restart. [Configuration](account-managements-service/src/config.rs)
+owns explicit dotenv/env loading and checked settings;
+[startup errors](account-managements-service/src/startup/error.rs) retain safe
+diagnostics. Startup modules contain no compatibility re-exports.
+
+Dropping an unstarted Service releases its listener/handlers. Normal awaited
+execution provides asynchronous pool cleanup; dropping/aborting the run future
+retains the host's existing cancellation behavior without guaranteeing cleanup.
+
 ## Graceful shutdown timeline
 
 The service shares a `CancellationToken` between HTTP, the outbox supervisor,

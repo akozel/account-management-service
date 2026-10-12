@@ -151,8 +151,11 @@ flowchart TD
     Pool -->|"connection error"| Report
 ```
 
-Private binary config/startup modules own settings and pool cleanup; host still
-owns component lifecycle. Startup error reporting never formats raw dotenv lines,
+Private binary ServiceConfig::load owns dotenv/env validation. Startup wiring
+assembles business dependencies; Service::prepare retains the pool, listener,
+router and TaskRuntime. Service::run delegates component lifecycle to host and
+closes its pool after both components finish, including errors.
+Startup error reporting never formats raw dotenv lines,
 connection options, URL/password or arbitrary SQLx/I/O causes. Native SQLx PG option
 behavior is preserved. Normal await closes pool on preparation/bind/host errors;
 Drop/abort cannot guarantee cleanup. No pool or host deadline is added. See the

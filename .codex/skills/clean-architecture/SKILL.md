@@ -27,11 +27,13 @@ configuration in this repository.
   contracts and coordination, PostgreSQL persistence, canonical SQL, and the
   worker supervisor and optional transport-independent process host. It must
   never depend on `account-managements-service` or Axum.
-- `main` composes business dependencies and HTTP adapters, passes inbound and
-  task runtime futures to `cqrs_runtime::host::lifecycle::run`, then closes the database pool
-  regardless of preparation/bind/host results before logging/returning the
-  binary ServiceError. Private config/startup modules own process configuration,
-  safe error reporting and pool cleanup; host retains component lifecycle.
+- `main` only loads checked ServiceConfig, awaits Service::prepare and consumes
+  Service::run. Private executable `startup/wiring.rs` is the composition root
+  for business dependencies, routes and a fresh dispatcher factory.
+  `startup/service.rs` owns the pool, listener, router and prepared TaskRuntime,
+  delegates lifecycle to `cqrs_runtime::host::lifecycle::run`, and closes the pool
+  before returning/reporting preparation, bind or host failures. Host retains
+  component lifecycle; Service owns process resources.
 - The optional `host` feature enables `worker` and `tokio/signal`. Its public
   `lifecycle`, `error`, and `signal` modules define `run`, `HostError` and
   `shutdown_signal` directly and own transport-independent coordination. No service-local
@@ -44,7 +46,9 @@ task runtime and queue configs. from_env snapshots supported keys, rejects non-U
 values and delegates to injected lookup. Update its key list and .env.example when
 adding settings. Required DATABASE_URL uses postgres/postgresql URI; BIND_ADDRESS
 requires numeric IPv4/IPv6 plus port. Executable dotenv loading allows only missing
-files; other errors are typed. Validate all settings before logger/DB initialization.
+files; other errors are typed. ServiceConfig::load owns that explicit dotenv/env
+step; from_env/from_lookup remain configuration parsers. Validate all settings
+before logger/DB initialization.
 Runtime must never load dotenv or install a subscriber implicitly.
 
 Runtime logging is optional and independent; telemetry is deferred. LoggingConfig
@@ -110,7 +114,7 @@ account-managements-service/src/
   DTOs readable while queued work can still be retried.
 - Presentation imports only `application::{capability}::service::{FeatureService,
   FeatureServiceError}`. Infrastructure implements the feature's
-  `gateway::FeatureGateway`. `main` composes a gateway through the service factory and
+  `gateway::FeatureGateway`. Executable startup wiring composes a gateway through the service factory and
   passes the resulting service to presentation.
 - Do not import a nested use case from outside its feature. Use Rust 2024 file
   modules; do not introduce `mod.rs`.
@@ -221,7 +225,7 @@ account-managements-service/src/
   LevelFilter aliases and parsing for RUST_LOG, without EnvFilter. Keep domain
   code free of logging and never include outbox payloads or secrets in failure
   events.
-- `main` is the only composition root. It calls the runtime's checked PostgreSQL
+- Private executable startup wiring is the composition root. It calls the runtime's checked PostgreSQL
   command factory, then constructs the feature gateway, feature service and
   router. Technical repository/store/framework construction belongs to
   `cqrs-runtime`; service infrastructure must not provide factories that compose
@@ -291,7 +295,7 @@ an event before issuing SQL. The one event, optional snapshot, and tasks are
 then committed by one atomic statement. Supporting multi-event commands
 requires a separate snapshot-contract change.
 
-`main` injects a ready `CommandExecutor<A>` into each CQRS gateway. The standard
+Executable startup wiring injects a ready `CommandExecutor<A>` into each CQRS gateway. The standard
 `postgres::command_factory::command_executor` factory uses unit services and no queries. Its
 checked `PostgresCommandConfig` has a positive snapshot interval (default 25)
 and the existing conflict retry policy. For each command, the factory creates
@@ -384,9 +388,10 @@ cancels its token and detaches task runtime for independent drain on a live Toki
 runtime, without awaiting components or guaranteeing DB cleanup. Preserve H+S
 task runtime drain and no host timeout for inbound/pool closure; force/watchdog policy
 remains [known issue #10](../../../doc/known_issues/http_shutdown.md).
-Recovery batches are capped at min(C, 32). `main` loads checked
-`TaskRuntimeConfig` before DB connection, builds the business handler factory,
-and calls `postgres::task_runtime_factory::prepare_task_runtime` before binding HTTP. Queue/executor/poller
+Recovery batches are capped at min(C, 32). ServiceConfig::load validates checked
+`TaskRuntimeConfig` before DB connection. Service preparation uses the business
+handler factory from startup wiring and calls
+`postgres::task_runtime_factory::prepare_task_runtime` before binding HTTP. Queue/executor/poller
 assembly and combined budget validation belong to runtime, with PostgreSQL statement
 cap kept separate. The helper is gated on both postgres and worker; neither feature
 implicitly enables the other. Configuration parsing/validation remains covered.
@@ -413,7 +418,7 @@ Sender ports and business outcome classification belong to
 application; delivery, storage deadlines, lease budgets, lock tokens, and
 monotonic claim deadlines belong to the runtime/queue adapter. Business handlers receive only immutable `TaskAttempt`, not queue ownership.
 `LeasedTask` and `TaskLease` remain platform context. Configuration parsing/validation
-stays in `cqrs-runtime`; `main` loads the combined config before DB connection.
+stays in `cqrs-runtime`; ServiceConfig::load checks the combined config before DB connection.
 Preparation builds/validates all dispatchers before opening listeners, without
 storage operations or background tasks. `TaskRuntime` owns the same
 dispatchers that workers receive and is consumed by run, without startup rebuild.
@@ -468,9 +473,11 @@ account-managements-service/src/
 
 ### Coverage boundary
 
-- `account-managements-service/src/main.rs` is the composition root. Exclude it from line coverage because
-  it only wires dependencies and starts the process; do not add brittle unit
-  tests around process startup.
+- `account-managements-service/src/main.rs` is the minimal executable entry point.
+  It remains the only coverage exclusion. Keep all private startup/config code,
+  including wiring and Service, in coverage. Test preparation ownership, error
+  cleanup and HTTP drain through Service using controlled signal futures.
+  Process-global logger setup and real dotenv loading use isolated child tests.
 - Keep `cqrs-runtime/src/host/` in coverage and test lifecycle/signal multiplexing
   with controlled futures rather than sending OS signals. The real Axum
   admission/drain/cleanup test belongs in the service integration suite.

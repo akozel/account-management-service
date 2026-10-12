@@ -16,6 +16,8 @@ use sqlx::postgres::PgConnectOptions;
 use thiserror::Error;
 use tracing::level_filters::ParseLevelFilterError;
 
+use crate::startup::{environment::load_dotenv, error::ServiceError};
+
 const ENV_KEYS: [&str; 10] = [
     "DATABASE_URL",
     "BIND_ADDRESS",
@@ -81,6 +83,18 @@ impl fmt::Debug for ServiceConfig {
 }
 
 impl ServiceConfig {
+    /// Load dotenv and validate all process settings before initialization.
+    pub(crate) fn load() -> Result<Self, ServiceError> {
+        let result = (|| {
+            load_dotenv()?;
+            Self::from_env().map_err(ServiceError::from)
+        })();
+        if let Err(error) = &result {
+            error.log();
+        }
+        result
+    }
+
     pub(crate) fn from_env() -> Result<Self, ServiceConfigError> {
         Self::from_environment(|name| std::env::var(name))
     }
@@ -143,6 +157,53 @@ impl ServiceConfig {
 mod tests {
     use super::*;
     use std::error::Error;
+
+    #[test]
+    fn load_validates_real_dotenv_and_environment_in_isolated_processes() {
+        use crate::startup::{error::ServiceError, test_support};
+        if let Some(scenario) = test_support::scenario() {
+            let result = ServiceConfig::load();
+            match scenario.as_str() {
+                "dotenv" | "environment" => {
+                    let config = result.unwrap();
+                    assert_eq!(config.bind_address(), "127.0.0.1:0".parse().unwrap());
+                }
+                "invalid_dotenv" => assert!(matches!(result, Err(ServiceError::Dotenv(_)))),
+                "invalid_configuration" => assert!(matches!(result, Err(ServiceError::Configuration(_)))),
+                _ => panic!("unknown configuration scenario"),
+            }
+            return;
+        }
+        for scenario in ["dotenv", "environment", "invalid_dotenv", "invalid_configuration"] {
+            let directory = std::env::temp_dir().join(format!("account-service-config-{}", uuid::Uuid::new_v4()));
+            std::fs::create_dir(&directory).unwrap();
+            let values = "DATABASE_URL=postgres://localhost/service\nBIND_ADDRESS=127.0.0.1:0\n";
+            match scenario {
+                "dotenv" => std::fs::write(directory.join(".env"), values).unwrap(),
+                "invalid_dotenv" => std::fs::write(directory.join(".env"), "INVALID='unclosed\n").unwrap(),
+                _ => {}
+            }
+            test_support::isolated(
+                concat!(
+                    module_path!(),
+                    "::load_validates_real_dotenv_and_environment_in_isolated_processes"
+                ),
+                scenario,
+                |child| {
+                    child.current_dir(&directory);
+                    for key in ENV_KEYS {
+                        child.env_remove(key);
+                    }
+                    if scenario == "environment" {
+                        child
+                            .env("DATABASE_URL", "postgres://localhost/service")
+                            .env("BIND_ADDRESS", "127.0.0.1:0");
+                    }
+                },
+            );
+            std::fs::remove_dir_all(directory).unwrap();
+        }
+    }
 
     fn config(overrides: &[(&str, &str)]) -> Result<ServiceConfig, ServiceConfigError> {
         ServiceConfig::from_lookup(|name| {
